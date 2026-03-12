@@ -60,7 +60,9 @@ from config import (
 from ntn_phy          import run_sionna_ber
 from rt_sim           import run_ray_tracing
 from ntn_ns3          import run_ns3_protocol_suite
-from topology_diagram import draw_topology, draw_protocol_comparison, draw_summary
+from topology_diagram import (draw_topology, draw_protocol_comparison,
+                               draw_summary, draw_throughput_over_time,
+                               draw_network_illustration, draw_ue_satellite_scene)
 
 
 # =============================================================================
@@ -115,6 +117,9 @@ def main() -> None:
     draw_topology(out="ntn_topology.png")
     draw_protocol_comparison(ns3_results, out="ntn_protocol_comparison.png")
     draw_summary(ber_results, ns3_results, out="ntn_summary.png")
+    draw_throughput_over_time(ns3_results, out="ntn_throughput_over_time.png")
+    draw_network_illustration(out="ntn_network_illustration.png")
+    draw_ue_satellite_scene(out="ntn_ue_satellite.png")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
@@ -124,6 +129,9 @@ def main() -> None:
     print("    ntn_topology.png             — topology diagram")
     print("    ntn_protocol_comparison.png  — protocol comparison bar chart")
     print("    ntn_summary.png              — BER/BLER + NS-3 combined figure")
+    print("    ntn_throughput_over_time.png — per-protocol throughput vs time")
+    print("    ntn_network_illustration.png — detailed NTN network diagram")
+    print("    ntn_ue_satellite.png         — UE-to-satellite street scene")
     print("    ntn_rt_paths_sat<N>.png      — RT paths per satellite")
     print("    ntn_rt_radiomap.png          — composite radio map")
     print("=" * 70)

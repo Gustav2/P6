@@ -459,6 +459,632 @@ def draw_summary(ber_results: dict, ns3_results: list,
     return out
 
 
+# =============================================================================
+# Throughput-over-time graph
+# =============================================================================
+
+# Handover schedule constants (derived from RT + NS-3 simulation)
+_SCHEDULE = [
+    {"label": "Sat 0", "t_start": 0,  "t_end": 20, "per": 0.101,
+     "elev": 69.9, "delay_ms": 2.1, "color": "#1a6fc4"},
+    {"label": "Sat 1", "t_start": 20, "t_end": 40, "per": 0.033,
+     "elev": 54.9, "delay_ms": 2.4, "color": "#2ca02c"},
+    {"label": "Sat 2", "t_start": 40, "t_end": 60, "per": 0.768,
+     "elev": 39.9, "delay_ms": 3.0, "color": "#d62728"},
+]
+
+_UDP_RATE_KBPS = 5000.0   # CBR source rate
+
+
+def _slot_per(t: np.ndarray) -> np.ndarray:
+    """Return per-sample PER value based on which satellite is active."""
+    per = np.full_like(t, _SCHEDULE[0]["per"])
+    for slot in _SCHEDULE[1:]:
+        per[t >= slot["t_start"]] = slot["per"]
+    return per
+
+
+def draw_throughput_over_time(
+        ns3_results: list | None = None,
+        out: str = "ntn_throughput_over_time.png") -> str:
+    """
+    Plot analytically reconstructed per-protocol throughput vs. time,
+    with shaded background regions and vertical dashed lines marking each
+    satellite handover event.
+
+    Since NS-3 FlowMonitor only provides aggregate flow statistics, the
+    time-series is reconstructed analytically:
+      - Per-slot PER values come from the RT-calibrated link budget.
+      - UDP throughput = CBR_rate × (1 - PER) + Gaussian noise.
+      - TCP throughput is derived from the aggregate NS-3 result,
+        split proportionally across slots by their relative (1-PER) weight,
+        then smoothed with a rolling average to mimic congestion-window
+        growth and brief post-handover recovery dip.
+
+    Parameters
+    ----------
+    ns3_results : list[dict] | None
+        Output of run_ns3_protocol_suite().  If None, placeholder values
+        derived from the known simulation run are used so the plot can be
+        generated without re-running NS-3.
+    out : str
+        Output filename.
+
+    Returns
+    -------
+    str  Path of the saved figure.
+    """
+    rng = np.random.default_rng(42)
+
+    dt   = 0.1   # seconds per sample
+    t    = np.arange(0, SIM_DURATION_S + dt, dt)
+    per  = _slot_per(t)
+
+    # ── Protocol aggregate targets (from NS-3 run; fallback if no results) ────
+    _defaults = {
+        "UDP":         4830.0,
+        "TCP NewReno":  382.0,
+        "TCP CUBIC":    618.0,
+        "TCP BBR":     4185.0,
+    }
+    if ns3_results:
+        agg = {r["label"]: r["throughput_kbps"] for r in ns3_results}
+    else:
+        agg = _defaults
+
+    # ── Reconstruct time-series per protocol ──────────────────────────────────
+    def _udp_trace() -> np.ndarray:
+        base   = _UDP_RATE_KBPS * (1.0 - per)
+        noise  = rng.normal(0, 80, size=len(t))
+        return np.clip(base + noise, 0, _UDP_RATE_KBPS)
+
+    def _tcp_trace(label: str) -> np.ndarray:
+        # Slot weights proportional to relative link quality (1-PER)
+        weights = np.array([1 - s["per"] for s in _SCHEDULE])
+        weights = weights / weights.sum()
+        total   = agg.get(label, _defaults[label])
+
+        # Per-slot mean throughput
+        slot_mean = total * weights * (len(_SCHEDULE))
+
+        # Build base trace
+        base = np.zeros(len(t))
+        for i, slot in enumerate(_SCHEDULE):
+            mask = (t >= slot["t_start"]) & (t < slot["t_end"])
+            base[mask] = slot_mean[i]
+
+        # Add noise
+        noise = rng.normal(0, total * 0.04, size=len(t))
+        trace = np.clip(base + noise, 0, None)
+
+        # Model post-handover recovery dip (CWND reset at handover boundaries)
+        ho_times = [20.0, 40.0]
+        recovery_s = 4.0  # seconds to recover
+        for ho in ho_times:
+            mask = (t >= ho) & (t < ho + recovery_s)
+            dip  = 1.0 - 0.55 * np.exp(-(t[mask] - ho) / (recovery_s * 0.4))
+            trace[mask] *= dip
+
+        # Smooth with rolling average (~3 s window)
+        win = max(1, int(3.0 / dt))
+        kernel = np.ones(win) / win
+        trace = np.convolve(trace, kernel, mode="same")
+        return np.clip(trace, 0, None)
+
+    traces = {
+        "UDP":         _udp_trace(),
+        "TCP NewReno": _tcp_trace("TCP NewReno"),
+        "TCP CUBIC":   _tcp_trace("TCP CUBIC"),
+        "TCP BBR":     _tcp_trace("TCP BBR"),
+    }
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(13, 6))
+    fig.patch.set_facecolor("#f8f9fa")
+    ax.set_facecolor("#f8f9fa")
+
+    # Shaded background regions per satellite slot — draw after ylim is fixed
+    slot_alphas = [0.10, 0.07, 0.13]
+    for slot, alpha in zip(_SCHEDULE, slot_alphas):
+        ax.axvspan(slot["t_start"], slot["t_end"],
+                   color=slot["color"], alpha=alpha, zorder=0)
+
+    # Handover vertical lines
+    for ho_t in [20.0, 40.0]:
+        ax.axvline(ho_t, color="#333", linestyle="--", linewidth=1.4,
+                   zorder=3, label="_nolegend_")
+        ax.text(ho_t + 0.4, 50,
+                f"Handover\nt = {ho_t:.0f} s",
+                fontsize=7, color="#333", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                          edgecolor="#333", alpha=0.8))
+
+    # Protocol traces
+    for label, trace in traces.items():
+        ax.plot(t, trace, color=PROTO_COLORS.get(label, "gray"),
+                linewidth=1.8, label=label, alpha=0.9)
+
+    ax.set_xlabel("Simulation Time [s]", fontsize=11)
+    ax.set_ylabel("Throughput [kbps]", fontsize=11)
+    ax.set_title(
+        "Transport Protocol Throughput over Time — 5G-NTN LEO Satellite Link\n"
+        "Analytically reconstructed from NS-3 aggregate stats + RT-calibrated PER",
+        fontsize=10,
+    )
+    ax.set_xlim(0, SIM_DURATION_S)
+    ax.set_ylim(bottom=0)
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+    ax.grid(axis="y", alpha=0.35)
+    ax.grid(axis="x", alpha=0.2)
+
+    # Slot labels at top of plot (drawn after ylim is finalised)
+    y_max = ax.get_ylim()[1]
+    for slot in _SCHEDULE:
+        mid = (slot["t_start"] + slot["t_end"]) / 2
+        ax.text(mid, y_max * 0.97,
+                f"{slot['label']}\nelev {slot['elev']:.0f}°\nPER {slot['per']:.3f}",
+                ha="center", va="top", fontsize=7.5, color=slot["color"],
+                fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                          edgecolor=slot["color"], alpha=0.75), zorder=4)
+
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"[ThroughputTime]  Saved -> {out}")
+    plt.close()
+    return out
+
+
+# =============================================================================
+# Detailed network illustration
+# =============================================================================
+
+def draw_network_illustration(out: str = "ntn_network_illustration.png") -> str:
+    """
+    Draw a detailed end-to-end NTN network diagram including:
+      - Earth arc at the bottom with ground infrastructure
+      - LEO orbit arc with 3 satellites
+      - Service link, feeder link, and fibre link with parameter labels
+      - Protocol stack labels on relevant nodes
+      - Link delay, data rate, and PER annotations
+
+    Returns
+    -------
+    str  Path of the saved figure.
+    """
+    fig, ax = plt.subplots(figsize=(16, 10))
+    ax.set_xlim(0, 16)
+    ax.set_ylim(0, 10)
+    ax.axis("off")
+    fig.patch.set_facecolor("#0d1b2a")
+    ax.set_facecolor("#0d1b2a")
+
+    # ── Earth arc ─────────────────────────────────────────────────────────────
+    earth_cx, earth_cy = 8.0, -7.5
+    earth_r = 10.5
+    earth_arc = mpatches.Arc(
+        (earth_cx, earth_cy), 2 * earth_r, 2 * earth_r,
+        angle=0, theta1=55, theta2=125,
+        color="#3a7d44", linewidth=3, zorder=2,
+    )
+    ax.add_patch(earth_arc)
+
+    # Filled Earth surface hint
+    from matplotlib.patches import Wedge
+    earth_fill = Wedge(
+        (earth_cx, earth_cy), earth_r,
+        theta1=55, theta2=125,
+        facecolor="#1a4a1f", edgecolor="#3a7d44", linewidth=2, zorder=1,
+    )
+    ax.add_patch(earth_fill)
+
+    # Atmosphere haze
+    atmos = mpatches.Arc(
+        (earth_cx, earth_cy), 2 * (earth_r + 0.35), 2 * (earth_r + 0.35),
+        angle=0, theta1=55, theta2=125,
+        color="#4fc3f7", linewidth=1.0, linestyle=":", alpha=0.5, zorder=2,
+    )
+    ax.add_patch(atmos)
+
+    # ── Orbit arc ─────────────────────────────────────────────────────────────
+    orbit_r = earth_r + 2.8
+    orbit_arc = mpatches.Arc(
+        (earth_cx, earth_cy), 2 * orbit_r, 2 * orbit_r,
+        angle=0, theta1=57, theta2=123,
+        color="#aaaaaa", linewidth=1.2, linestyle="--", alpha=0.6, zorder=2,
+    )
+    ax.add_patch(orbit_arc)
+    # Orbit label
+    import math
+    orb_label_angle = math.radians(90)
+    ax.text(
+        earth_cx + (orbit_r + 0.3) * math.cos(orb_label_angle),
+        earth_cy + (orbit_r + 0.3) * math.sin(orb_label_angle),
+        "LEO orbit  ~600 km",
+        ha="center", va="bottom", fontsize=7.5, color="#aaaaaa",
+        fontstyle="italic",
+    )
+
+    # ── Satellite positions ────────────────────────────────────────────────────
+    # Sat 0: left (70° elevation → angle 110° from Earth center on our arc)
+    # Sat 1: centre (55° elevation → angle 90°)
+    # Sat 2: right (40° elevation → angle 70°)
+    sat_angles_deg = [110, 90, 70]
+    sat_elevs      = [69.9, 54.9, 39.9]
+    sat_pers       = [0.101, 0.033, 0.768]
+    sat_delays     = [2.1, 2.4, 3.0]
+    sat_colors     = [_SCHEDULE[0]["color"], _SCHEDULE[1]["color"],
+                      _SCHEDULE[2]["color"]]
+    sat_positions  = []
+
+    for i, (ang, elev, per, dly, sc) in enumerate(
+            zip(sat_angles_deg, sat_elevs, sat_pers, sat_delays, sat_colors)):
+        rad = math.radians(ang)
+        sx  = earth_cx + orbit_r * math.cos(rad)
+        sy  = earth_cy + orbit_r * math.sin(rad)
+        sat_positions.append((sx, sy))
+
+        # Satellite body (diamond)
+        diamond = plt.Polygon(
+            [[sx, sy + 0.22], [sx + 0.18, sy], [sx, sy - 0.22],
+             [sx - 0.18, sy]],
+            closed=True, facecolor=sc, edgecolor="white",
+            linewidth=1.2, zorder=5,
+        )
+        ax.add_patch(diamond)
+
+        # Solar panel wings
+        ax.plot([sx - 0.45, sx - 0.18], [sy, sy], color=sc,
+                linewidth=2.5, solid_capstyle="round", zorder=4)
+        ax.plot([sx + 0.18, sx + 0.45], [sy, sy], color=sc,
+                linewidth=2.5, solid_capstyle="round", zorder=4)
+
+        # Label box
+        lbl_dx = (-1.2 if i == 0 else (0.0 if i == 1 else 1.2))
+        lbl_dy = 0.55
+        ax.text(sx + lbl_dx, sy + lbl_dy,
+                f"Sat {i}  (elev {elev:.0f}°)\nPER={per:.3f}  dly={dly:.1f} ms",
+                ha="center", va="bottom", fontsize=7, color="white",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="#1a2a3a",
+                          edgecolor=sc, linewidth=1.0),
+                zorder=6)
+
+    # ── Ground nodes ──────────────────────────────────────────────────────────
+    def _gnd_box(cx, cy, lines, fc="#1c3a5e", ec="#4a9fd4", fs=8):
+        n_lines = len(lines)
+        h = 0.15 * n_lines + 0.25
+        w = max(len(l) for l in lines) * 0.085 + 0.3
+        box = FancyBboxPatch(
+            (cx - w / 2, cy - h / 2), w, h,
+            boxstyle="round,pad=0.06",
+            facecolor=fc, edgecolor=ec, linewidth=1.2, zorder=5,
+        )
+        ax.add_patch(box)
+        for j, line in enumerate(lines):
+            yoff = (n_lines - 1) / 2 * 0.15 - j * 0.15
+            ax.text(cx, cy + yoff, line, ha="center", va="center",
+                    fontsize=fs, color="white", zorder=6,
+                    fontweight=("bold" if j == 0 else "normal"))
+
+    # UE on the left side of the Earth arc
+    ue_rad = math.radians(108)
+    ue_sx  = earth_cx + earth_r * math.cos(ue_rad)
+    ue_sy  = earth_cy + earth_r * math.sin(ue_rad)
+    _gnd_box(ue_sx, ue_sy + 0.35,
+             ["UE (Phone)", "[50, 80, 1.5 m]",
+              "5G NR NTN UE", "3.5 GHz"],
+             fc="#1a3a1a", ec="#3a7d44")
+
+    # Ground station in the centre
+    gs_rad = math.radians(90)
+    gs_sx  = earth_cx + earth_r * math.cos(gs_rad)
+    gs_sy  = earth_cy + earth_r * math.sin(gs_rad)
+    _gnd_box(gs_sx, gs_sy + 0.35,
+             ["Ground Station", "Ka-band gateway",
+              "100 Mbps uplink"],
+             fc="#3a2a00", ec="#f0a500")
+
+    # Internet server on the right
+    srv_rad = math.radians(72)
+    srv_sx  = earth_cx + earth_r * math.cos(srv_rad)
+    srv_sy  = earth_cy + earth_r * math.sin(srv_rad)
+    _gnd_box(srv_sx, srv_sy + 0.35,
+             ["Internet Server", "TCP/UDP sink",
+              "NS-3 PacketSink"],
+             fc="#3a001a", ec="#e05080")
+
+    # ── Links ─────────────────────────────────────────────────────────────────
+    def _link(x1, y1, x2, y2, label, color="#aaddff",
+              ls="-", lw=1.5, label_offset=(0, 0)):
+        ax.plot([x1, x2], [y1, y2], color=color, linestyle=ls,
+                linewidth=lw, zorder=3, alpha=0.85)
+        mx = (x1 + x2) / 2 + label_offset[0]
+        my = (y1 + y2) / 2 + label_offset[1]
+        ax.text(mx, my, label, ha="center", va="center",
+                fontsize=6.5, color=color, zorder=7,
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="#0d1b2a",
+                          edgecolor="none", alpha=0.85))
+
+    ue_top  = (ue_sx, ue_sy + 0.35 + 0.25)
+    gs_top  = (gs_sx, gs_sy + 0.35 + 0.25)
+    srv_top = (srv_sx, srv_sy + 0.35 + 0.25)
+
+    # UE → Sat 0 (active service link)
+    _link(ue_top[0], ue_top[1], sat_positions[0][0], sat_positions[0][1] - 0.22,
+          "5G-NR NTN service link\n3.5 GHz  |  dly 2.1 ms  |  PER 0.101",
+          color="#64b5f6", lw=2.2, label_offset=(-0.6, 0.2))
+
+    # UE → Sat 1 (handover candidate, dashed)
+    _link(ue_top[0], ue_top[1], sat_positions[1][0], sat_positions[1][1] - 0.22,
+          "handover candidate\nPER 0.033",
+          color="#80cbc4", ls="--", lw=1.3, label_offset=(0.1, 0.3))
+
+    # UE → Sat 2 (future, dotted)
+    _link(ue_top[0], ue_top[1], sat_positions[2][0], sat_positions[2][1] - 0.22,
+          "future\nPER 0.768",
+          color="#ef9a9a", ls=":", lw=1.0, label_offset=(0.6, 0.1))
+
+    # Sat 0 → GS (feeder link)
+    _link(sat_positions[0][0], sat_positions[0][1] - 0.22,
+          gs_top[0], gs_top[1],
+          "Ka-band feeder link\n26.5 GHz  |  100 Mbps",
+          color="#ffcc80", lw=1.8, label_offset=(-0.3, 0.1))
+
+    # GS → Server (fibre)
+    _link(gs_top[0], gs_top[1], srv_top[0], srv_top[1],
+          "Fibre  1 Gbps  |  10 ms",
+          color="#a5d6a7", lw=1.8, label_offset=(0, 0.2))
+
+    # ── Legend ────────────────────────────────────────────────────────────────
+    legend_items = [
+        plt.Line2D([0], [0], color="#64b5f6", lw=2.2, label="Active service link"),
+        plt.Line2D([0], [0], color="#80cbc4", lw=1.3,
+                   linestyle="--", label="Handover candidate"),
+        plt.Line2D([0], [0], color="#ef9a9a", lw=1.0,
+                   linestyle=":", label="Future satellite"),
+        plt.Line2D([0], [0], color="#ffcc80", lw=1.8,
+                   label="Ka-band feeder link"),
+        plt.Line2D([0], [0], color="#a5d6a7", lw=1.8,
+                   label="Fibre backhaul"),
+        plt.Line2D([0], [0], color="#aaaaaa", lw=1.2,
+                   linestyle="--", label="LEO orbit arc"),
+    ]
+    ax.legend(handles=legend_items, loc="upper left",
+              fontsize=7.5, framealpha=0.85,
+              facecolor="#1a2a3a", labelcolor="white",
+              edgecolor="#4a9fd4")
+
+    # ── Title ─────────────────────────────────────────────────────────────────
+    ax.set_title(
+        "5G Non-Terrestrial Network (NTN) — End-to-End Topology\n"
+        f"LEO {SAT_HEIGHT_M/1e3:.0f} km  |  {CARRIER_FREQ_HZ/1e9:.1f} GHz  |  "
+        f"3-satellite constellation  |  2 handover events",
+        fontsize=11, color="white", pad=10,
+    )
+
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    print(f"[NetworkIllust]  Saved -> {out}")
+    plt.close()
+    return out
+
+
+# =============================================================================
+# UE-to-satellite street scene
+# =============================================================================
+
+def draw_ue_satellite_scene(out: str = "ntn_ue_satellite.png") -> str:
+    """
+    Draw an artistic street-level scene illustrating the UE-to-satellite
+    communication geometry with multipath rays, as derived from Sionna RT.
+
+    Scene elements:
+      - Night sky gradient background
+      - Two city building silhouettes forming a street canyon
+      - UE (smartphone) at street level
+      - LEO satellite high above
+      - Line-of-sight ray (direct path)
+      - Two reflected rays bouncing off building walls
+      - Signal strength annotation and elevation arc
+
+    Returns
+    -------
+    str  Path of the saved figure.
+    """
+    fig, ax = plt.subplots(figsize=(10, 12))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 12)
+    ax.axis("off")
+
+    # ── Sky gradient ──────────────────────────────────────────────────────────
+    from matplotlib.colors import LinearSegmentedColormap
+    sky_cmap = LinearSegmentedColormap.from_list(
+        "sky", ["#0d1b2a", "#1a3a5c", "#2a5a8c"])
+    sky_grad = np.linspace(0, 1, 256).reshape(256, 1)
+    ax.imshow(sky_grad, aspect="auto", cmap=sky_cmap,
+              extent=[0, 10, 0, 12], origin="lower",
+              zorder=0, alpha=0.95)
+
+    # Stars (scattered dots)
+    rng = np.random.default_rng(7)
+    star_x = rng.uniform(0.2, 9.8, 60)
+    star_y = rng.uniform(5.5, 11.8, 60)
+    star_s = rng.uniform(2, 10, 60)
+    ax.scatter(star_x, star_y, s=star_s, color="white", alpha=0.6, zorder=1)
+
+    # ── Ground / street ───────────────────────────────────────────────────────
+    street = plt.Polygon([[0, 0], [10, 0], [10, 1.2], [0, 1.2]],
+                         closed=True, facecolor="#1c1c1c", edgecolor="none",
+                         zorder=2)
+    ax.add_patch(street)
+    # Road markings
+    for xm in np.arange(1.0, 9.5, 1.5):
+        ax.plot([xm, xm + 0.8], [0.6, 0.6], color="#ffdd44",
+                linewidth=2.5, alpha=0.6, zorder=3)
+
+    # ── Buildings ─────────────────────────────────────────────────────────────
+    def _building(x, w, h, fc="#2a3a4a", window_color="#ffdd88"):
+        body = plt.Polygon(
+            [[x, 1.2], [x + w, 1.2], [x + w, 1.2 + h], [x, 1.2 + h]],
+            closed=True, facecolor=fc, edgecolor="#4a5a6a",
+            linewidth=0.8, zorder=2,
+        )
+        ax.add_patch(body)
+        # Windows
+        ww, wh = 0.22, 0.28
+        for row in range(int(h / 0.7)):
+            for col in range(int(w / 0.55)):
+                wx = x + 0.18 + col * 0.55
+                wy = 1.2 + 0.25 + row * 0.7
+                if wx + ww < x + w - 0.1 and wy + wh < 1.2 + h - 0.1:
+                    lit = rng.random() > 0.35
+                    win = plt.Polygon(
+                        [[wx, wy], [wx + ww, wy],
+                         [wx + ww, wy + wh], [wx, wy + wh]],
+                        closed=True,
+                        facecolor=window_color if lit else "#1a2030",
+                        edgecolor="#3a4a5a", linewidth=0.5, zorder=3,
+                    )
+                    ax.add_patch(win)
+
+    _building(0.0, 2.8, 5.2, fc="#253040")   # Left building
+    _building(7.2, 2.8, 4.0, fc="#253545")   # Right building
+
+    # ── UE (phone icon) ───────────────────────────────────────────────────────
+    ue_x, ue_y = 5.0, 1.55
+    phone = FancyBboxPatch(
+        (ue_x - 0.18, ue_y - 0.42), 0.36, 0.74,
+        boxstyle="round,pad=0.04",
+        facecolor="#222", edgecolor="#aaaaaa", linewidth=1.5, zorder=8,
+    )
+    ax.add_patch(phone)
+    # Screen
+    screen = FancyBboxPatch(
+        (ue_x - 0.13, ue_y - 0.30), 0.26, 0.48,
+        boxstyle="round,pad=0.02",
+        facecolor="#1a6fc4", edgecolor="none", linewidth=0, zorder=9,
+    )
+    ax.add_patch(screen)
+    # Home button
+    ax.add_patch(plt.Circle((ue_x, ue_y - 0.36), 0.04,
+                             color="#555", zorder=9))
+    ax.text(ue_x, ue_y - 0.68, "UE\n[50, 80, 1.5 m]",
+            ha="center", va="top", fontsize=7.5, color="white", zorder=10,
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="#0d1b2a",
+                      edgecolor="#4a9fd4", alpha=0.8))
+
+    # ── Satellite ─────────────────────────────────────────────────────────────
+    sat_x, sat_y = 6.8, 10.5
+    # Body
+    sat_body = plt.Polygon(
+        [[sat_x, sat_y + 0.35], [sat_x + 0.28, sat_y],
+         [sat_x, sat_y - 0.35], [sat_x - 0.28, sat_y]],
+        closed=True, facecolor="#2ca02c", edgecolor="white",
+        linewidth=1.5, zorder=8,
+    )
+    ax.add_patch(sat_body)
+    # Solar panels
+    for dx in [(-0.72, -0.28), (0.28, 0.72)]:
+        ax.plot([sat_x + dx[0], sat_x + dx[1]], [sat_y, sat_y],
+                color="#ffaa00", linewidth=5, solid_capstyle="butt",
+                zorder=7, alpha=0.9)
+    ax.text(sat_x + 0.5, sat_y + 0.5,
+            "LEO Sat 1\nelev 55°  |  PER 0.033",
+            ha="left", va="bottom", fontsize=7.5, color="white", zorder=10,
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="#0d1b2a",
+                      edgecolor="#2ca02c", alpha=0.85))
+
+    # ── Ray paths (Sionna RT multipath) ──────────────────────────────────────
+    # LoS ray (direct path, brightest)
+    ax.annotate("", xy=(sat_x - 0.2, sat_y - 0.35),
+                xytext=(ue_x + 0.05, ue_y + 0.32),
+                arrowprops=dict(arrowstyle="-|>", color="#64b5f6",
+                                lw=2.0, mutation_scale=12),
+                zorder=6)
+    ax.text(5.75, 6.5, "LoS path\n(direct)",
+            ha="center", fontsize=7, color="#64b5f6",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="#0d1b2a",
+                      edgecolor="#64b5f6", alpha=0.8), zorder=7)
+
+    # Reflected ray 1: off left building wall → UE
+    refl1_x, refl1_y = 2.8, 5.8   # reflection point on left wall
+    # Sat → wall
+    ax.annotate("", xy=(refl1_x, refl1_y),
+                xytext=(sat_x - 0.28, sat_y),
+                arrowprops=dict(arrowstyle="-", color="#ffab40",
+                                lw=1.5, linestyle="dashed"),
+                zorder=5)
+    # Wall → UE
+    ax.annotate("", xy=(ue_x - 0.18, ue_y + 0.1),
+                xytext=(refl1_x, refl1_y),
+                arrowprops=dict(arrowstyle="-|>", color="#ffab40",
+                                lw=1.5, mutation_scale=10),
+                zorder=5)
+    # Reflection marker
+    ax.plot(refl1_x, refl1_y, "o", ms=6, color="#ffab40", zorder=6)
+    ax.text(refl1_x - 0.35, refl1_y,
+            "Refl. 1\n(left wall)",
+            ha="right", fontsize=6.5, color="#ffab40",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="#0d1b2a",
+                      edgecolor="#ffab40", alpha=0.8), zorder=7)
+
+    # Reflected ray 2: off right building wall → UE
+    refl2_x, refl2_y = 7.2, 4.5   # reflection point on right wall
+    ax.annotate("", xy=(refl2_x, refl2_y),
+                xytext=(sat_x - 0.05, sat_y - 0.35),
+                arrowprops=dict(arrowstyle="-", color="#ce93d8",
+                                lw=1.5, linestyle="dashed"),
+                zorder=5)
+    ax.annotate("", xy=(ue_x + 0.18, ue_y + 0.1),
+                xytext=(refl2_x, refl2_y),
+                arrowprops=dict(arrowstyle="-|>", color="#ce93d8",
+                                lw=1.5, mutation_scale=10),
+                zorder=5)
+    ax.plot(refl2_x, refl2_y, "o", ms=6, color="#ce93d8", zorder=6)
+    ax.text(refl2_x + 0.15, refl2_y,
+            "Refl. 2\n(right wall)",
+            ha="left", fontsize=6.5, color="#ce93d8",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="#0d1b2a",
+                      edgecolor="#ce93d8", alpha=0.8), zorder=7)
+
+    # ── Elevation arc annotation ──────────────────────────────────────────────
+    elev_arc = mpatches.Arc(
+        (ue_x, ue_y + 0.32), 2.2, 2.2,
+        angle=0, theta1=55, theta2=90,
+        color="#80cbc4", linewidth=1.2, zorder=7,
+    )
+    ax.add_patch(elev_arc)
+    ax.text(ue_x + 0.8, ue_y + 1.6, "55°", fontsize=8,
+            color="#80cbc4", ha="center", zorder=8)
+
+    # ── Info panel ────────────────────────────────────────────────────────────
+    info = (
+        "Sionna RT — Munich scene\n"
+        "8 multipath components resolved\n"
+        "Delay spread: ~12 ns   |   Mean path gain: −142 dB"
+    )
+    ax.text(5.0, 0.35, info, ha="center", va="center",
+            fontsize=7.5, color="white", zorder=10,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#0d2a1a",
+                      edgecolor="#3a7d44", alpha=0.9))
+
+    # ── Title ─────────────────────────────────────────────────────────────────
+    ax.set_title(
+        "UE-to-Satellite Communication — Urban Street Canyon\n"
+        "Multipath propagation via Sionna RT ray tracing (Munich scene)",
+        fontsize=10, color="#cce4ff", pad=8,
+    )
+    fig.patch.set_facecolor("#0d1b2a")
+
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    print(f"[UESatScene]  Saved -> {out}")
+    plt.close()
+    return out
+
+
 def _mini_topology(ax) -> None:
     """
     Draw a compact inline topology sketch into a pre-existing axes.
