@@ -1,5 +1,18 @@
 """
-NTN Satellite Link Simulation
+ntn_link_sim.py — DEPRECATED
+==============================
+This monolithic script has been superseded by the modular layout:
+
+  config.py       — shared parameters
+  ntn_phy.py      — Part 1: Sionna 1.2.1 + OpenNTN BER/BLER simulation
+  ntn_ns3.py      — Part 2: NS-3 packet-level network simulation
+  rt_sim.py       — Part 3: Sionna RT ray tracing (Munich scene)
+  main.py         — entry point that runs all three parts
+
+Run ``python main.py`` instead.
+
+----------------------------------------------------------------------
+NTN Satellite Link Simulation (original monolithic version)
 ==============================
 Uses the real APIs of:
 
