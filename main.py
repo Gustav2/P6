@@ -81,6 +81,11 @@ from config import (
     ELEVATION_ANGLE_DEG,
     CODERATE,
     NUM_BITS_PER_SYMBOL,
+    FFT_SIZE,
+    NUM_OFDM_SYMBOLS,
+    PILOT_SYMBOL_IDX,
+    SNR_THRESH_DB,
+    SIGMOID_SLOPE,
     PROTOCOLS,
 )
 from ntn_phy          import run_sionna_ber
@@ -119,12 +124,79 @@ def main() -> None:
     print("  Part 1 — PHY layer BER/BLER  (Sionna + OpenNTN)")
     print("─" * 70)
 
-    snr_range   = np.arange(0, 22, 2, dtype=float)
+    snr_range   = np.arange(0, 20.5, 0.5, dtype=float)  # 0.5 dB steps for sigmoid fitting
     ber_results = {}
     for sc in ["urban", "dense_urban", "suburban"]:
         ber, bler       = run_sionna_ber(snr_range, sc)
         ber_results[sc] = (ber, bler)
-        print(f"  [{sc}]  BER @ 10 dB = {ber[5]:.4f}  BLER @ 10 dB = {bler[5]:.4f}")
+        print(f"  [{sc}]  BER @ 10 dB = {ber[20]:.4f}  BLER @ 10 dB = {bler[20]:.4f}")
+
+    # ── Sigmoid fitting: BER → PER (using "urban" scenario curve) ────────────
+    # Convert BER to PER:  PER = 1 - (1 - BER)^(codeword_bits)
+    # where codeword_bits is the number of information bits per LDPC codeword.
+    #
+    # The Sionna ResourceGrid has:
+    #   - NUM_OFDM_SYMBOLS total OFDM symbols per slot (= 14 at µ=0)
+    #   - len(PILOT_SYMBOL_IDX) pilot symbols (= 2, at indices 2 and 11)
+    #   - FFT_SIZE active subcarriers per OFDM symbol (no guard-band stripping
+    #     in Sionna's ResourceGrid by default)
+    #   - NUM_BITS_PER_SYMBOL bits per data symbol (= 2 for QPSK)
+    # Total coded bits per slot:
+    #   n = (NUM_OFDM_SYMBOLS - num_pilots) × FFT_SIZE × NUM_BITS_PER_SYMBOL
+    #     = (14 - 2) × 128 × 2 = 3072 bits
+    # Information bits:
+    #   k = n × CODERATE = 3072 × 0.5 = 1536 bits
+    # This matches the _n and _k computed in NTNOFDMModel.__init__() in ntn_phy.py
+    # (lines 134–135), which also uses rg.num_data_symbols × NUM_BITS_PER_SYMBOL.
+    #
+    # NOTE: Using FFT_SIZE × CODERATE × NUM_BITS_PER_SYMBOL = 128 (incorrect)
+    # would underestimate the codeword by 24×, giving a much shallower BER→PER
+    # waterfall and causing the fitted sigmoid slope to be too small.
+    num_pilot_syms = len(PILOT_SYMBOL_IDX)                             # = 2
+    num_data_syms  = NUM_OFDM_SYMBOLS - num_pilot_syms                 # = 12
+    codeword_bits  = num_data_syms * FFT_SIZE * NUM_BITS_PER_SYMBOL    # = 3072
+
+    # Fit sigmoid(snr, thresh, slope) = 1 / (1 + exp(slope*(snr - thresh)))
+    # to the PER vs Eb/N0 curve, then pass the fitted params to NS-3.
+    print("\n  Fitting BER→PER sigmoid to urban Sionna LDPC BER curve ...")
+    fitted_snr_thresh    = SNR_THRESH_DB
+    fitted_sigmoid_slope = SIGMOID_SLOPE
+    try:
+        from scipy.optimize import curve_fit
+
+        def _sigmoid(snr, thresh, slope):
+            return 1.0 / (1.0 + np.exp(slope * (snr - thresh)))
+
+        ber_urban, _ = ber_results["urban"]
+        per_urban = 1.0 - (1.0 - np.clip(ber_urban, 0.0, 1.0 - 1e-9)) ** codeword_bits
+
+        # Only fit over points where PER is in (0.01, 0.99) — the transition
+        # region carries the most information about the sigmoid shape.
+        mask = (per_urban > 0.01) & (per_urban < 0.99)
+        if mask.sum() >= 2:
+            popt, _ = curve_fit(
+                _sigmoid,
+                snr_range[mask],
+                per_urban[mask],
+                p0=[SNR_THRESH_DB, SIGMOID_SLOPE],
+                bounds=([0.0, 0.01], [30.0, 5.0]),
+                maxfev=10000,
+            )
+            fitted_snr_thresh    = float(popt[0])
+            fitted_sigmoid_slope = float(popt[1])
+            print(f"  Sigmoid fit (urban):  "
+                  f"snr_thresh={fitted_snr_thresh:.2f} dB  "
+                  f"slope={fitted_sigmoid_slope:.4f} /dB")
+            print(f"  Config defaults:      "
+                  f"snr_thresh={SNR_THRESH_DB:.2f} dB  "
+                  f"slope={SIGMOID_SLOPE:.4f} /dB")
+        else:
+            print(f"  Warning: not enough PER transition points for fitting "
+                  f"({mask.sum()} valid pts).  Using config defaults.")
+    except Exception as exc:
+        print(f"  Warning: sigmoid fitting failed ({exc}).  "
+              f"Using config defaults (snr_thresh={SNR_THRESH_DB}, "
+              f"slope={SIGMOID_SLOPE}).")
 
     # ── Part 2: Ray tracing  (MUST run before NS-3) ───────────────────────────
     print("\n" + "─" * 70)
@@ -149,7 +221,9 @@ def main() -> None:
     print("─" * 70)
 
     direct_results, indirect_results = run_ns3_both_topologies(
-        channel_stats, scenario="urban"
+        channel_stats, scenario="urban",
+        snr_thresh_db=fitted_snr_thresh,
+        sigmoid_slope=fitted_sigmoid_slope,
     )
 
     # ── Plots ─────────────────────────────────────────────────────────────────
@@ -163,7 +237,7 @@ def main() -> None:
     draw_protocol_comparison(direct_results, out="output/ntn_protocol_comparison.png")
     print("  [2/14]  output/ntn_protocol_comparison.png")
 
-    draw_summary(ber_results, direct_results, out="output/ntn_summary.png")
+    draw_summary(ber_results, direct_results, snr_range=snr_range, out="output/ntn_summary.png")
     print("  [3/14]  output/ntn_summary.png")
 
     draw_throughput_over_time(direct_results, indirect_results,

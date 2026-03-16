@@ -4,12 +4,12 @@ rt_sim.py — Part 1: Sionna RT ray tracing  (runs before NS-3)
 Models the 5G-NTN uplink from a street-level UE (phone) placed in the
 Munich scene to a constellation of LEO satellites passing overhead.
 
-Because the actual orbital altitude (600 km) is far outside the Sionna RT
+Because the actual orbital altitude (550 km) is far outside the Sionna RT
 scene bounds (~100 m), each satellite is represented by a proxy transmitter
 placed RT_SAT_SCENE_HEIGHT_M above the scene.  This produces the correct
 near-vertical incidence geometry for extracting urban multipath statistics
 (delay spread, shadow fading, angle-of-arrival spread) which are then fed
-into the NS-3 link budget.  The true free-space path loss over 600 km is
+into the NS-3 link budget.  The true free-space path loss over 550 km is
 computed analytically in ntn_ns3.py.
 
 Multi-satellite pass
@@ -87,6 +87,7 @@ from config import (
     SAT_SPACING_DEG,
     SAT_HANDOVER_ELEVATION_DEG,
     SAT_HEIGHT_M,
+    RT_TX_POWER_DBM,
 )
 
 
@@ -123,7 +124,7 @@ def _propagation_delay_ms(height_m: float, elev_deg: float) -> float:
 
     Parameters
     ----------
-    height_m : float  Satellite orbital altitude [m] (SAT_HEIGHT_M = 600 km).
+    height_m : float  Satellite orbital altitude [m] (SAT_HEIGHT_M = 550 km).
     elev_deg : float  Elevation angle from the ground receiver [degrees].
     """
     RE = 6_371_000.0
@@ -240,12 +241,22 @@ def _extract_channel_stats(paths, sat_id: int,
             sat_y_m         = sat_pos[1],
         )
 
-    # Mean channel gain: average |h|² → convert to dB
-    mean_gain_lin = float(np.mean(valid_a))
-    mean_gain_db  = float(20.0 * np.log10(mean_gain_lin + 1e-30))
+    # Mean channel gain: average |h|² (power), then convert to dB.
+    # Correct per Jensen's inequality — averaging power then taking
+    # 10·log10 is unbiased; averaging amplitude then 20·log10 overestimates.
+    mean_power_lin = float(np.mean(valid_a ** 2))
+    mean_gain_db   = float(10.0 * np.log10(mean_power_lin + 1e-60))
 
-    # RMS delay spread: std-dev of path delays weighted equally
-    delay_spread_ns = float(np.std(valid_tau) * 1e9)
+    # Power-weighted RMS delay spread [ns].
+    # Standard definition: σ_τ = sqrt(Σ p_k(τ_k − τ̄)² / Σ p_k)
+    # where p_k = |h_k|² (path power weight).
+    # Equal-weight std overestimates spread by giving weak late paths
+    # the same importance as the strong early paths.
+    power_weights   = valid_a ** 2 / (valid_a ** 2).sum()
+    mean_tau        = float((power_weights * valid_tau).sum())
+    delay_spread_ns = float(
+        np.sqrt((power_weights * (valid_tau - mean_tau) ** 2).sum()) * 1e9
+    )
 
     # LoS exists if the earliest-arriving (minimum-delay) path has a gain
     # within 6 dB of the strongest path.  This heuristic is necessary because
@@ -278,9 +289,9 @@ def _extract_feeder_stats(paths, sat_id: int,
     satellite → GS feeder link.
 
     The propagation delay is computed analytically from the GS elevation
-    angle and the real 600 km orbital altitude (SAT_HEIGHT_M), because the
+    angle and the real 550 km orbital altitude (SAT_HEIGHT_M), because the
     proxy TX is only 300 m above the scene and the RT path delays do not
-    represent the true 600 km slant range.
+    represent the true 550 km slant range.
 
     Parameters
     ----------
@@ -349,9 +360,13 @@ def _extract_feeder_stats(paths, sat_id: int,
             feeder_propagation_delay_ms = round(prop_delay_ms, 3),
         )
 
-    mean_gain_lin = float(np.mean(valid_a))
-    mean_gain_db  = float(20.0 * np.log10(mean_gain_lin + 1e-30))
-    delay_spread_ns = float(np.std(valid_tau) * 1e9)
+    mean_power_lin  = float(np.mean(valid_a ** 2))
+    mean_gain_db    = float(10.0 * np.log10(mean_power_lin + 1e-60))
+    power_weights   = valid_a ** 2 / (valid_a ** 2).sum()
+    mean_tau_f      = float((power_weights * valid_tau).sum())
+    delay_spread_ns = float(
+        np.sqrt((power_weights * (valid_tau - mean_tau_f) ** 2).sum()) * 1e9
+    )
 
     return dict(
         feeder_elevation_deg      = round(gs_elev_deg, 1),
@@ -447,7 +462,7 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
         position = sat_pos,
         look_at  = RT_UE_POSITION,   # Beam steered towards the UE
         velocity = (0.0, 0.0, 0.0),  # Static within this snapshot
-        power_dbm = 44,              # 44 dBm ≈ 25 W EIRP per beam
+        power_dbm = RT_TX_POWER_DBM, # from config.RT_TX_POWER_DBM
         display_radius = 5,
     )
     scene.add(tx)
@@ -618,7 +633,7 @@ def run_ray_tracing() -> list:
             name      = f"sat{sat_id}",
             position  = sat_pos,
             look_at   = RT_UE_POSITION,
-            power_dbm = 44,
+            power_dbm = RT_TX_POWER_DBM,
         )
         scene.add(tx)
 

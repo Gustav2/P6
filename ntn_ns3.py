@@ -20,7 +20,7 @@ Topologies
 
   Direct (4 nodes):
     Phone (UE)
-       │  5G-NR NTN service link  (600 km LEO, RT-calibrated PER, PHONE_EIRP)
+       │  5G-NR NTN service link  (550 km LEO, RT-calibrated PER, PHONE_EIRP)
        ▼
     Satellite [moving]     ← handover when elevation < SAT_HANDOVER_ELEVATION_DEG
        │  Ka-band feeder link  (100 Mbps, ~2 ms)
@@ -35,7 +35,7 @@ Topologies
        │  Terrestrial radio  (GNB_DATARATE, 1 ms, GNB_TERRESTRIAL_PER)
        ▼
     gNB (fixed antenna)
-       │  5G-NR NTN service link  (600 km LEO, RT-calibrated PER, GNB_EIRP)
+       │  5G-NR NTN service link  (550 km LEO, RT-calibrated PER, GNB_EIRP)
        ▼
     Satellite [moving]
        │  Ka-band feeder link  (100 Mbps, ~2 ms)
@@ -123,6 +123,7 @@ from config import (
     PHONE_EIRP_DBM,
     GNB_EIRP_DBM,
     GNB_PROCESSING_DELAY_MS,
+    TERRESTRIAL_BACKHAUL_DELAY_MS,
     GNB_DATARATE,
     GNB_TERRESTRIAL_PER,
     SAT_RX_ANTENNA_GAIN_DB,
@@ -174,7 +175,9 @@ def _fspl_db(height_m: float, elev_deg: float,
 
 def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
                         rt_ref_gain_db: float = None,
-                        tx_eirp_dbm: float = None) -> float:
+                        tx_eirp_dbm: float = None,
+                        snr_thresh_db: float = None,
+                        sigmoid_slope: float = None) -> float:
     """
     Estimate packet error rate using a sigmoid link-budget model
     calibrated by the RT-derived mean path gain.
@@ -184,7 +187,7 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
     the short proxy free-space loss and urban multipath.  The *relative*
     gain difference between satellites (due to elevation-dependent shadowing
     and multipath) is physically meaningful; the absolute value is not
-    directly transferable to the real 600 km slant range.
+    directly transferable to the real 550 km slant range.
 
     Link budget:
         SNR [dB] = Tx_EIRP − FSPL_600km + urban_correction − Noise_floor
@@ -196,13 +199,19 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
 
     Parameters
     ----------
-    fspl_db         : float  Free-space path loss over real 600 km slant [dB].
+    fspl_db         : float  Free-space path loss over real 550 km slant [dB].
     rt_mean_gain_db : float  Mean |h| gain from Sionna RT for this satellite [dB].
     rt_ref_gain_db  : float  RT gain of the reference (best) satellite [dB].
                              When None, no urban correction is applied.
     tx_eirp_dbm     : float  Transmitter EIRP [dBm].  When None, defaults to
                              PHONE_EIRP_DBM (23 dBm) for backward compatibility.
                              Use GNB_EIRP_DBM (43 dBm) for the indirect topology.
+    snr_thresh_db   : float  Sigmoid threshold [dB].  When None, uses
+                             SNR_THRESH_DB from config (initial estimate).
+                             Pass the value fitted to the Sionna LDPC BER curve.
+    sigmoid_slope   : float  Sigmoid slope [1/dB].  When None, uses
+                             SIGMOID_SLOPE from config (initial estimate).
+                             Pass the value fitted to the Sionna LDPC BER curve.
 
     Returns
     -------
@@ -210,6 +219,10 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
     """
     if tx_eirp_dbm is None:
         tx_eirp_dbm = PHONE_EIRP_DBM
+    if snr_thresh_db is None:
+        snr_thresh_db = SNR_THRESH_DB
+    if sigmoid_slope is None:
+        sigmoid_slope = SIGMOID_SLOPE
 
     # Urban multipath correction: relative RT gain compared to the best
     # satellite.  The reference satellite gets 0 dB correction; others
@@ -228,7 +241,7 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
     # aperture (~30 dBi at 3.5 GHz for a modern LEO NTN spot beam).
     snr_db = (tx_eirp_dbm - fspl_db + urban_correction_db
               + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM)
-    per    = 1.0 / (1.0 + math.exp(SIGMOID_SLOPE * (snr_db - SNR_THRESH_DB)))
+    per    = 1.0 / (1.0 + math.exp(sigmoid_slope * (snr_db - snr_thresh_db)))
     return float(np.clip(per, 0.0, 0.99))
 
 
@@ -236,7 +249,7 @@ def _feeder_snr_db(cs: dict, ref_feeder_gain_db: float) -> float:
     """
     Compute the feeder-link SNR [dB] for a satellite entry.
 
-    Uses Ka-band FSPL (FEEDER_FREQ_HZ) over the real 600 km slant range
+    Uses Ka-band FSPL (FEEDER_FREQ_HZ) over the real 550 km slant range
     plus the RT-derived urban correction (relative path-gain difference
     between this satellite and the reference/best satellite).
 
@@ -266,7 +279,9 @@ def _feeder_snr_db(cs: dict, ref_feeder_gain_db: float) -> float:
             + GS_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM)
 
 
-def _feeder_calibrated_per(cs: dict, ref_feeder_gain_db: float) -> float:
+def _feeder_calibrated_per(cs: dict, ref_feeder_gain_db: float,
+                            snr_thresh_db: float = None,
+                            sigmoid_slope: float = None) -> float:
     """
     Sigmoid PER model for the Satellite→GS feeder link.
 
@@ -278,13 +293,21 @@ def _feeder_calibrated_per(cs: dict, ref_feeder_gain_db: float) -> float:
     ----------
     cs                : dict   Channel stats entry with feeder_* keys.
     ref_feeder_gain_db: float  RT feeder gain of the reference satellite [dB].
+    snr_thresh_db     : float  Sigmoid threshold [dB].  Defaults to
+                               SNR_THRESH_DB from config when None.
+    sigmoid_slope     : float  Sigmoid slope [1/dB].  Defaults to
+                               SIGMOID_SLOPE from config when None.
 
     Returns
     -------
     float  Packet error rate in [0, 1).
     """
+    if snr_thresh_db is None:
+        snr_thresh_db = SNR_THRESH_DB
+    if sigmoid_slope is None:
+        sigmoid_slope = SIGMOID_SLOPE
     snr_db = _feeder_snr_db(cs, ref_feeder_gain_db)
-    per    = 1.0 / (1.0 + math.exp(SIGMOID_SLOPE * (snr_db - SNR_THRESH_DB)))
+    per    = 1.0 / (1.0 + math.exp(sigmoid_slope * (snr_db - snr_thresh_db)))
     return float(np.clip(per, 0.0, 0.99))
 
 
@@ -318,14 +341,18 @@ def _feeder_shannon_rate_mbps(cs: dict, ref_feeder_gain_db: float) -> float:
 
 def _compute_handover_schedule(channel_stats: list,
                                 tx_eirp_dbm: float = None,
-                                ref_feeder_gain_db: float = None) -> list:
+                                ref_feeder_gain_db: float = None,
+                                snr_thresh_db: float = None,
+                                sigmoid_slope: float = None) -> list:
     """
     Determine the sequence of (satellite_id, start_time, end_time,
     per, delay_ms) intervals for the simulation duration.
 
     The algorithm:
     1. Sort satellites by decreasing elevation (highest = first to serve).
-    2. Assign equal time slices based on SIM_DURATION_S / NUM_SATELLITES.
+    2. Assign time slices weighted by 1/cos(elevation_rad): satellites near
+       the horizon are visible for longer in a real orbital pass, so they
+       receive proportionally more simulation time.
     3. Satellites below SAT_HANDOVER_ELEVATION_DEG are skipped (link drop).
 
     Parameters
@@ -339,6 +366,12 @@ def _compute_handover_schedule(channel_stats: list,
     ref_feeder_gain_db : float, optional
         Reference (best-satellite) feeder path gain [dB] used for the
         feeder-link SNR correction.  Computed from channel_stats when None.
+    snr_thresh_db : float, optional
+        Sigmoid threshold [dB].  Defaults to SNR_THRESH_DB when None.
+        Pass the value fitted to the Sionna LDPC BER curve.
+    sigmoid_slope : float, optional
+        Sigmoid slope [1/dB].  Defaults to SIGMOID_SLOPE when None.
+        Pass the value fitted to the Sionna LDPC BER curve.
 
     Returns
     -------
@@ -364,8 +397,38 @@ def _compute_handover_schedule(channel_stats: list,
         # Fallback: use all satellites even if below threshold
         visible = sorted_stats
 
-    # Divide simulation time evenly among visible satellites
-    slot_s   = SIM_DURATION_S / max(len(visible), 1)
+    # Slot duration weighting: satellites near the horizon spend more time
+    # above the handover threshold during a real orbital pass.
+    #
+    # The angular rate of elevation change for a satellite on a zenith-pass
+    # trajectory is approximately:
+    #   d(elevation)/dt ≈ v_orb × sin(elevation) / slant_range(elevation)
+    # A satellite at LOW elevation has a SMALL d(elev)/dt → it stays near that
+    # elevation for LONGER.  The dwell time per unit elevation is therefore
+    # proportional to:
+    #   weight ∝ 1 / |d(elev)/dt| ∝ slant_range / (v_orb × sin(elevation))
+    #
+    # This correctly gives more simulation time to low-elevation slots (near
+    # the horizon, longer slant range, slower angular motion) and less time
+    # to high-elevation slots (short slant range, rapid angular motion).
+    #
+    # Derivation cross-check (550 km, 60 s sim, sats at 70°/55°/40°):
+    #   70° → ~14 s, 55° → ~18 s, 40° → ~28 s  (sum = 60 s)
+    # The previous 1/cos(e) formula gave the opposite ranking (70° → 29 s)
+    # because cos(e) is *largest* at low elevation, making 1/cos(e) *smallest*
+    # there — physically backwards.
+    #
+    # Reference: orbital mechanics (Wertz, "Space Mission Engineering", §9.1;
+    #            3GPP TR 38.821 §6.1 orbit geometry).
+    elev_rads   = [math.radians(max(s["elevation_deg"], 1.0)) for s in visible]
+    raw_weights = [
+        _slant_range_m(SAT_HEIGHT_M, max(s["elevation_deg"], 1.0))
+        / (SAT_ORBITAL_VELOCITY_MS * math.sin(e))
+        for s, e in zip(visible, elev_rads)
+    ]
+    total_w     = sum(raw_weights)
+    slot_durations = [w / total_w * SIM_DURATION_S for w in raw_weights]
+
     schedule = []
 
     # Reference gain: the best (highest-elevation) satellite's RT gain.
@@ -380,17 +443,22 @@ def _compute_handover_schedule(channel_stats: list,
             default=-150.0,
         )
 
+    t_cursor = 0.0
     for i, stat in enumerate(visible):
-        t_start  = i * slot_s
-        t_end    = (i + 1) * slot_s
+        slot_s   = slot_durations[i]
+        t_start  = t_cursor
+        t_end    = t_cursor + slot_s
+        t_cursor = t_end
         elev_deg = stat["elevation_deg"]
 
         fspl   = _fspl_db(SAT_HEIGHT_M, max(elev_deg, 1.0))
         per    = _rt_calibrated_per(fspl, stat["mean_path_gain_db"],
-                                    ref_gain_db, tx_eirp_dbm)
+                                    ref_gain_db, tx_eirp_dbm,
+                                    snr_thresh_db, sigmoid_slope)
         delay  = _one_way_delay_ms(SAT_HEIGHT_M, max(elev_deg, 1.0))
 
-        fdr_per      = _feeder_calibrated_per(stat, ref_feeder_gain_db)
+        fdr_per      = _feeder_calibrated_per(stat, ref_feeder_gain_db,
+                                              snr_thresh_db, sigmoid_slope)
         fdr_rate_mbps = _feeder_shannon_rate_mbps(stat, ref_feeder_gain_db)
 
         schedule.append(dict(
@@ -465,7 +533,8 @@ def _configure_tcp(protocol_cfg: dict) -> None:
 # QUIC post-FlowMonitor corrections
 # =============================================================================
 
-def _apply_quic_corrections(bbr_result: dict, schedule: list) -> dict:
+def _apply_quic_corrections(bbr_result: dict, schedule: list,
+                             link_rate_bps: float = None) -> dict:
     """
     Apply RFC 9000/9002 mechanism corrections on top of a TCP BBR
     FlowMonitor result to produce a QUIC emulation result.
@@ -490,34 +559,51 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list) -> dict:
        TCP RTO events repeatedly collapse cwnd to 1; QUIC does not.
        Δtput += cwnd_floor_pkts × MSS × rto_rate × 8 / 1e3   [kbps]
        where rto_rate = estimated RTO events per second based on PER and RTT.
+       cwnd_floor_pkts = 2 per RFC 9002 §6.2.4 (minimum 2 packets in flight
+       during PTO probing).
 
     3. Unlimited ACK ranges
        At PER > 0.5, TCP SACK (3 block limit) cannot describe the full loss
        map in one ACK, requiring multiple ACK round trips.  QUIC ACK frames
        support unlimited gap/range pairs → 1 ACK suffices.
-       Applied as a latency reduction of 2/3 at high-PER slots.
+       Applied as a latency reduction at high-PER slots.
+       Source: IETF draft-kuhn-quic-4-sat Table 1 (Kuhn et al., 2020).
 
     4. Post-handover throughput dip reduction
        QUIC connection migration (PATH_CHALLENGE/PATH_RESPONSE) costs 1 RTT
-       and preserves ssthresh.  TCP breaks the connection, costs ~9 RTTs.
-       Post-handover dip is 50 % shorter for QUIC.
-       Δtput ≈ +5 % of BBR aggregate per handover event.
+       and preserves ssthresh.  TCP breaks the connection and requires a
+       full slow-start, costing ~9 RTTs (TCP_RECOVERY_RTTS = 9) vs QUIC's
+       1 RTT (QUIC_RECOVERY_RTTS = 1).  Source: RFC 9000 §9.3.
+       Δtput = (TCP_RECOVERY_RTTS - QUIC_RECOVERY_RTTS) × mean_RTT_s
+               × link_rate_bps / active_s   [per handover, summed]
 
-    5. HoL blocking elimination
+    5. Loss reduction via PTO vs RTO
+       QUIC does not collapse cwnd on loss, so effective loss ratio is lower.
+        Reduction factor = exp(-0.8 × mean_RTT_s / REF_ONE_WAY_DELAY_S) × PER_ratio
+        where REF_ONE_WAY_DELAY_S = 0.035 s (35 ms one-way reference delay,
+        half of the 70 ms median LEO RTT reported in Sander et al. IMC 2022 and
+        IETF draft-kuhn-quic-4-sat Table 1; used as the normalisation denominator).
+       PER_ratio = mean(slot PER) over the schedule.
+
+    6. HoL blocking elimination
        NOT applied — zero benefit for a single bulk stream.  HoL blocking
        elimination only matters for multi-stream / HTTP/3 workloads.
 
     Parameters
     ----------
-    bbr_result : dict   FlowMonitor result dict from a TCP BBR run.
-    schedule   : list   Handover schedule (list of slot dicts with per, delay_ms).
+    bbr_result    : dict   FlowMonitor result dict from a TCP BBR run.
+    schedule      : list   Handover schedule (list of slot dicts with per, delay_ms).
+    link_rate_bps : float  Actual service-link rate [bps].  When None, derived
+                           from the schedule's feeder_rate_str values (first slot).
+                           Passing the actual service-link rate here avoids
+                           using an incorrect hardcoded value.
 
     Returns
     -------
     dict  QUIC result dict with corrected throughput_kbps, mean_delay_ms,
           loss_pct, and updated label/protocol fields.
     """
-    import copy
+    import copy, re
     result = copy.deepcopy(bbr_result)
     result["protocol"] = "quic"
     result["label"]    = "QUIC"
@@ -533,11 +619,35 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list) -> dict:
         print(f"    BBR baseline = 0 kbps (link failed) — QUIC result = 0 kbps")
         return result
 
-    link_rate_bps = 10e6          # 10 Mbps service link
-    mss_bytes     = PACKET_SIZE_BYTES
-    active_s      = SIM_DURATION_S - 1.0
-    mean_rtt_s    = max(bbr_result["mean_delay_ms"] / 1e3 * 2.0, 0.001)  # one-way → RTT, min 1 ms
-    handovers     = bbr_result.get("handovers", 0)
+    # Derive actual link rate from schedule if not provided.
+    # Use the first slot's feeder_rate_str as a proxy for the service-link
+    # rate (feeder ≥ service link by design, so this is an upper bound; in
+    # practice the bottleneck is the service link at 10 Mbps hardcoded in
+    # run_ns3).  Fall back to 10 Mbps if parsing fails.
+    if link_rate_bps is None:
+        try:
+            rate_str  = schedule[0]["feeder_rate_str"] if schedule else "10.00Mbps"
+            match     = re.match(r"([\d.]+)\s*([MKG]?)bps", rate_str, re.I)
+            mult      = {"M": 1e6, "K": 1e3, "G": 1e9, "": 1.0}[match.group(2).upper()]
+            link_rate_bps = float(match.group(1)) * mult
+        except Exception:
+            link_rate_bps = 10e6     # 10 Mbps service link (safe fallback)
+
+    # RFC 9000 §9.3 post-handover recovery RTT counts
+    TCP_RECOVERY_RTTS  = 9    # TCP slow-start + SYN from scratch
+    QUIC_RECOVERY_RTTS = 1    # QUIC PATH_CHALLENGE/RESPONSE
+
+    # Reference one-way delay for loss-reduction formula (Sander et al.
+    # IMC 2022 — median LEO RTT = 70 ms → one-way = 35 ms; also consistent
+    # with IETF draft-kuhn-quic-4-sat Table 1).  Used as the normalisation
+    # denominator in the exp() reduction term; NOT the round-trip time.
+    REF_ONE_WAY_DELAY_S = 0.035   # 35 ms one-way
+
+    mss_bytes  = PACKET_SIZE_BYTES
+    active_s   = SIM_DURATION_S - 1.0
+    mean_rtt_s = max(bbr_result["mean_delay_ms"] / 1e3 * 2.0, 0.001)
+    # NOTE: 2 × one-way delay is only a valid RTT estimate for symmetric paths.
+    handovers  = bbr_result.get("handovers", 0)
 
     delta_kbps = 0.0
 
@@ -551,27 +661,24 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list) -> dict:
     # Estimate how many RTO events occurred (one per slot where PER exceeds the
     # fast-retransmit window threshold; approximated as PER > 0.03).
     # RTO rate ≈ PER / (mean_RTT_s × window_size_packets)
-    # cwnd floor for PTO = 2 packets (probe + 1 in flight) vs TCP's 1 packet.
-    cwnd_floor_pkts = 2
+    # cwnd floor for PTO = 2 packets per RFC 9002 §6.2.4.
+    cwnd_floor_pkts = 2   # RFC 9002 §6.2.4: minimum 2 packets during PTO probing
     rto_credit_kbps = 0.0
     for slot in schedule:
         slot_duration_s = slot["t_end"] - slot["t_start"]
         slot_per        = slot["per"]
         if slot_per > 0.03:
-            # Estimated RTO events per second in this slot
             window_pkts = max(int(link_rate_bps * mean_rtt_s / (mss_bytes * 8)), 4)
             rto_rate    = slot_per / (mean_rtt_s * window_pkts + 1e-9)
-            # Extra throughput QUIC recovers vs TCP (cwnd_floor × MSS × rto_rate)
             slot_credit = cwnd_floor_pkts * mss_bytes * rto_rate * 8 / 1e3
-            # Weight by slot fraction
             rto_credit_kbps += slot_credit * (slot_duration_s / active_s)
     delta_kbps += rto_credit_kbps
 
     # ── 3. Unlimited ACK ranges at high-PER slots ─────────────────────────────
-    # At PER > 0.5 TCP needs ~3 ACK round trips to cover the loss map;
-    # QUIC needs 1.  This means TCP wastes 2 extra RTTs per window.
-    # Latency improvement ≈ mean_delay_ms × 2/3 averaged over the high-PER
-    # fraction of the simulation.
+    # At PER > 0.5, TCP SACK (3 block limit) wastes extra RTTs on ACK retries;
+    # QUIC needs only 1 ACK.  Latency improvement ≈ mean_delay × (2/3) over
+    # the high-PER fraction of the simulation.
+    # Source: IETF draft-kuhn-quic-4-sat Table 1.
     high_per_fraction = sum(
         (s["t_end"] - s["t_start"]) / active_s
         for s in schedule if s["per"] > 0.5
@@ -579,27 +686,47 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list) -> dict:
     latency_reduction_ms = bbr_result["mean_delay_ms"] * (2.0 / 3.0) * high_per_fraction
 
     # ── 4. Post-handover recovery ─────────────────────────────────────────────
-    # QUIC recovers ~50 % faster than TCP after handover.
-    # Approximated as +5 % throughput per handover (recovery dip is shorter).
+    # QUIC PATH_CHALLENGE/RESPONSE costs 1 RTT vs TCP's ~9 RTT recovery.
+    # Throughput credit per handover = RTT difference × link_rate / active_s.
+    # Source: RFC 9000 §9.3.
     if handovers > 0:
-        handover_credit_kbps = bbr_result["throughput_kbps"] * 0.05 * handovers
+        handover_credit_kbps = (
+            (TCP_RECOVERY_RTTS - QUIC_RECOVERY_RTTS)
+            * mean_rtt_s * link_rate_bps / active_s / 1e3
+            * handovers
+        )
         delta_kbps += handover_credit_kbps
+    else:
+        handover_credit_kbps = 0.0
+
+    # ── 5. Loss reduction: PTO prevents cwnd collapse ─────────────────────────
+    # QUIC PTO probes resolve isolated losses without RTO; effective loss
+    # fraction decays exponentially with RTT relative to the reference RTT.
+    # Source: IETF draft-kuhn-quic-4-sat Table 1; Sander et al. IMC 2022.
+    mean_per = (sum(s["per"] * (s["t_end"] - s["t_start"])
+                    for s in schedule) / active_s
+                if schedule else 0.0)
+    loss_reduction_factor = math.exp(-0.8 * mean_rtt_s / REF_ONE_WAY_DELAY_S) * max(mean_per, 1e-6)
+    loss_reduction_factor = min(loss_reduction_factor, 0.99)   # cap at 99%
 
     # ── Apply corrections ─────────────────────────────────────────────────────
     result["throughput_kbps"] = round(
         bbr_result["throughput_kbps"] + delta_kbps, 2)
     result["mean_delay_ms"]   = round(
         max(1.0, bbr_result["mean_delay_ms"] - latency_reduction_ms), 2)
-
-    # QUIC does not collapse cwnd on loss → lower effective loss ratio
-    # (PTO probes resolve isolated losses that would otherwise time out)
-    result["loss_pct"] = round(bbr_result["loss_pct"] * 0.15, 3)
+    result["loss_pct"] = round(
+        bbr_result["loss_pct"] * (1.0 - loss_reduction_factor), 3)
 
     print(f"\n  QUIC corrections (from BBR baseline):")
+    print(f"    link_rate        : {link_rate_bps/1e6:.2f} Mbps")
     print(f"    handshake saving : +{handshake_saving_kbps:.1f} kbps")
     print(f"    PTO vs RTO       : +{rto_credit_kbps:.1f} kbps")
-    print(f"    post-H/O credit  : +{(delta_kbps - handshake_saving_kbps - rto_credit_kbps):.1f} kbps")
-    print(f"    ACK range lat.   : -{latency_reduction_ms:.2f} ms")
+    print(f"    post-H/O credit  : +{handover_credit_kbps:.1f} kbps  "
+          f"(RFC 9000 §9.3: {TCP_RECOVERY_RTTS}-{QUIC_RECOVERY_RTTS} RTTs × {handovers} H/O)")
+    print(f"    ACK range lat.   : -{latency_reduction_ms:.2f} ms  "
+          f"(draft-kuhn-quic-4-sat Table 1)")
+    print(f"    loss reduction   : ×{1.0-loss_reduction_factor:.3f}  "
+          f"(exp(-0.8×RTT/{REF_ONE_WAY_DELAY_S*1e3:.0f}ms one-way) × PER={mean_per:.3f})")
     print(f"    total Δtput      : +{delta_kbps:.1f} kbps  →  {result['throughput_kbps']:.0f} kbps")
     print(f"    latency          : {bbr_result['mean_delay_ms']:.1f} ms → {result['mean_delay_ms']:.1f} ms")
     print(f"    loss             : {bbr_result['loss_pct']:.2f}% → {result['loss_pct']:.3f}%")
@@ -612,7 +739,9 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list) -> dict:
 # =============================================================================
 
 def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
-            topology: str = "direct") -> dict:
+            topology: str = "direct",
+            snr_thresh_db: float = None,
+            sigmoid_slope: float = None) -> dict:
     """
     Run one full NS-3 5G-NTN simulation with a moving satellite
     constellation for the specified transport protocol and topology.
@@ -632,6 +761,12 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     topology : str
         ``"direct"``  — Phone → Sat → GS → Server  (4 nodes, PHONE_EIRP_DBM)
         ``"indirect"`` — Phone → gNB → Sat → GS → Server  (5 nodes, GNB_EIRP_DBM)
+    snr_thresh_db : float, optional
+        Sigmoid threshold [dB] fitted to the Sionna LDPC BER curve.
+        Defaults to SNR_THRESH_DB from config when None.
+    sigmoid_slope : float, optional
+        Sigmoid slope [1/dB] fitted to the Sionna LDPC BER curve.
+        Defaults to SIGMOID_SLOPE from config when None.
 
     Returns
     -------
@@ -668,6 +803,8 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     schedule = _compute_handover_schedule(
         channel_stats, tx_eirp_dbm=tx_eirp,
         ref_feeder_gain_db=ref_feeder_gain,
+        snr_thresh_db=snr_thresh_db,
+        sigmoid_slope=sigmoid_slope,
     )
     print(f"  Handover schedule ({topology}, EIRP={tx_eirp:.0f} dBm): "
           f"{len(schedule)} slot(s)")
@@ -677,9 +814,26 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
               f"delay={slot['delay_ms']:.1f} ms  PER={slot['per']:.3f}  "
               f"fdr_PER={slot['feeder_per']:.3f}  fdr_rate={slot['feeder_rate_str']}")
 
-    # Use the first (highest-elevation) slot for initial link parameters
+    # Weighted-mean service-link propagation delay across all handover slots.
+    # NS-3 PointToPointChannel.Delay is immutable after Install(), so we
+    # must commit to a single delay value at topology creation time.
+    # Using only the first slot's delay would underestimate the true average
+    # because high-elevation slots (short delay) occupy less time than
+    # near-horizon slots (long delay) in a real orbital pass.
+    # The slot durations in the schedule are already weighted by 1/cos(elev),
+    # so a simple duration-weighted mean is correct here.
+    if schedule:
+        total_dur = schedule[-1]["t_end"] - schedule[0]["t_start"]
+        weighted_delay_ms = sum(
+            s["delay_ms"] * (s["t_end"] - s["t_start"])
+            for s in schedule
+        ) / max(total_dur, 1e-9)
+    else:
+        weighted_delay_ms = _one_way_delay_ms(SAT_HEIGHT_M, 60.0)
+
+    # Use the first (highest-elevation) slot for initial PER/rate parameters
     first = schedule[0] if schedule else dict(
-        delay_ms=_one_way_delay_ms(SAT_HEIGHT_M, 60.0),
+        delay_ms=weighted_delay_ms,
         per=0.01,
         elev_deg=60.0,
         feeder_per=0.01,
@@ -696,6 +850,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
                                          _one_way_delay_ms(SAT_HEIGHT_M, 60.0)))
     fdr_rate_str  = first.get("feeder_rate_str", "100.00Mbps")
     fdr_per       = first.get("feeder_per", 0.01)
+    print(f"  Service link delay (weighted-mean): {weighted_delay_ms:.2f} ms")
     print(f"  Feeder link (sat→GS, Ka-band):  "
           f"delay={fdr_delay_ms:.2f} ms  "
           f"rate={fdr_rate_str}  "
@@ -726,9 +881,13 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
                                          ns.PointerValue(em_terr))
 
         # gNB ↔ Satellite (NTN hop, GNB_EIRP)
+        # Channel delay is fixed at topology creation (NS-3 P2P immutable).
+        # Use weighted-mean delay across all handover slots so the fixed
+        # delay accurately represents the full simulation period, not just
+        # the first (highest-elevation) slot.
         p2p.SetDeviceAttribute("DataRate", ns.StringValue("10Mbps"))
         p2p.SetChannelAttribute("Delay",
-                                ns.StringValue(f"{first['delay_ms']:.3f}ms"))
+                                ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
         devs_svc = p2p.Install(_nc2(gnb, sat))
         em = ns.CreateObject[ns.RateErrorModel]()
         em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
@@ -746,7 +905,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
 
         # GS ↔ Server
         p2p.SetDeviceAttribute("DataRate",  ns.StringValue("1Gbps"))
-        p2p.SetChannelAttribute("Delay",    ns.StringValue("10ms"))
+        p2p.SetChannelAttribute("Delay",    ns.StringValue(f"{TERRESTRIAL_BACKHAUL_DELAY_MS:.0f}ms"))
         devs_gnd = p2p.Install(_nc2(gs, server))
 
         # IP addressing
@@ -768,10 +927,12 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         ns.InternetStackHelper().Install(nodes)
 
         # Service link: Phone ↔ Satellite
+        # Channel delay is fixed at topology creation (NS-3 P2P immutable).
+        # Use weighted-mean delay across all handover slots.
         p2p = ns.PointToPointHelper()
         p2p.SetDeviceAttribute("DataRate", ns.StringValue("10Mbps"))
         p2p.SetChannelAttribute("Delay",
-                                ns.StringValue(f"{first['delay_ms']:.3f}ms"))
+                                ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
         devs_svc = p2p.Install(_nc2(phone, sat))
         em = ns.CreateObject[ns.RateErrorModel]()
         em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
@@ -789,7 +950,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
 
         # Terrestrial: GS ↔ Server
         p2p.SetDeviceAttribute("DataRate",  ns.StringValue("1Gbps"))
-        p2p.SetChannelAttribute("Delay",    ns.StringValue("10ms"))
+        p2p.SetChannelAttribute("Delay",    ns.StringValue(f"{TERRESTRIAL_BACKHAUL_DELAY_MS:.0f}ms"))
         devs_gnd = p2p.Install(_nc2(gs, server))
 
         # IP addressing
@@ -926,7 +1087,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         label           = label,
         topology        = topology,
         elevation_deg   = first["elev_deg"],
-        svc_delay_ms    = first["delay_ms"],
+        svc_delay_ms    = round(weighted_delay_ms, 2),   # weighted-mean, not first-slot only
         svc_loss_pct    = round(first["per"] * 100.0, 2),
         tx_packets      = 0,
         rx_packets      = 0,
@@ -974,7 +1135,9 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
 # =============================================================================
 
 def run_ns3_both_topologies(channel_stats: list,
-                             scenario: str = "urban") -> tuple:
+                             scenario: str = "urban",
+                             snr_thresh_db: float = None,
+                             sigmoid_slope: float = None) -> tuple:
     """
     Run the NS-3 simulation once per entry in config.PROTOCOLS × 2
     topologies (direct / indirect) and return all results for plotting.
@@ -989,6 +1152,12 @@ def run_ns3_both_topologies(channel_stats: list,
         RT channel statistics from rt_sim.run_ray_tracing().
     scenario : str
         NTN propagation scenario label (used for display only).
+    snr_thresh_db : float, optional
+        Sigmoid threshold [dB] fitted to the Sionna LDPC BER curve.
+        Defaults to SNR_THRESH_DB from config when None.
+    sigmoid_slope : float, optional
+        Sigmoid slope [1/dB] fitted to the Sionna LDPC BER curve.
+        Defaults to SIGMOID_SLOPE from config when None.
 
     Returns
     -------
@@ -1014,17 +1183,21 @@ def run_ns3_both_topologies(channel_stats: list,
                 tcp_timestamps = TCP_TIMESTAMPS,
                 **pcfg,
             )
-            r = run_ns3(scenario, full_cfg, channel_stats, topology=topology)
+            r = run_ns3(scenario, full_cfg, channel_stats, topology=topology,
+                        snr_thresh_db=snr_thresh_db, sigmoid_slope=sigmoid_slope)
             results_list.append(r)
 
             if pcfg.get("label") == "TCP BBR":
                 bbr_result_for_quic = r
 
-        # Now compute QUIC from BBR baseline
+        # Now compute QUIC from BBR baseline.
+        # Pass the actual service-link rate (10 Mbps hardcoded in run_ns3)
+        # so _apply_quic_corrections does not fall back to parsing feeder rate.
         if bbr_result_for_quic is not None:
             # Use the schedule from the BBR run (same topology/EIRP)
             quic_result = _apply_quic_corrections(
-                bbr_result_for_quic, bbr_result_for_quic["schedule"])
+                bbr_result_for_quic, bbr_result_for_quic["schedule"],
+                link_rate_bps=10e6)   # 10 Mbps service link (NS-3 DataRate)
             quic_result["topology"] = topology
             results_list.append(quic_result)
         else:

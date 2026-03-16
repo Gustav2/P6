@@ -44,6 +44,7 @@ from config import (
     BATCH_SIZE,
     SAT_HEIGHT_M,
     ELEVATION_ANGLE_DEG,
+    SAT_ORBITAL_VELOCITY_MS,
 )
 
 
@@ -147,7 +148,7 @@ class NTNOFDMModel(Block):
         )
 
         self._rm_null = RemoveNulledSubcarriers(self._rg)
-        self._ls_est  = LSChannelEstimator(self._rg, interpolation_type="nn")
+        self._ls_est  = LSChannelEstimator(self._rg, interpolation_type="lin")
         self._lmmse   = LMMSEEqualizer(self._rg, self._sm)
         self._demap   = Demapper("app", "qam", NUM_BITS_PER_SYMBOL)
         self._dec     = LDPC5GDecoder(self._enc, hard_out=True)
@@ -198,17 +199,28 @@ def run_sionna_ber(snr_db_range: np.ndarray, scenario: str):
 
     ch_model = build_channel_model(scenario)
 
+    # Elevation geometry: satellite is not directly overhead.
+    # Horizontal offset = height / tan(elevation_angle) places the satellite
+    # at the correct slant range for the configured elevation angle.
+    elevation_rad = np.deg2rad(ELEVATION_ANGLE_DEG)
+    horiz_offset_m = SAT_HEIGHT_M / np.tan(elevation_rad)
+
     ut_loc          = tf.zeros([BATCH_SIZE, 1, 3], dtype=tf.float32)
     bs_loc          = tf.tile(
-        tf.constant([[[0., 0., SAT_HEIGHT_M]]], dtype=tf.float32),
+        tf.constant([[[horiz_offset_m, 0., SAT_HEIGHT_M]]], dtype=tf.float32),
         [BATCH_SIZE, 1, 1],
     )
     ut_orientations = tf.zeros([BATCH_SIZE, 1, 3], dtype=tf.float32)
     bs_orientations = tf.zeros([BATCH_SIZE, 1, 3], dtype=tf.float32)
-    ut_velocities   = tf.tile(
-        tf.constant([[[7600., 0., 0.]]], dtype=tf.float32),
-        [BATCH_SIZE, 1, 1],
-    )
+    # Velocity: set to zero to model NTN-capable UEs with Doppler pre-compensation.
+    # 3GPP TR 38.821 §6.1.2 mandates that NTN UEs pre-compensate the LEO satellite
+    # Doppler shift (up to ±88 kHz at 3.5 GHz) before the OFDM demodulator.
+    # Without pre-compensation, the 7612 m/s orbital velocity produces a Doppler
+    # shift of ~88 kHz >> 15 kHz SCS, causing catastrophic ICI (BER ≈ 0.5).
+    # Setting ut_velocities = 0 models a UE that has pre-compensated Doppler;
+    # the channel statistics (delay spread, shadow fading) still reflect the NTN
+    # environment per TR 38.811.
+    ut_velocities   = tf.zeros([BATCH_SIZE, 1, 3], dtype=tf.float32)
     in_state        = tf.zeros([BATCH_SIZE, 1], dtype=tf.bool)
 
     ch_model.set_topology(

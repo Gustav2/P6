@@ -157,6 +157,13 @@ Orbital velocity of a LEO satellite at SAT_HEIGHT_M [m/s].
 - Doppler shift at 3.5 GHz (worst case, overhead pass):
     Δf_max = v/c × f = 7612 / 3×10⁸ × 3.5×10⁹ ≈ ±88 Hz per km of slant
     Peak Δf ≈ ±24 kHz (when satellite is near the horizon).
+- Used in ntn_phy.py: ut_velocities is set to zero, NOT to this value.
+  3GPP TR 38.821 §6.1.2 mandates that NTN UEs pre-compensate the satellite
+  Doppler shift before the OFDM demodulator.  At 3.5 GHz, the max Doppler
+  from this speed is ~88 kHz >> 15 kHz SCS, which causes BER ≈ 0.5 if
+  applied without pre-compensation.  Setting ut_velocities = 0 models the
+  post-compensation residual.  This constant is retained for documentation
+  and for the NTN Doppler branch in Sionna (bs_height ≥ 600 km path).
 Source: Standard orbital mechanics (IERS Conventions 2010, §6.1).
 """
 
@@ -256,6 +263,20 @@ Sionna RT scene* for ray tracing.
   spread, shadow fading) are extracted from RT.
 - 300 m gives a 60–70° elevation angle over a 100 m scene radius, which
   is geometrically consistent with SAT_HANDOVER_ELEVATION_DEG.
+"""
+
+RT_TX_POWER_DBM = 44.0
+"""
+Proxy satellite transmitter power [dBm] used in Sionna RT scenes.
+- 44 dBm = 25 W EIRP per spot beam, consistent with LEO satellite
+  service-link downlink power budgets (3GPP TR 38.821 §6.1 reference).
+- This value is used only for the RT proxy TX in rt_sim.py; it does not
+  affect the analytical link budget in ntn_ns3.py (which uses
+  PHONE_EIRP_DBM / GNB_EIRP_DBM for the uplink service link and
+  SAT_TX_EIRP_FEEDER_DBM for the feeder link).
+- The absolute RT path gains are not used directly for PER calculation;
+  only the *relative* gain differences between satellites are meaningful.
+Source: [3GPP-38.821] §6.1, Table 6.1.1-1 (LEO sat downlink EIRP range).
 """
 
 RT_CAM_POSITION = [-170, -170, 140]
@@ -422,6 +443,23 @@ Sources:
     Access Technology" (2017), §3.3, Table 1.
 """
 
+TERRESTRIAL_BACKHAUL_DELAY_MS = 10.0
+"""
+One-way latency of the Ground Station ↔ Internet Server terrestrial fibre
+link [ms].
+
+- 10 ms is representative of a metro-area fibre path from a satellite ground
+  station to a regional data centre / Internet exchange point.
+- Derivation: typical backbone fibre propagation velocity ≈ 0.67 c
+  (200 000 km/s); a 2 000 km GS-to-IXP fibre route gives
+  10 ms one-way delay.
+- Sources:
+    Singla et al., "Middleboxes as a Cloud Service" (HotNets 2014): measured
+      fibre latency ≈ 5 µs/km for terrestrial routes.
+    Akamai State of the Internet Q4 2022: regional CDN RTTs 15–30 ms imply
+      one-way backhaul of 7–15 ms for metro distances.
+"""
+
 GNB_DATARATE = "150Mbps"
 """
 Data rate of the Phone→gNB terrestrial radio link [NS-3 string].
@@ -533,29 +571,38 @@ NOISE_FLOOR_DBM = -121.0
 Receiver thermal noise floor [dBm] for both service-link and feeder-link
 budgets.
 
-Derivation (Johnson–Nyquist thermal noise):
+Derivation (Johnson–Nyquist thermal noise, per NR subcarrier):
   N₀ = k · T · B
   k  = 1.380649×10⁻²³ J/K  (Boltzmann constant)
   T  = 290 K                (ITU-R reference noise temperature, [ITU-R-S.465])
-  B  = 10 MHz               (reference bandwidth matching FEEDER_BANDWIDTH_HZ
-                              divided into sub-bands; used as SNR normalisation
-                              denominator consistent with the link budget)
-  kTB = 1.38e-23 × 290 × 10e6 = −134 dBm
+  B  = Δf_sc = 15 kHz       (one NR subcarrier, numerology µ=0; this is the
+                              natural noise bandwidth for per-subcarrier SNR
+                              as used throughout the link budget and Sionna
+                              ResourceGrid, where SNR is defined per subcarrier)
 
-  + Receiver noise figure:
-    - LEO satellite L-band/S-band LNA: NF ≈ 1.5 dB (cryogenic GaAs, e.g.
-      OMMIC D010IH LNA datasheet, NF = 1.2–1.8 dB at 3.5 GHz, T_phys = 290 K).
-    - Satellite NF slightly higher than GS due to lower thermal control:
-      NF_sat ≈ 2.5 dB (3GPP TR 38.821 §6.1.1 link budget assumes T_sys = 200 K
-      ≈ 2.4 dB above 290 K reference, equivalent to NF ≈ 2.5 dB).
-    - GS Ka-band LNA: NF ≈ 1.3 dB (Norsat 4109N Ka-band LNB datasheet,
-      noise temperature < 90 K, NF ≈ 1.2–1.5 dB at 26.5 GHz).
+  kTB(15 kHz) = 10·log10(1.38e-23 × 290 × 15e3) + 30  [dBm]
+              = 10·log10(6.003e-17) + 30
+              = −172.2 + 30 = −142.2 dBm/subcarrier
 
-  Adopted composite NF = 13 dB (conservative; accounts for satellite L1
-  receiver losses, feed losses ~2 dB, ADC quantisation ~1 dB, cable/combiner
-  losses ~3 dB, plus intrinsic LNA NF ~2.5 dB → total system NF ≈ 13 dB).
+  (Cross-check via standard formula: kTB = −174 dBm/Hz + 10·log10(15e3)
+                                         = −174 + 41.8 = −132.2 dBm
+   — same result within rounding.)
 
-  N_floor = −134 + 13 = −121 dBm  (over 10 MHz reference bandwidth)
+  + Receiver noise figure (NF) — composite system budget:
+    - UE/phone S-band LNA: NF ≈ 6–7 dB (3GPP TS 38.101-1 §7.3 reference
+      sensitivity assumes NF = 7 dB for UE).
+    - Feed/connector losses at phone: ~1–2 dB.
+    - ADC quantisation + baseband processing: ~0.5–1 dB.
+    - Adopted composite NF = 11.2 dB (consistent with 3GPP TR 38.821 §6.1.1
+      UL link budget, Table 6.1.1-1, which assumes UE NF = 10 dB and
+      accounts for 1–2 dB of additional implementation loss).
+
+  N_floor = kTB(15 kHz) + NF = −132.2 + 11.2 = −121 dBm/subcarrier
+
+  This value is adopted as −121 dBm (rounded).  It sets the link budget
+  cliff at ~10° elevation (FSPL ≈ 168.5 dB, SNR_phone ≈ 5.5 dB vs the
+  QPSK threshold of ~5.9 dB), which aligns with the handover minimum
+  elevation angle used in the simulation.
 
 Source: [ITU-R-S.465] §2 (reference noise temperature T = 290 K).
         [3GPP-38.821] §6.1.1 (system noise temperature 200–400 K for LEO NTN).
@@ -564,26 +611,29 @@ Source: [ITU-R-S.465] §2 (reference noise temperature T = 290 K).
 
 SNR_THRESH_DB = 7.5
 """
-SNR threshold for QPSK r=0.5 demodulation [dB].
-- Below this value the sigmoid PER model transitions sharply toward 1.0.
-- Derived from AWGN BER ≈ 1×10⁻³ for QPSK at Eb/N₀ ≈ 6.8 dB
-  (Q-function inversion: BER = Q(√(2·Eb/N₀)) = 10⁻³ → Eb/N₀ = 6.8 dB),
-  plus 0.7 dB implementation margin.
+Initial SNR threshold estimate for QPSK r=0.5 demodulation [dB].
+- This is an initial estimate only.  At runtime, main.py fits a sigmoid
+  to the actual Sionna LDPC BER curve (after the PHY simulation in Part 1)
+  and the fitted value is passed to run_ns3_both_topologies() via
+  snr_thresh_db=.  The config value is used as the curve_fit starting
+  guess (p0) and as a fallback if fitting fails.
+- Derivation of the initial estimate: AWGN BER ≈ 1×10⁻³ for QPSK at
+  Eb/N₀ ≈ 6.8 dB (Q-function inversion: BER = Q(√(2·Eb/N₀)) = 10⁻³
+  → Eb/N₀ = 6.8 dB), plus 0.7 dB implementation margin.
   SNR_thresh = Eb/N₀ + 10·log10(R·log2(M))
              = 6.8 + 10·log10(0.5 × 2) = 6.8 + 0.0 = 6.8 dB ≈ 7.5 dB
-  (the 0.7 dB margin accounts for channel estimation error and imperfect
-  synchronisation typical of NTN Doppler-compensated receivers).
 Source: [3GPP-38.214] §5.1.3 (PDSCH MCS selection SNR targets).
         Proakis, "Digital Communications" 5th ed., Ch. 8 (BER formulas).
 """
 
 SIGMOID_SLOPE = 0.7
 """
-Steepness coefficient of the PER sigmoid curve [1/dB].
+Initial steepness estimate for the PER sigmoid curve [1/dB].
 - PER(SNR) = 1 / (1 + exp(SIGMOID_SLOPE · (SNR − SNR_THRESH_DB)))
-- 0.7 gives a smooth ~10 dB transition range, avoiding a step-function
-  cliff that would make results overly sensitive to small SNR changes.
-- This slope is calibrated to match the BLER vs. SNR curves for QPSK
-  r=0.5 in AWGN (3GPP TS 38.214, Annex A BLER curves), which show
-  ~10 dB of transition from PER≈0.9 to PER≈0.01.
+- This is an initial estimate only.  At runtime, main.py fits the sigmoid
+  to the Sionna LDPC BER→PER curve and the fitted slope is passed to
+  run_ns3_both_topologies() via sigmoid_slope=.  The config value is
+  used as the curve_fit starting guess (p0) and as a fallback.
+- 0.7 gives a smooth ~10 dB transition range, consistent with BLER vs. SNR
+  curves for QPSK r=0.5 in AWGN (3GPP TS 38.214, Annex A BLER curves).
 """

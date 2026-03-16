@@ -344,6 +344,7 @@ def draw_protocol_comparison(ns3_results: list,
 # =============================================================================
 
 def draw_summary(ber_results: dict, ns3_results: list,
+                 snr_range=None,
                  out: str = "output/ntn_summary.png") -> str:
     """
     Five-panel summary figure combining BER/BLER (Part 1) with the
@@ -351,15 +352,26 @@ def draw_summary(ber_results: dict, ns3_results: list,
 
     Parameters
     ----------
-    ber_results  : dict  Mapping scenario -> (ber_array, bler_array).
-    ns3_results  : list  Output of run_ns3_protocol_suite().
-    out          : str   Output filename.
+    ber_results  : dict        Mapping scenario -> (ber_array, bler_array).
+    ns3_results  : list        Output of run_ns3_protocol_suite().
+    snr_range    : array-like  Eb/N0 values [dB] matching the ber_results
+                               arrays.  If None, inferred from the first
+                               ber array length using 0.5 dB steps from 0.
+    out          : str         Output filename.
 
     Returns
     -------
     str  Path of the saved figure.
     """
-    snr_range = np.arange(0, 22, 2, dtype=float)
+    # Derive snr_range from the actual ber arrays if not supplied.
+    if snr_range is None and ber_results:
+        first_ber, _ = next(iter(ber_results.values()))
+        n = len(first_ber)
+        snr_range = np.arange(0, n * 0.5, 0.5, dtype=float)[:n]
+    elif snr_range is None:
+        snr_range = np.arange(0, 22, 2, dtype=float)
+    else:
+        snr_range = np.asarray(snr_range, dtype=float)
     ber_colors = {
         "urban":       "#1f77b4",
         "dense_urban": "#d62728",
@@ -747,7 +759,7 @@ def draw_network_illustration(out: str = "output/ntn_network_illustration.png") 
     ax.text(
         earth_cx + (orbit_r + 0.3) * math.cos(orb_label_angle),
         earth_cy + (orbit_r + 0.3) * math.sin(orb_label_angle),
-        "LEO orbit  ~600 km",
+        "LEO orbit  ~550 km",
         ha="center", va="bottom", fontsize=7.5, color="#aaaaaa",
         fontstyle="italic",
     )
@@ -1244,7 +1256,7 @@ def draw_topology_comparison(out: str = "output/ntn_topology_comparison.png") ->
 
     # Nodes (left to right)
     _node(ax, 1.5, 2.5, "UE (Phone)", f"EIRP {PHONE_EIRP_DBM:.0f} dBm", "phone")
-    _node(ax, 4.5, 4.0, "LEO Satellite", "600 km", "sat")
+    _node(ax, 4.5, 4.0, "LEO Satellite", "550 km", "sat")
     _node(ax, 7.0, 2.5, "Ground\nStation", "Ka-band", "gs", h=0.7)
     _node(ax, 9.2, 2.5, "Server", "sink", "server", w=1.2)
 
@@ -1271,7 +1283,7 @@ def draw_topology_comparison(out: str = "output/ntn_topology_comparison.png") ->
 
     _node(ax, 1.0, 2.5, "UE (Phone)", "local UE", "phone")
     _node(ax, 3.2, 2.5, "gNB", f"EIRP {GNB_EIRP_DBM:.0f} dBm", "gnb")
-    _node(ax, 6.0, 4.0, "LEO Satellite", "600 km", "sat")
+    _node(ax, 6.0, 4.0, "LEO Satellite", "550 km", "sat")
     _node(ax, 8.8, 2.5, "Ground\nStation", "Ka-band", "gs", h=0.7)
     _node(ax, 11.0, 2.5, "Server", "sink", "server", w=1.2)
 
