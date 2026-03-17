@@ -134,6 +134,19 @@ from config import (
     NOISE_FLOOR_DBM,
     SNR_THRESH_DB,
     SIGMOID_SLOPE,
+    # Multi-client topology
+    USE_BASE_STATIONS,
+    NUM_STATIONARY_CLIENTS,
+    NUM_MOVING_CLIENTS,
+    CLIENT_AREA_RADIUS_M,
+    WAYPOINT_SPEED_MIN_MS,
+    WAYPOINT_SPEED_MAX_MS,
+    GNB_POSITIONS,
+    NUM_GNB,
+    DATA_VOLUME_MB,
+    ISL_DATARATE,
+    ISL_DELAY_MS,
+    ISL_PER,
 )
 
 
@@ -735,38 +748,40 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
 
 
 # =============================================================================
-# Main NS-3 simulation run
+# Main NS-3 simulation run — multi-client ISL relay topology
 # =============================================================================
 
 def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
-            topology: str = "direct",
             snr_thresh_db: float = None,
             sigmoid_slope: float = None) -> dict:
     """
-    Run one full NS-3 5G-NTN simulation with a moving satellite
-    constellation for the specified transport protocol and topology.
+    Run one full NS-3 5G-NTN simulation with:
+      - NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS client phones
+      - Access satellites (Sat 1 … NUM_SATELLITES-1), each connected via an
+        ISL to the benchmark satellite (Sat 0, always highest elevation)
+      - If USE_BASE_STATIONS: Phone → gNB → AccessSat → ISL → BenchmarkSat → GS → Server
+        Otherwise:            Phone → AccessSat → ISL → BenchmarkSat → GS → Server
+      - Moving clients use RandomWaypointMobilityModel
+      - TCP BulkSend capped at DATA_VOLUME_MB
+
+    The benchmark satellite (Sat 0) is the measurement node: all traffic
+    always flows through it regardless of which access satellite is currently
+    serving a client.  This keeps throughput measurements consistent across
+    handovers.
 
     Parameters
     ----------
     scenario : str
         Channel scenario label (e.g. ``"urban"``).  Used for display only.
     protocol_cfg : dict
-        Protocol configuration dict from config.PROTOCOLS, e.g.
-        ``{"protocol": "tcp", "tcp_variant": "Cubic", "label": "TCP CUBIC"}``.
-        For QUIC, the NS-3 simulation runs as UDP internally; RFC 9000
-        corrections are applied after FlowMonitor collection.
+        Protocol configuration dict from config.PROTOCOLS.
+        For QUIC: runs as UDP internally; RFC 9000 corrections applied after.
     channel_stats : list[dict]
         RT channel statistics returned by rt_sim.run_ray_tracing().
-        Used to calibrate per-satellite PER and slant-range delay.
-    topology : str
-        ``"direct"``  — Phone → Sat → GS → Server  (4 nodes, PHONE_EIRP_DBM)
-        ``"indirect"`` — Phone → gNB → Sat → GS → Server  (5 nodes, GNB_EIRP_DBM)
     snr_thresh_db : float, optional
         Sigmoid threshold [dB] fitted to the Sionna LDPC BER curve.
-        Defaults to SNR_THRESH_DB from config when None.
     sigmoid_slope : float, optional
         Sigmoid slope [1/dB] fitted to the Sionna LDPC BER curve.
-        Defaults to SIGMOID_SLOPE from config when None.
 
     Returns
     -------
@@ -775,75 +790,61 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         svc_loss_pct, tx_packets, rx_packets, loss_pct,
         mean_delay_ms, jitter_ms, throughput_kbps, handovers, schedule.
     """
-    proto = protocol_cfg["protocol"]
-    label = protocol_cfg.get("label", proto.upper())
+    import collections
+    import math as _math
 
-    # QUIC runs as UDP in NS-3; corrections are applied post-simulation
+    proto     = protocol_cfg["protocol"]
+    label     = protocol_cfg.get("label", proto.upper())
     ns3_proto = "udp" if proto == "quic" else proto
 
-    # Determine TX EIRP based on topology
-    tx_eirp = GNB_EIRP_DBM if topology == "indirect" else PHONE_EIRP_DBM
+    # TX EIRP for the ground→satellite service link
+    tx_eirp   = GNB_EIRP_DBM if USE_BASE_STATIONS else PHONE_EIRP_DBM
+    topo_str  = "indirect (gNB)" if USE_BASE_STATIONS else "direct"
 
-    print(f"\n[NS-3]  {scenario.upper()}  topology={topology}  protocol={label}")
+    num_clients = NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS
+
+    print(f"\n[NS-3]  {scenario.upper()}  topology={topo_str}  "
+          f"protocol={label}  clients={num_clients}")
 
     # ── TCP global config ─────────────────────────────────────────────────────
     if ns3_proto == "tcp":
         _configure_tcp(protocol_cfg)
 
-    # ── Feeder-link reference gain (needed before schedule is built) ──────────
-    # Reference gain: best satellite's feeder path gain for Ka-band SNR norm.
+    # ── Feeder-link reference gain ────────────────────────────────────────────
     ref_feeder_gain = max(
         (s["feeder_mean_path_gain_db"] for s in channel_stats
          if s.get("feeder_mean_path_gain_db", -200.0) > -150.0),
         default=-150.0,
     )
 
-    # ── Handover schedule derived from RT channel stats ───────────────────────
-    # feeder_per and feeder_rate_str are now included in every schedule slot.
+    # ── Handover schedule ─────────────────────────────────────────────────────
     schedule = _compute_handover_schedule(
         channel_stats, tx_eirp_dbm=tx_eirp,
         ref_feeder_gain_db=ref_feeder_gain,
         snr_thresh_db=snr_thresh_db,
         sigmoid_slope=sigmoid_slope,
     )
-    print(f"  Handover schedule ({topology}, EIRP={tx_eirp:.0f} dBm): "
-          f"{len(schedule)} slot(s)")
+    print(f"  Handover schedule (EIRP={tx_eirp:.0f} dBm): {len(schedule)} slot(s)")
     for slot in schedule:
         print(f"    sat{slot['sat_id']}  {slot['t_start']:.1f}s–{slot['t_end']:.1f}s  "
-              f"elev={slot['elev_deg']:.1f}°  "
-              f"delay={slot['delay_ms']:.1f} ms  PER={slot['per']:.3f}  "
-              f"fdr_PER={slot['feeder_per']:.3f}  fdr_rate={slot['feeder_rate_str']}")
+              f"elev={slot['elev_deg']:.1f}°  delay={slot['delay_ms']:.1f} ms  "
+              f"PER={slot['per']:.3f}  fdr_PER={slot['feeder_per']:.3f}  "
+              f"fdr_rate={slot['feeder_rate_str']}")
 
-    # Weighted-mean service-link propagation delay across all handover slots.
-    # NS-3 PointToPointChannel.Delay is immutable after Install(), so we
-    # must commit to a single delay value at topology creation time.
-    # Using only the first slot's delay would underestimate the true average
-    # because high-elevation slots (short delay) occupy less time than
-    # near-horizon slots (long delay) in a real orbital pass.
-    # The slot durations in the schedule are already weighted by 1/cos(elev),
-    # so a simple duration-weighted mean is correct here.
+    # Weighted-mean service-link delay (P2P channel delay is immutable)
     if schedule:
         total_dur = schedule[-1]["t_end"] - schedule[0]["t_start"]
         weighted_delay_ms = sum(
-            s["delay_ms"] * (s["t_end"] - s["t_start"])
-            for s in schedule
+            s["delay_ms"] * (s["t_end"] - s["t_start"]) for s in schedule
         ) / max(total_dur, 1e-9)
     else:
         weighted_delay_ms = _one_way_delay_ms(SAT_HEIGHT_M, 60.0)
 
-    # Use the first (highest-elevation) slot for initial PER/rate parameters
     first = schedule[0] if schedule else dict(
-        delay_ms=weighted_delay_ms,
-        per=0.01,
-        elev_deg=60.0,
-        feeder_per=0.01,
-        feeder_rate_str="100.00Mbps",
+        delay_ms=weighted_delay_ms, per=0.01, elev_deg=60.0,
+        feeder_per=0.01, feeder_rate_str="100.00Mbps", sat_id=0,
     )
-
-    # ── Feeder-link initial values (from first slot) ──────────────────────────
-    # Channel delay is fixed at topology creation (NS-3 P2P channel immutable).
-    # DataRate and PER can be updated at runtime on each handover.
-    active_sat_id = int(first.get("sat_id", 0)) if schedule else 0
+    active_sat_id = int(first.get("sat_id", 0))
     active_cs     = (channel_stats[active_sat_id]
                      if channel_stats and active_sat_id < len(channel_stats) else {})
     fdr_delay_ms  = float(active_cs.get("feeder_propagation_delay_ms",
@@ -851,156 +852,262 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     fdr_rate_str  = first.get("feeder_rate_str", "100.00Mbps")
     fdr_per       = first.get("feeder_per", 0.01)
     print(f"  Service link delay (weighted-mean): {weighted_delay_ms:.2f} ms")
-    print(f"  Feeder link (sat→GS, Ka-band):  "
-          f"delay={fdr_delay_ms:.2f} ms  "
-          f"rate={fdr_rate_str}  "
-          f"PER={fdr_per:.4f}  "
-          f"(ref_gain={ref_feeder_gain:.1f} dB)")
+    print(f"  Feeder link:  delay={fdr_delay_ms:.2f} ms  rate={fdr_rate_str}  "
+          f"PER={fdr_per:.4f}")
+    print(f"  ISL (access→benchmark sat):  rate={ISL_DATARATE}  "
+          f"delay={ISL_DELAY_MS} ms  PER={ISL_PER}")
 
-    # ── Build node topology ───────────────────────────────────────────────────
-    import collections
+    # =========================================================================
+    # Node creation
+    # =========================================================================
+    # Node layout (all in one NodeContainer for InternetStack):
+    #   [0 … num_clients-1]               : phone nodes
+    #   [num_clients … num_clients+NUM_GNB-1] : gNB nodes (if USE_BASE_STATIONS)
+    #   [base_idx]                         : benchmark satellite (Sat 0)
+    #   [base_idx+1 … base_idx+n_access]   : access satellites (Sat 1…N)
+    #   [base_idx+n_access+1]              : ground station
+    #   [base_idx+n_access+2]              : internet server
+    #
+    # n_access = number of access satellites = len(schedule) - 1 (Sat 0 is
+    # the benchmark; we need at least 1 access sat even if only 1 in schedule)
+    # In practice n_access = max(1, len(schedule)-1) but we map schedule
+    # slots round-robin to access sats if needed.
 
-    if topology == "indirect":
-        # 5 nodes: Phone | gNB | Satellite | GroundStation | Server
-        nodes = ns.NodeContainer()
-        nodes.Create(5)
-        phone, gnb, sat, gs, server = (nodes.Get(i) for i in range(5))
-        ns.InternetStackHelper().Install(nodes)
+    n_access_sats = max(1, len(schedule) - 1)  # access sats (not the benchmark)
+    n_gnbs        = NUM_GNB if USE_BASE_STATIONS else 0
 
-        # Phone ↔ gNB (terrestrial radio hop)
-        p2p = ns.PointToPointHelper()
+    # Index helpers
+    phone_idx   = lambda i: i                                  # 0..num_clients-1
+    gnb_idx     = lambda i: num_clients + i                    # 0..n_gnbs-1
+    bench_idx   = num_clients + n_gnbs                         # benchmark sat
+    access_idx  = lambda i: bench_idx + 1 + i                  # 0..n_access_sats-1
+    gs_idx      = bench_idx + 1 + n_access_sats
+    server_idx  = gs_idx + 1
+    total_nodes = server_idx + 1
+
+    nodes = ns.NodeContainer()
+    nodes.Create(total_nodes)
+    ns.InternetStackHelper().Install(nodes)
+
+    phones  = [nodes.Get(phone_idx(i)) for i in range(num_clients)]
+    gnbs    = [nodes.Get(gnb_idx(i))   for i in range(n_gnbs)]
+    bench   = nodes.Get(bench_idx)
+    accesses = [nodes.Get(access_idx(i)) for i in range(n_access_sats)]
+    gs      = nodes.Get(gs_idx)
+    server  = nodes.Get(server_idx)
+
+    p2p = ns.PointToPointHelper()
+
+    # ── Client positions ──────────────────────────────────────────────────────
+    # Phones are placed in a circle of CLIENT_AREA_RADIUS_M.
+    # Stationary: ConstantPosition.  Moving: RandomWaypoint.
+    import random as _random
+    _rng = _random.Random(42)
+
+    def _random_pos_in_circle(radius, z=1.5):
+        """Uniform random (x,y) within a circle of given radius, height z."""
+        angle  = _rng.uniform(0, 2 * _math.pi)
+        r      = radius * _math.sqrt(_rng.uniform(0, 1))
+        return r * _math.cos(angle), r * _math.sin(angle), z
+
+    static_mob = ns.MobilityHelper()
+    static_mob.SetMobilityModel("ns3::ConstantPositionMobilityModel")
+    static_mob.Install(nodes)   # default all nodes to static first
+
+    # Place stationary phones at fixed random positions
+    phone_positions = []
+    for i in range(num_clients):
+        px, py, pz = _random_pos_in_circle(CLIENT_AREA_RADIUS_M)
+        phone_positions.append((px, py, pz))
+        mob = phones[i].GetObject[ns.ConstantPositionMobilityModel]()
+        mob.SetPosition(ns.Vector(px, py, pz))
+
+    # Override moving phones with RandomWaypointMobilityModel
+    # NS-3 RandomWaypointMobilityModel has three attributes: Speed, Pause,
+    # PositionAllocator.  There is no "Bounds" attribute — bounds are enforced
+    # entirely via RandomRectanglePositionAllocator (X and Y random variables).
+    for i in range(NUM_STATIONARY_CLIENTS, num_clients):
+        px, py, pz = phone_positions[i]
+        rwp_mob = ns.CreateObject[ns.RandomWaypointMobilityModel]()
+        r = CLIENT_AREA_RADIUS_M
+        speed_var = ns.StringValue(
+            f"ns3::UniformRandomVariable[Min={WAYPOINT_SPEED_MIN_MS}"
+            f"|Max={WAYPOINT_SPEED_MAX_MS}]"
+        )
+        pause_var = ns.StringValue("ns3::ConstantRandomVariable[Constant=0]")
+        pos_alloc = ns.CreateObject[ns.RandomRectanglePositionAllocator]()
+        pos_alloc.SetAttribute("X", ns.StringValue(
+            f"ns3::UniformRandomVariable[Min={-r}|Max={r}]"))
+        pos_alloc.SetAttribute("Y", ns.StringValue(
+            f"ns3::UniformRandomVariable[Min={-r}|Max={r}]"))
+        rwp_mob.SetAttribute("Speed",             speed_var)
+        rwp_mob.SetAttribute("Pause",             pause_var)
+        rwp_mob.SetAttribute("PositionAllocator", ns.PointerValue(pos_alloc))
+        phones[i].AggregateObject(rwp_mob)
+        rwp_mob.SetPosition(ns.Vector(px, py, pz))
+
+    # ── Satellite mobility: benchmark at zenith, access sats in orbit ─────────
+    sat_mob_b = ns.CreateObject[ns.ConstantVelocityMobilityModel]()
+    bench.AggregateObject(sat_mob_b)
+    sat_mob_b.SetPosition(ns.Vector(0.0, 0.0, SAT_HEIGHT_M))
+    sat_mob_b.SetVelocity(ns.Vector(SAT_ORBITAL_VELOCITY_MS, 0.0, 0.0))
+
+    for i, acc in enumerate(accesses):
+        sat_mob_a = ns.CreateObject[ns.ConstantVelocityMobilityModel]()
+        acc.AggregateObject(sat_mob_a)
+        offset = (i + 1) * 144_000.0   # ~144 km spacing at 550 km
+        sat_mob_a.SetPosition(ns.Vector(offset, 0.0, SAT_HEIGHT_M))
+        sat_mob_a.SetVelocity(ns.Vector(SAT_ORBITAL_VELOCITY_MS, 0.0, 0.0))
+
+    # ── IP address allocator ──────────────────────────────────────────────────
+    ipv4 = ns.Ipv4AddressHelper()
+    subnet_iter = [0]  # mutable counter for subnet numbering
+
+    def _next_subnet():
+        n = subnet_iter[0]
+        subnet_iter[0] += 1
+        return f"10.{n // 256}.{n % 256}.0"
+
+    # ── Assign each phone to the nearest gNB (or directly to access sat 0) ───
+    # client_to_gnb[i] = gNB index for client i  (USE_BASE_STATIONS only)
+    client_to_gnb = []
+    if USE_BASE_STATIONS and n_gnbs > 0:
+        for i in range(num_clients):
+            px, py, _ = phone_positions[i]
+            dists = [
+                _math.hypot(px - GNB_POSITIONS[g][0], py - GNB_POSITIONS[g][1])
+                for g in range(n_gnbs)
+            ]
+            client_to_gnb.append(int(dists.index(min(dists))))
+    else:
+        client_to_gnb = [0] * num_clients
+
+    # ── gNB positions ─────────────────────────────────────────────────────────
+    for gi, (gx, gy) in enumerate(GNB_POSITIONS[:n_gnbs]):
+        gmob = gnbs[gi].GetObject[ns.ConstantPositionMobilityModel]()
+        gmob.SetPosition(ns.Vector(gx, gy, 30.0))
+
+    # =========================================================================
+    # Wiring up links
+    # =========================================================================
+
+    # All phone↔gNB or phone↔access-sat error models stored per-client
+    # so handover callback can update each one.
+    em_svc_list   = []   # service-link error model per client
+    devs_svc_list = []   # service-link DeviceContainer per client
+
+    # ── Phone ↔ gNB  (or direct Phone ↔ access-sat-0) ────────────────────────
+    if USE_BASE_STATIONS:
+        # Phone → gNB  (terrestrial, high data rate, low PER)
+        gnb_used = set(client_to_gnb)
         p2p.SetDeviceAttribute("DataRate", ns.StringValue(GNB_DATARATE))
         p2p.SetChannelAttribute("Delay",
-                                ns.StringValue(f"{GNB_PROCESSING_DELAY_MS:.3f}ms"))
-        devs_ue_gnb = p2p.Install(_nc2(phone, gnb))
-        # Terrestrial PER on the Phone→gNB hop
-        em_terr = ns.CreateObject[ns.RateErrorModel]()
-        em_terr.SetAttribute("ErrorRate", ns.DoubleValue(GNB_TERRESTRIAL_PER))
-        em_terr.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-        devs_ue_gnb.Get(1).SetAttribute("ReceiveErrorModel",
-                                         ns.PointerValue(em_terr))
+            ns.StringValue(f"{GNB_PROCESSING_DELAY_MS:.3f}ms"))
+        for i in range(num_clients):
+            devs_ug = p2p.Install(_nc2(phones[i], gnbs[client_to_gnb[i]]))
+            em_ug = ns.CreateObject[ns.RateErrorModel]()
+            em_ug.SetAttribute("ErrorRate", ns.DoubleValue(GNB_TERRESTRIAL_PER))
+            em_ug.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
+            devs_ug.Get(1).SetAttribute("ReceiveErrorModel",
+                                        ns.PointerValue(em_ug))
+            ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
+                         ns.Ipv4Mask("255.255.255.0"))
+            ipv4.Assign(devs_ug)
 
-        # gNB ↔ Satellite (NTN hop, GNB_EIRP)
-        # Channel delay is fixed at topology creation (NS-3 P2P immutable).
-        # Use weighted-mean delay across all handover slots so the fixed
-        # delay accurately represents the full simulation period, not just
-        # the first (highest-elevation) slot.
+        # gNB → access satellite 0  (NTN hop, GNB EIRP)
+        # All gNBs share the same access sat (Sat 0 in schedule order →
+        # accesses[0]).  Each gNB gets its own P2P link; they all share
+        # the same error model so handover updates all simultaneously.
         p2p.SetDeviceAttribute("DataRate", ns.StringValue("10Mbps"))
         p2p.SetChannelAttribute("Delay",
-                                ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
-        devs_svc = p2p.Install(_nc2(gnb, sat))
-        em = ns.CreateObject[ns.RateErrorModel]()
-        em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
-        em.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-        devs_svc.Get(1).SetAttribute("ReceiveErrorModel", ns.PointerValue(em))
-
-        # Satellite ↔ GS (feeder link — RT-derived Ka-band)
-        p2p.SetDeviceAttribute("DataRate",  ns.StringValue(fdr_rate_str))
-        p2p.SetChannelAttribute("Delay",    ns.StringValue(f"{fdr_delay_ms:.3f}ms"))
-        devs_fdr = p2p.Install(_nc2(sat, gs))
-        em_fdr = ns.CreateObject[ns.RateErrorModel]()
-        em_fdr.SetAttribute("ErrorRate", ns.DoubleValue(fdr_per))
-        em_fdr.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-        devs_fdr.Get(1).SetAttribute("ReceiveErrorModel", ns.PointerValue(em_fdr))
-
-        # GS ↔ Server
-        p2p.SetDeviceAttribute("DataRate",  ns.StringValue("1Gbps"))
-        p2p.SetChannelAttribute("Delay",    ns.StringValue(f"{TERRESTRIAL_BACKHAUL_DELAY_MS:.0f}ms"))
-        devs_gnd = p2p.Install(_nc2(gs, server))
-
-        # IP addressing
-        ipv4 = ns.Ipv4AddressHelper()
-        ipv4.SetBase(ns.Ipv4Address("10.1.0.0"), ns.Ipv4Mask("255.255.255.0"))
-        ipv4.Assign(devs_ue_gnb)
-        ipv4.SetBase(ns.Ipv4Address("10.1.1.0"), ns.Ipv4Mask("255.255.255.0"))
-        iface_svc = ipv4.Assign(devs_svc)
-        ipv4.SetBase(ns.Ipv4Address("10.1.2.0"), ns.Ipv4Mask("255.255.255.0"))
-        ipv4.Assign(devs_fdr)
-        ipv4.SetBase(ns.Ipv4Address("10.1.3.0"), ns.Ipv4Mask("255.255.255.0"))
-        iface_gnd = ipv4.Assign(devs_gnd)
+            ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
+        for gi in sorted(gnb_used):
+            devs_svc = p2p.Install(_nc2(gnbs[gi], accesses[0]))
+            em = ns.CreateObject[ns.RateErrorModel]()
+            em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
+            em.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
+            devs_svc.Get(1).SetAttribute("ReceiveErrorModel",
+                                          ns.PointerValue(em))
+            em_svc_list.append(em)
+            devs_svc_list.append(devs_svc)
+            ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
+                         ns.Ipv4Mask("255.255.255.0"))
+            ipv4.Assign(devs_svc)
 
     else:
-        # 4 nodes: Phone | Satellite | GroundStation | Server  (direct)
-        nodes = ns.NodeContainer()
-        nodes.Create(4)
-        phone, sat, gs, server = (nodes.Get(i) for i in range(4))
-        ns.InternetStackHelper().Install(nodes)
-
-        # Service link: Phone ↔ Satellite
-        # Channel delay is fixed at topology creation (NS-3 P2P immutable).
-        # Use weighted-mean delay across all handover slots.
-        p2p = ns.PointToPointHelper()
+        # Direct: Phone → access satellite 0
         p2p.SetDeviceAttribute("DataRate", ns.StringValue("10Mbps"))
         p2p.SetChannelAttribute("Delay",
-                                ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
-        devs_svc = p2p.Install(_nc2(phone, sat))
-        em = ns.CreateObject[ns.RateErrorModel]()
-        em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
-        em.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-        devs_svc.Get(1).SetAttribute("ReceiveErrorModel", ns.PointerValue(em))
+            ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
+        for i in range(num_clients):
+            devs_svc = p2p.Install(_nc2(phones[i], accesses[0]))
+            em = ns.CreateObject[ns.RateErrorModel]()
+            em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
+            em.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
+            devs_svc.Get(1).SetAttribute("ReceiveErrorModel",
+                                          ns.PointerValue(em))
+            em_svc_list.append(em)
+            devs_svc_list.append(devs_svc)
+            ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
+                         ns.Ipv4Mask("255.255.255.0"))
+            ipv4.Assign(devs_svc)
 
-        # Feeder link: Satellite ↔ GS (RT-derived Ka-band)
-        p2p.SetDeviceAttribute("DataRate",  ns.StringValue(fdr_rate_str))
-        p2p.SetChannelAttribute("Delay",    ns.StringValue(f"{fdr_delay_ms:.3f}ms"))
-        devs_fdr = p2p.Install(_nc2(sat, gs))
-        em_fdr = ns.CreateObject[ns.RateErrorModel]()
-        em_fdr.SetAttribute("ErrorRate", ns.DoubleValue(fdr_per))
-        em_fdr.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-        devs_fdr.Get(1).SetAttribute("ReceiveErrorModel", ns.PointerValue(em_fdr))
+    # ── Access satellite(s) → Benchmark satellite (ISL) ──────────────────────
+    p2p.SetDeviceAttribute("DataRate", ns.StringValue(ISL_DATARATE))
+    p2p.SetChannelAttribute("Delay",   ns.StringValue(f"{ISL_DELAY_MS:.3f}ms"))
+    em_isl_list = []
+    for acc in accesses:
+        devs_isl = p2p.Install(_nc2(acc, bench))
+        em_isl = ns.CreateObject[ns.RateErrorModel]()
+        em_isl.SetAttribute("ErrorRate", ns.DoubleValue(ISL_PER))
+        em_isl.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
+        devs_isl.Get(1).SetAttribute("ReceiveErrorModel",
+                                      ns.PointerValue(em_isl))
+        em_isl_list.append(em_isl)
+        ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
+                     ns.Ipv4Mask("255.255.255.0"))
+        ipv4.Assign(devs_isl)
 
-        # Terrestrial: GS ↔ Server
-        p2p.SetDeviceAttribute("DataRate",  ns.StringValue("1Gbps"))
-        p2p.SetChannelAttribute("Delay",    ns.StringValue(f"{TERRESTRIAL_BACKHAUL_DELAY_MS:.0f}ms"))
-        devs_gnd = p2p.Install(_nc2(gs, server))
+    # ── Benchmark satellite → Ground Station (feeder, Ka-band) ───────────────
+    p2p.SetDeviceAttribute("DataRate",  ns.StringValue(fdr_rate_str))
+    p2p.SetChannelAttribute("Delay",    ns.StringValue(f"{fdr_delay_ms:.3f}ms"))
+    devs_fdr = p2p.Install(_nc2(bench, gs))
+    em_fdr = ns.CreateObject[ns.RateErrorModel]()
+    em_fdr.SetAttribute("ErrorRate", ns.DoubleValue(fdr_per))
+    em_fdr.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
+    devs_fdr.Get(1).SetAttribute("ReceiveErrorModel", ns.PointerValue(em_fdr))
+    ipv4.SetBase(ns.Ipv4Address(_next_subnet()), ns.Ipv4Mask("255.255.255.0"))
+    ipv4.Assign(devs_fdr)
 
-        # IP addressing
-        ipv4 = ns.Ipv4AddressHelper()
-        ipv4.SetBase(ns.Ipv4Address("10.1.1.0"), ns.Ipv4Mask("255.255.255.0"))
-        iface_svc = ipv4.Assign(devs_svc)
-        ipv4.SetBase(ns.Ipv4Address("10.1.2.0"), ns.Ipv4Mask("255.255.255.0"))
-        ipv4.Assign(devs_fdr)
-        ipv4.SetBase(ns.Ipv4Address("10.1.3.0"), ns.Ipv4Mask("255.255.255.0"))
-        iface_gnd = ipv4.Assign(devs_gnd)
+    # ── Ground Station → Internet Server (terrestrial fibre) ─────────────────
+    p2p.SetDeviceAttribute("DataRate",  ns.StringValue("1Gbps"))
+    p2p.SetChannelAttribute("Delay",
+        ns.StringValue(f"{TERRESTRIAL_BACKHAUL_DELAY_MS:.0f}ms"))
+    devs_gnd = p2p.Install(_nc2(gs, server))
+    ipv4.SetBase(ns.Ipv4Address(_next_subnet()), ns.Ipv4Mask("255.255.255.0"))
+    iface_gnd = ipv4.Assign(devs_gnd)
 
     ns.Ipv4GlobalRoutingHelper.PopulateRoutingTables()
 
-    # ── Satellite mobility: LEO orbit at ~7.6 km/s ────────────────────────────
-    static_mob = ns.MobilityHelper()
-    static_mob.SetMobilityModel("ns3::ConstantPositionMobilityModel")
-    static_mob.Install(nodes)
+    # =========================================================================
+    # Handover scheduling
+    # =========================================================================
+    # On each handover we update the service-link PER for all error models
+    # in em_svc_list (all gNB→sat or phone→sat links share the same slot PER
+    # because all clients are within CLIENT_AREA_RADIUS_M of each other, which
+    # is negligible vs the satellite footprint), and the feeder-link em_fdr.
 
-    sat_mob = ns.CreateObject[ns.ConstantVelocityMobilityModel]()
-    sat.AggregateObject(sat_mob)
-    sat_mob.SetPosition(ns.Vector(0.0, 0.0, SAT_HEIGHT_M))
-    sat_mob.SetVelocity(ns.Vector(SAT_ORBITAL_VELOCITY_MS, 0.0, 0.0))
-
-    # ── Schedule handover events ──────────────────────────────────────────────
-    # cppyy converts Python callables to C function pointers void(*)().
-    # All distinct Python closures map to the *same* C function pointer, so
-    # we cannot pass different closures for different handover times.
-    # Instead, we drive handovers with a single function that pops the next
-    # (time, per, slot) entry from a module-level deque on each call, then
-    # reschedules itself for the following handover.
-
-    handover_queue = collections.deque(schedule[1:])   # remaining handovers
+    handover_queue = collections.deque(schedule[1:])
     handover_count = [0]
 
     def _handover_tick():
-        """
-        Single handover callback — applies the next PER/rate from the queue
-        and reschedules itself for the subsequent handover time (if any).
-
-        Updates both the service-link error model (em) and the feeder-link
-        error model (em_fdr) plus feeder device DataRate on each handover.
-        The feeder-link channel delay cannot be updated at runtime (NS-3
-        PointToPointChannel.Delay is immutable after Install).
-        """
         if not handover_queue:
             return
         slot = handover_queue.popleft()
-        # Service-link PER
-        em.SetAttribute("ErrorRate", ns.DoubleValue(slot["per"]))
-        # Feeder-link PER and DataRate (delay is fixed at topology creation)
+        # Update service-link PER for every svc link
+        for em in em_svc_list:
+            em.SetAttribute("ErrorRate", ns.DoubleValue(slot["per"]))
+        # Update feeder-link PER and DataRate
         em_fdr.SetAttribute("ErrorRate", ns.DoubleValue(slot["feeder_per"]))
         devs_fdr.Get(0).SetAttribute("DataRate",
                                      ns.StringValue(slot["feeder_rate_str"]))
@@ -1008,57 +1115,57 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         print(f"  [t={ns.Simulator.Now().GetSeconds():.1f}s] "
               f"Handover → sat{slot['sat_id']}  "
               f"PER={slot['per']:.3f}  elev={slot['elev_deg']:.1f}°  "
-              f"fdr_PER={slot['feeder_per']:.3f}  "
-              f"fdr_rate={slot['feeder_rate_str']}")
-        # Schedule next handover
+              f"fdr_PER={slot['feeder_per']:.3f}  fdr_rate={slot['feeder_rate_str']}")
         if handover_queue:
             nxt = handover_queue[0]
             if nxt["t_start"] < SIM_DURATION_S:
                 ev = ns.cppyy.gbl.pythonMakeEvent(_handover_tick)
                 ns.Simulator.Schedule(ns.Seconds(nxt["t_start"]), ev)
 
-    # Kick off the first handover
     if len(schedule) > 1:
         first_ho = schedule[1]
         if first_ho["t_start"] < SIM_DURATION_S:
             ev = ns.cppyy.gbl.pythonMakeEvent(_handover_tick)
             ns.Simulator.Schedule(ns.Seconds(first_ho["t_start"]), ev)
 
-    # ── Application layer ─────────────────────────────────────────────────────
-    port = 9
+    # =========================================================================
+    # Application layer
+    # =========================================================================
+    port        = 9
     server_addr = ns.InetSocketAddress(iface_gnd.GetAddress(1), port)
 
+    # Compute per-flow MaxBytes for TCP BulkSend
+    max_bytes = 0  # unlimited (for UDP; ignored)
+    if DATA_VOLUME_MB > 0:
+        max_bytes = int(DATA_VOLUME_MB * 1_000_000)
+
     if ns3_proto == "udp":
-        # Constant-bit-rate UDP (OnOff)
-        onoff = ns.OnOffHelper(
-            "ns3::UdpSocketFactory", server_addr.ConvertTo())
+        onoff = ns.OnOffHelper("ns3::UdpSocketFactory", server_addr.ConvertTo())
         onoff.SetAttribute("DataRate",   ns.StringValue(APP_DATA_RATE))
         onoff.SetAttribute("PacketSize", ns.UintegerValue(PACKET_SIZE_BYTES))
         onoff.SetAttribute("OnTime",
             ns.StringValue("ns3::ConstantRandomVariable[Constant=1]"))
         onoff.SetAttribute("OffTime",
             ns.StringValue("ns3::ConstantRandomVariable[Constant=0]"))
-        for _ in range(NUM_PARALLEL_FLOWS):
-            app_tx = onoff.Install(phone)
-            app_tx.Start(ns.Seconds(1.0))
-            app_tx.Stop(ns.Seconds(SIM_DURATION_S))
-
+        for phone in phones:
+            for _ in range(NUM_PARALLEL_FLOWS):
+                app_tx = onoff.Install(phone)
+                app_tx.Start(ns.Seconds(1.0))
+                app_tx.Stop(ns.Seconds(SIM_DURATION_S))
         sink = ns.PacketSinkHelper(
             "ns3::UdpSocketFactory",
             ns.InetSocketAddress(ns.Ipv4Address.GetAny(), port).ConvertTo())
         ip_proto_num = 17
 
     else:
-        # TCP: saturating BulkSend (fills the pipe)
-        bulk = ns.BulkSendHelper(
-            "ns3::TcpSocketFactory", server_addr.ConvertTo())
+        bulk = ns.BulkSendHelper("ns3::TcpSocketFactory", server_addr.ConvertTo())
         bulk.SetAttribute("SendSize", ns.UintegerValue(PACKET_SIZE_BYTES))
-        bulk.SetAttribute("MaxBytes", ns.UintegerValue(0))   # unlimited
-        for _ in range(NUM_PARALLEL_FLOWS):
-            app_tx = bulk.Install(phone)
-            app_tx.Start(ns.Seconds(1.0))
-            app_tx.Stop(ns.Seconds(SIM_DURATION_S))
-
+        bulk.SetAttribute("MaxBytes", ns.UintegerValue(max_bytes))
+        for phone in phones:
+            for _ in range(NUM_PARALLEL_FLOWS):
+                app_tx = bulk.Install(phone)
+                app_tx.Start(ns.Seconds(1.0))
+                app_tx.Stop(ns.Seconds(SIM_DURATION_S))
         sink = ns.PacketSinkHelper(
             "ns3::TcpSocketFactory",
             ns.InetSocketAddress(ns.Ipv4Address.GetAny(), port).ConvertTo())
@@ -1083,11 +1190,11 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
 
     result = dict(
         scenario        = scenario,
-        protocol        = proto,       # original protocol name (not ns3_proto)
+        protocol        = proto,
         label           = label,
-        topology        = topology,
+        topology        = topo_str,
         elevation_deg   = first["elev_deg"],
-        svc_delay_ms    = round(weighted_delay_ms, 2),   # weighted-mean, not first-slot only
+        svc_delay_ms    = round(weighted_delay_ms, 2),
         svc_loss_pct    = round(first["per"] * 100.0, 2),
         tx_packets      = 0,
         rx_packets      = 0,
@@ -1099,30 +1206,41 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         schedule        = schedule,
     )
 
+    active_s = SIM_DURATION_S - 1.0   # exclude 1 s warm-up
+
+    total_rx   = 0
+    total_tx   = 0
+    delay_sum  = 0.0
+    jitter_sum = 0.0
+    rx_bytes   = 0
+
     for pair in stats:
         fid, fs = pair.first, pair.second
         if classifier.FindFlow(fid).protocol != ip_proto_num:
             continue
         if fs.rxPackets == 0:
             continue
-        rx_n = int(fs.rxPackets)
-        tx_n = int(fs.txPackets)
-        active_s = SIM_DURATION_S - 1.0   # Exclude 1 s warm-up
+        rx_n        = int(fs.rxPackets)
+        tx_n        = int(fs.txPackets)
+        total_rx   += rx_n
+        total_tx   += tx_n
+        delay_sum  += fs.delaySum.GetSeconds()
+        jitter_sum += fs.jitterSum.GetSeconds()
+        rx_bytes   += int(fs.rxBytes)
+
+    if total_rx > 0:
         result.update(
-            tx_packets      = result["tx_packets"] + tx_n,
-            rx_packets      = result["rx_packets"] + rx_n,
-            loss_pct        = round(100.0 * (1 - rx_n / max(tx_n, 1)), 2),
-            mean_delay_ms   = round(
-                fs.delaySum.GetSeconds() / rx_n * 1e3, 2),
-            jitter_ms       = round(
-                fs.jitterSum.GetSeconds() / max(rx_n - 1, 1) * 1e3, 2),
-            throughput_kbps = result["throughput_kbps"] + round(
-                fs.rxBytes * 8.0 / active_s / 1e3, 2),
+            tx_packets      = total_tx,
+            rx_packets      = total_rx,
+            loss_pct        = round(100.0 * (1 - total_rx / max(total_tx, 1)), 2),
+            mean_delay_ms   = round(delay_sum / total_rx * 1e3, 2),
+            jitter_ms       = round(jitter_sum / max(total_rx - 1, 1) * 1e3, 2),
+            throughput_kbps = round(rx_bytes * 8.0 / active_s / 1e3, 2),
         )
 
     ns.Simulator.Destroy()
 
-    print(f"\n  Results ({label}, {topology}):")
+    print(f"\n  Results ({label}, {topo_str}):")
     for k, v in result.items():
         if k != "schedule":
             print(f"    {k:<24s}: {v}")
@@ -1131,7 +1249,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
 
 
 # =============================================================================
-# Protocol suite runner — both topologies
+# Protocol suite runner — returns (results, results) for backward compat
 # =============================================================================
 
 def run_ns3_both_topologies(channel_stats: list,
@@ -1139,12 +1257,18 @@ def run_ns3_both_topologies(channel_stats: list,
                              snr_thresh_db: float = None,
                              sigmoid_slope: float = None) -> tuple:
     """
-    Run the NS-3 simulation once per entry in config.PROTOCOLS × 2
-    topologies (direct / indirect) and return all results for plotting.
+    Run the NS-3 simulation once per entry in config.PROTOCOLS using the
+    topology mode configured in config.USE_BASE_STATIONS, then return the
+    results as a (direct_results, indirect_results) tuple for backward
+    compatibility with main.py and topology_diagram.py.
 
-    For QUIC, the NS-3 simulation runs as UDP internally.  After the
-    BBR run completes, RFC 9000 corrections are applied analytically to
-    produce the QUIC result (no additional NS-3 simulation needed).
+    Because the topology is now determined by USE_BASE_STATIONS (a single
+    configurable flag), the same result set is returned in both slots of
+    the tuple.  All 14 plot functions in topology_diagram.py continue to
+    work without modification.
+
+    For QUIC: the NS-3 simulation runs as UDP.  After the BBR run completes,
+    RFC 9000 corrections are applied analytically via _apply_quic_corrections.
 
     Parameters
     ----------
@@ -1154,57 +1278,52 @@ def run_ns3_both_topologies(channel_stats: list,
         NTN propagation scenario label (used for display only).
     snr_thresh_db : float, optional
         Sigmoid threshold [dB] fitted to the Sionna LDPC BER curve.
-        Defaults to SNR_THRESH_DB from config when None.
     sigmoid_slope : float, optional
         Sigmoid slope [1/dB] fitted to the Sionna LDPC BER curve.
-        Defaults to SIGMOID_SLOPE from config when None.
 
     Returns
     -------
-    tuple (direct_results, indirect_results)
-        Each is a list[dict], one result dict per protocol.
+    tuple (results, results)
+        Both elements contain the same list[dict], one entry per protocol.
+        The tuple structure is kept for backward compatibility with callers
+        that unpack as:  direct_results, indirect_results = run_ns3_both_topologies(...)
     """
-    direct_results   = []
-    indirect_results = []
+    results             = []
+    bbr_result_for_quic = None
 
-    for topology, results_list in [("direct",   direct_results),
-                                    ("indirect", indirect_results)]:
-        bbr_result_for_quic = None
+    for pcfg in PROTOCOLS:
+        if pcfg["protocol"] == "quic":
+            continue   # defer until BBR is done
 
-        for pcfg in PROTOCOLS:
-            if pcfg["protocol"] == "quic":
-                # Defer QUIC until after BBR has run
-                continue
+        full_cfg = dict(
+            tcp_snd_buf    = TCP_SNDRCV_BUF_BYTES,
+            tcp_rcv_buf    = TCP_SNDRCV_BUF_BYTES,
+            tcp_sack       = TCP_SACK_ENABLED,
+            tcp_timestamps = TCP_TIMESTAMPS,
+            **pcfg,
+        )
+        r = run_ns3(scenario, full_cfg, channel_stats,
+                    snr_thresh_db=snr_thresh_db, sigmoid_slope=sigmoid_slope)
+        results.append(r)
 
-            full_cfg = dict(
-                tcp_snd_buf    = TCP_SNDRCV_BUF_BYTES,
-                tcp_rcv_buf    = TCP_SNDRCV_BUF_BYTES,
-                tcp_sack       = TCP_SACK_ENABLED,
-                tcp_timestamps = TCP_TIMESTAMPS,
-                **pcfg,
-            )
-            r = run_ns3(scenario, full_cfg, channel_stats, topology=topology,
-                        snr_thresh_db=snr_thresh_db, sigmoid_slope=sigmoid_slope)
-            results_list.append(r)
+        if pcfg.get("label") == "TCP BBR":
+            bbr_result_for_quic = r
 
-            if pcfg.get("label") == "TCP BBR":
-                bbr_result_for_quic = r
+    # QUIC: analytical corrections on top of BBR baseline
+    if bbr_result_for_quic is not None:
+        quic_result = _apply_quic_corrections(
+            bbr_result_for_quic,
+            bbr_result_for_quic["schedule"],
+            link_rate_bps=10e6,   # 10 Mbps service link
+        )
+        topo_str = "indirect (gNB)" if USE_BASE_STATIONS else "direct"
+        quic_result["topology"] = topo_str
+        results.append(quic_result)
+    else:
+        print("[QUIC]  No BBR result found — skipping QUIC.")
 
-        # Now compute QUIC from BBR baseline.
-        # Pass the actual service-link rate (10 Mbps hardcoded in run_ns3)
-        # so _apply_quic_corrections does not fall back to parsing feeder rate.
-        if bbr_result_for_quic is not None:
-            # Use the schedule from the BBR run (same topology/EIRP)
-            quic_result = _apply_quic_corrections(
-                bbr_result_for_quic, bbr_result_for_quic["schedule"],
-                link_rate_bps=10e6)   # 10 Mbps service link (NS-3 DataRate)
-            quic_result["topology"] = topology
-            results_list.append(quic_result)
-        else:
-            print(f"[QUIC]  No BBR result found for {topology} topology — "
-                  "skipping QUIC.")
-
-    return direct_results, indirect_results
+    # Return the same result set in both slots for backward compatibility
+    return results, results
 
 
 # =============================================================================
@@ -1213,12 +1332,6 @@ def run_ns3_both_topologies(channel_stats: list,
 
 def run_ns3_protocol_suite(channel_stats: list,
                             scenario: str = "urban") -> list:
-    """
-    Run the NS-3 simulation once per entry in config.PROTOCOLS for the
-    direct topology only.  Returns a flat list of results.
-
-    Kept for backward compatibility with older callers.  New code should
-    use run_ns3_both_topologies() instead.
-    """
-    direct_results, _ = run_ns3_both_topologies(channel_stats, scenario)
-    return direct_results
+    """Kept for backward compatibility. Use run_ns3_both_topologies instead."""
+    results, _ = run_ns3_both_topologies(channel_stats, scenario)
+    return results

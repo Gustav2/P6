@@ -577,9 +577,16 @@ def run_ray_tracing() -> list:
         This list is passed directly to ntn_ns3.run_ns3() so that the
         NS-3 link budget uses RT-informed channel parameters for both hops.
     """
+    # NOTE: RT_UE_POSITION is used as a single representative UE position for
+    # all clients in the multi-client topology.  All clients are deployed within
+    # CLIENT_AREA_RADIUS_M (500 m) of the NS-3 coordinate origin, which is
+    # negligible compared to the satellite footprint (~100 km).  The RT-derived
+    # urban channel statistics (multipath gain, delay spread) are therefore
+    # valid for the entire client population without per-client ray tracing.
     print("\n[Sionna RT]  5G-NTN Munich scene — satellite constellation pass")
     print(f"  Frequency      : {RT_SCENE_FREQ_HZ/1e9:.2f} GHz")
-    print(f"  UE position    : {RT_UE_POSITION} m")
+    print(f"  UE position    : {RT_UE_POSITION} m  "
+          f"(representative for all clients within CLIENT_AREA_RADIUS_M)")
     print(f"  GS position    : {RT_GS_POSITION} m")
     print(f"  Proxy altitude : {RT_SAT_SCENE_HEIGHT_M} m")
     print(f"  Satellites     : {NUM_SATELLITES}  "

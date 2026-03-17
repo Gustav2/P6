@@ -216,8 +216,14 @@ def main() -> None:
     print("\n" + "─" * 70)
     print("  Part 3 — NS-3 multi-protocol simulation")
     print(f"  Protocols: {[p['label'] for p in PROTOCOLS]}")
-    print("  Topologies: direct (Phone->Sat->GS->Server)  +  "
-          "indirect (Phone->gNB->Sat->GS->Server)")
+    from config import USE_BASE_STATIONS, NUM_STATIONARY_CLIENTS, NUM_MOVING_CLIENTS
+    _topo = ("indirect: Phone→gNB→AccessSat→ISL→BenchmarkSat→GS→Server"
+             if USE_BASE_STATIONS
+             else "direct: Phone→AccessSat→ISL→BenchmarkSat→GS→Server")
+    print(f"  Topology : {_topo}")
+    print(f"  Clients  : {NUM_STATIONARY_CLIENTS} stationary + "
+          f"{NUM_MOVING_CLIENTS} moving  "
+          f"(total {NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS})")
     print("─" * 70)
 
     direct_results, indirect_results = run_ns3_both_topologies(

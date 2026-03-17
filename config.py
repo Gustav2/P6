@@ -334,7 +334,7 @@ Each entry is a dict with:
   label       : Human-readable name used in plots and console output.
 """
 
-APP_DATA_RATE = "5Mbps"
+APP_DATA_RATE = "1Mbps"
 """
 Application-layer target data rate for UDP CBR traffic [NS-3 string].
 - Used only for the UDP OnOff application.
@@ -636,4 +636,157 @@ Initial steepness estimate for the PER sigmoid curve [1/dB].
   used as the curve_fit starting guess (p0) and as a fallback.
 - 0.7 gives a smooth ~10 dB transition range, consistent with BLER vs. SNR
   curves for QPSK r=0.5 in AWGN (3GPP TS 38.214, Annex A BLER curves).
+"""
+
+# =============================================================================
+# Multi-client topology settings
+# =============================================================================
+
+USE_BASE_STATIONS = False
+"""
+Topology mode flag.
+
+  True  — Indirect:  Phone → gNB → AccessSat → ISL → BenchmarkSat → GS → Server
+           Each phone is assigned to the nearest gNB (from GNB_POSITIONS).
+           The gNB aggregates traffic before the NTN hop, improving link budget
+           by GNB_EIRP_DBM − PHONE_EIRP_DBM = 20 dB relative to direct mode.
+
+  False — Direct:    Phone → AccessSat → ISL → BenchmarkSat → GS → Server
+           Phones connect to the access satellite directly (no gNB hop).
+           Represents satellite-direct (SD) IoT / mobile terminal use case.
+
+In both modes the benchmark satellite (Sat 0, the highest-elevation satellite
+in the handover schedule) is always reachable via ISL from any access satellite,
+so throughput measurements remain consistent across handovers.
+"""
+
+NUM_STATIONARY_CLIENTS = 3
+"""
+Number of stationary client (phone) nodes placed randomly inside a circle
+of radius CLIENT_AREA_RADIUS_M centred on the NS-3 coordinate origin.
+
+Stationary clients use a ConstantPositionMobilityModel; their positions are
+fixed throughout the simulation.  Used together with NUM_MOVING_CLIENTS.
+"""
+
+NUM_MOVING_CLIENTS = 2
+"""
+Number of mobile client (phone) nodes using the RandomWaypoint mobility
+model.  Each moving client is initialised at a random position within
+CLIENT_AREA_RADIUS_M and moves at a uniformly distributed speed between
+WAYPOINT_SPEED_MIN_MS and WAYPOINT_SPEED_MAX_MS m/s toward a random
+destination within the same radius, with zero pause time at each waypoint.
+
+RandomWaypoint parameters are set in ntn_ns3.py using the bounds
+[−CLIENT_AREA_RADIUS_M, CLIENT_AREA_RADIUS_M] for both X and Y axes.
+"""
+
+CLIENT_AREA_RADIUS_M = 500.0
+"""
+Radius [m] of the circular deployment area for all clients (stationary
+and moving) around the NS-3 coordinate origin (0, 0, 1.5 m).
+
+- 500 m is representative of a 5G macro-cell coverage radius in a dense
+  urban environment (inter-site distance ~500–1000 m for urban macro).
+- All clients in this area share the same satellite visibility and
+  handover schedule because 500 m ≪ the satellite footprint (~100 km).
+Source: 3GPP TR 38.913 §8.1 (dense urban macro inter-site distance 200 m;
+        urban macro 500 m).
+"""
+
+WAYPOINT_SPEED_MIN_MS = 1.0
+"""Minimum moving-client waypoint speed [m/s] (≈ slow walk)."""
+
+WAYPOINT_SPEED_MAX_MS = 5.0
+"""Maximum moving-client waypoint speed [m/s] (≈ fast walk / slow jog)."""
+
+# =============================================================================
+# Base station positions (used only when USE_BASE_STATIONS = True)
+# =============================================================================
+
+GNB_POSITIONS = [
+    (200.0, 150.0),
+    (500.0, 300.0),
+    (350.0, 600.0),
+]
+"""
+List of (x_m, y_m) positions [m] for the fixed gNB nodes in the NS-3
+simulation.  The z-coordinate is fixed at 30.0 m (rooftop installation).
+
+Each phone is assigned to the nearest gNB (minimum Euclidean distance
+at t=0 for stationary clients; at initial position for moving clients).
+
+Three gNBs are sufficient to provide at least one handover between cells
+for moving clients traversing CLIENT_AREA_RADIUS_M at WAYPOINT_SPEED_MAX_MS.
+
+Positions are expressed in NS-3 Cartesian coordinates (metres), with the
+coordinate origin at the centre of the deployment area.
+"""
+
+NUM_GNB = len(GNB_POSITIONS)
+"""Number of gNB nodes — derived from GNB_POSITIONS, do not set manually."""
+
+# =============================================================================
+# Data volume per flow
+# =============================================================================
+
+DATA_VOLUME_MB = 10.0
+"""
+Maximum data volume sent per TCP BulkSend flow [MB].
+
+NS-3 BulkSend.MaxBytes is set to int(DATA_VOLUME_MB × 10⁶) bytes so that
+each flow terminates after transferring this fixed file size rather than
+saturating the link for the full SIM_DURATION_S.
+
+- 10 MB is representative of a medium-sized file transfer (e.g. a map
+  tile cache update or a short video segment for adaptive streaming).
+- Setting this value ensures all protocol runs transmit the same total
+  data volume, making throughput and latency comparisons fair.
+- Set to 0 to disable the cap (unlimited BulkSend, saturating sender).
+
+UDP OnOff flows are not capped by this value (they use APP_DATA_RATE).
+"""
+
+# =============================================================================
+# Inter-satellite link (ISL) parameters
+# =============================================================================
+
+ISL_DATARATE = "1Gbps"
+"""
+Data rate of the inter-satellite link between an access satellite and the
+benchmark satellite (Sat 0) [NS-3 string].
+
+- 1 Gbps is achievable with a space-borne optical (laser) ISL.
+  Starlink Gen-2 optical ISLs are rated at ~1–10 Gbps per link.
+- The ISL is the highest-capacity link in the chain; it should never be
+  the bottleneck.  The bottleneck is the ground service link (10 Mbps).
+Source: Bhattacherjee & Singla, "Network topology design at 27,000 km/hour"
+        (CoNEXT 2019) — laser ISL capacity 1–10 Gbps.
+"""
+
+ISL_DELAY_MS = 5.0
+"""
+One-way propagation delay of the access → benchmark satellite ISL [ms].
+
+- At 550 km altitude with SAT_SPACING_DEG = 15°, the inter-satellite
+  distance along the orbit is approximately:
+    d ≈ 2 × (R_E + h) × sin(π × SAT_SPACING_DEG / 360)
+      = 2 × 6921 km × sin(7.5°) ≈ 1808 km
+  One-way delay = 1808 km / (3×10⁵ km/s) ≈ 6.0 ms.
+- 5.0 ms is used as a round number slightly conservative of this estimate,
+  accounting for the fact that the access satellite and benchmark satellite
+  may be separated by less than one full SAT_SPACING_DEG in practice.
+"""
+
+ISL_PER = 0.0001
+"""
+Packet error rate on the access → benchmark satellite ISL.
+
+- Optical ISLs have an intrinsically very low BER (~10⁻¹² after FEC).
+  At the packet level (1400 B = 11200 bits), PER ≈ 1 − (1−BER)^11200 ≈ 10⁻⁸.
+- 10⁻⁴ is used as a conservative engineering margin that accounts for
+  occasional pointing-acquisition losses, atmospheric scintillation at
+  low elevation, and inter-satellite link geometry changes.
+- Even at 10⁻⁴ PER, the ISL contributes negligibly to end-to-end loss
+  compared with the ground service link (PER typically 0.01–0.3).
 """
