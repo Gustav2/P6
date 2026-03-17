@@ -170,9 +170,25 @@ Source: Standard orbital mechanics (IERS Conventions 2010, §6.1).
 NUM_SATELLITES = 3
 """
 Number of satellites in the simulated constellation pass.
-- Each satellite is visible for a limited time window; when one drops
-  below MIN_ELEVATION_DEG the UE performs a handover to the next one.
-- Minimum 2 to observe at least one handover event.
+
+This controls both the Sionna RT ray-tracing snapshot and the NS-3
+handover schedule.  Three satellites are used because:
+  - They produce 2 handover events during the 600 s simulation,
+    covering high (Sat 0), medium (Sat 1), and low (Sat 2) elevation
+    angles — the three link-budget regimes of interest.
+  - Ray tracing 3 satellites (PathSolver + render per satellite) takes
+    ~2–4 minutes on CPU-only hardware; each additional satellite adds
+    ~45–90 s.  300 satellites would take ~4–8 hours and is not feasible.
+  - The 3 satellite positions span zenith angles 20°, 35°, and 50°
+    (with SAT_SPACING_DEG = 15° and RT_SAT_INITIAL_ZENITH_DEG = 20°),
+    giving elevation angles 70°, 55°, and 40° — well above the 10°
+    handover threshold and representative of a realistic LEO pass.
+  - Minimum 2 to observe at least one handover event.
+
+For the Starlink constellation context (300+ satellites in a shell),
+the NUM_SATELLITES value here represents the number of satellites that
+are active (above the horizon) during a single simulated orbital pass
+rather than the total constellation size.
 """
 
 SAT_HANDOVER_ELEVATION_DEG = 10.0
@@ -302,9 +318,14 @@ Ground Station (GS) position [x, y, z] in metres within the Munich scene.
 SIM_DURATION_S = 60.0
 """
 Total NS-3 simulation duration [seconds].
-- Long enough to capture multiple satellite handovers.
+- 60 s shows at least one handover event with NUM_SATELLITES = 3.
   At 7612 m/s and 550 km altitude, a full overhead pass takes ~8 min;
-  60 s shows at least one handover with NUM_SATELLITES = 3.
+  three satellites with 15° spacing give handovers at ~14 s and ~46 s.
+- Longer durations (e.g. 600 s) significantly increase NS-3 runtime:
+  with 50 clients, each extra 30 s of simulated time adds ~24 min wall-
+  time, making 600 s × 5 protocols ≈ 8 hours impractical.
+- DATA_VOLUME_MB caps each TCP flow at 10 MB, so TCP runs will finish
+  their transfer well before t=60 s even at the limited NTN rates.
 """
 
 # =============================================================================
@@ -660,7 +681,7 @@ in the handover schedule) is always reachable via ISL from any access satellite,
 so throughput measurements remain consistent across handovers.
 """
 
-NUM_STATIONARY_CLIENTS = 3
+NUM_STATIONARY_CLIENTS = 30
 """
 Number of stationary client (phone) nodes placed randomly inside a circle
 of radius CLIENT_AREA_RADIUS_M centred on the NS-3 coordinate origin.
@@ -669,7 +690,7 @@ Stationary clients use a ConstantPositionMobilityModel; their positions are
 fixed throughout the simulation.  Used together with NUM_MOVING_CLIENTS.
 """
 
-NUM_MOVING_CLIENTS = 2
+NUM_MOVING_CLIENTS = 20
 """
 Number of mobile client (phone) nodes using the RandomWaypoint mobility
 model.  Each moving client is initialised at a random position within

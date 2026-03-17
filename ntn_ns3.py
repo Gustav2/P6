@@ -1175,9 +1175,17 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     app_rx.Start(ns.Seconds(0.0))
     app_rx.Stop(ns.Seconds(SIM_DURATION_S + 2.0))
 
-    # ── FlowMonitor ───────────────────────────────────────────────────────────
+     # ── FlowMonitor ───────────────────────────────────────────────────────────
+    # Install FlowMonitor only on endpoint nodes (phones + server) to avoid
+    # monitoring every forwarded packet on infrastructure nodes (satellite,
+    # GS), which would roughly double the event count and is unnecessary since
+    # we only report per-flow src→dst statistics.
     fm_helper = ns.FlowMonitorHelper()
-    monitor   = fm_helper.InstallAll()
+    endpoint_nc = ns.NodeContainer()
+    for ph in phones:
+        endpoint_nc.Add(ph)
+    endpoint_nc.Add(server)
+    monitor   = fm_helper.Install(endpoint_nc)
 
     # ── Run simulation ────────────────────────────────────────────────────────
     ns.Simulator.Stop(ns.Seconds(SIM_DURATION_S + 3.0))
