@@ -5,7 +5,7 @@ Produces output figures for the NTN satellite simulation:
 
   ntn_protocol_comparison.png
       Grouped bar chart comparing all transport protocols (UDP, TCP NewReno,
-      TCP CUBIC, TCP BBR, QUIC) on latency, throughput, and packet loss.
+      TCP CUBIC, TCP BBR, QUIC) on latency, throughput, packet loss, jitter.
 
   ntn_summary.png
       Five-panel summary: BER/BLER from Sionna + 3 NS-3 bar charts.
@@ -17,7 +17,7 @@ Produces output figures for the NTN satellite simulation:
       SNR vs elevation angle with PER sigmoid overlay.
 
   ntn_latency_breakdown.png
-      Per-hop stacked latency bar chart.
+      Per-hop stacked latency bar chart (NTN / ISL / backhaul / overhead).
 
   ntn_handover_impact.png
       Per-slot throughput showing TCP congestion collapse vs QUIC resilience.
@@ -27,6 +27,15 @@ Produces output figures for the NTN satellite simulation:
 
   ntn_results.png
       Three-panel combined results summary (throughput, latency, loss).
+
+  ntn_timeseries.png
+      Per-second throughput time-series with handover gap markers.
+
+  ntn_fairness.png
+      Jain's fairness index per protocol.
+
+  ntn_profile_breakdown.png
+      Per-traffic-profile throughput and loss breakdown per protocol.
 """
 
 import numpy as np
@@ -72,18 +81,19 @@ _SLOT_COLORS = ["#1a6fc4", "#2ca02c", "#d62728"]
 def draw_protocol_comparison(ns3_results: list,
                               out: str = "output/ntn_protocol_comparison.png") -> str:
     """
-    Grouped bar chart comparing transport protocols on three metrics:
+    Grouped bar chart comparing transport protocols on four metrics:
       - Mean end-to-end latency [ms]
       - Throughput [kbps]
       - Packet loss rate [%]
+      - Jitter [ms]
 
     Parameters
     ----------
     ns3_results : list[dict]
         Output of ntn_ns3.run_ns3_protocol_suite() — one dict per protocol.
         Each dict must contain keys:
-          label, mean_delay_ms, throughput_kbps, loss_pct, handovers,
-          elevation_deg, svc_delay_ms.
+          label, mean_delay_ms, throughput_kbps, loss_pct, jitter_ms,
+          handovers, elevation_deg, svc_delay_ms.
     out : str
         Output filename.
 
@@ -95,17 +105,18 @@ def draw_protocol_comparison(ns3_results: list,
         print("[ProtocolChart]  No results to plot — skipping.")
         return out
 
-    labels    = [r["label"]           for r in ns3_results]
-    latencies = [r["mean_delay_ms"]   for r in ns3_results]
-    tputs     = [r["throughput_kbps"] for r in ns3_results]
-    losses    = [r["loss_pct"]        for r in ns3_results]
-    handovers = [r.get("handovers", 0) for r in ns3_results]
+    labels    = [r["label"]              for r in ns3_results]
+    latencies = [r["mean_delay_ms"]      for r in ns3_results]
+    tputs     = [r["throughput_kbps"]    for r in ns3_results]
+    losses    = [r["loss_pct"]           for r in ns3_results]
+    jitters   = [r.get("jitter_ms", 0.0) for r in ns3_results]
+    handovers = [r.get("handovers", 0)   for r in ns3_results]
 
     colors = [_proto_color(lbl, i) for i, lbl in enumerate(labels)]
     x = np.arange(len(labels))
     bar_w = 0.62
 
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(18, 5))
     fig.suptitle(
         "Transport Protocol Comparison — 5G-NTN LEO Satellite Link\n"
         f"(Sionna RT channel stats → NS-3 packet simulation, "
@@ -119,7 +130,7 @@ def draw_protocol_comparison(ns3_results: list,
                   linewidth=0.8, alpha=0.88)
     ax.bar_label(bars, fmt="%.1f", fontsize=8, padding=2)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_xticklabels(labels, fontsize=9, rotation=12, ha="right")
     ax.set_ylabel("Mean E2E Latency [ms]")
     ax.set_title("Latency")
     ax.grid(axis="y", alpha=0.35)
@@ -131,7 +142,7 @@ def draw_protocol_comparison(ns3_results: list,
                   linewidth=0.8, alpha=0.88)
     ax.bar_label(bars, fmt="%.0f", fontsize=8, padding=2)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_xticklabels(labels, fontsize=9, rotation=12, ha="right")
     ax.set_ylabel("Throughput [kbps]")
     ax.set_title("Throughput")
     ax.grid(axis="y", alpha=0.35)
@@ -143,17 +154,29 @@ def draw_protocol_comparison(ns3_results: list,
                   linewidth=0.8, alpha=0.88)
     ax.bar_label(bars, fmt="%.2f%%", fontsize=8, padding=2)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_xticklabels(labels, fontsize=9, rotation=12, ha="right")
     ax.set_ylabel("Packet Loss [%]")
     ax.set_title("Packet Loss")
     ax.grid(axis="y", alpha=0.35)
-    ax.set_ylim(0, max(losses) * 1.35 + 0.1)
-
+    loss_top = max(losses) * 1.35 + 0.1
+    ax.set_ylim(0, loss_top)
     # Annotate handover counts below each bar
     for xi, ho in zip(x, handovers):
-        ax.text(xi, -0.04 * (max(losses) * 1.35 + 0.1),
+        ax.text(xi, -0.04 * loss_top,
                 f"{ho} H/O", ha="center", va="top",
                 fontsize=7, color="#555")
+
+    # ── Panel 4: Jitter ───────────────────────────────────────────────────────
+    ax = axes[3]
+    bars = ax.bar(x, jitters, bar_w, color=colors, edgecolor="#333",
+                  linewidth=0.8, alpha=0.88)
+    ax.bar_label(bars, fmt="%.2f", fontsize=8, padding=2)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9, rotation=12, ha="right")
+    ax.set_ylabel("Jitter [ms]")
+    ax.set_title("Jitter")
+    ax.grid(axis="y", alpha=0.35)
+    ax.set_ylim(0, max(jitters) * 1.35 + 0.1)
 
     # ── Shared legend ─────────────────────────────────────────────────────────
     legend_patches = [
@@ -322,6 +345,9 @@ def _mini_topology(ax) -> None:
     """
     Draw a compact inline topology sketch into a pre-existing axes.
     Used by draw_summary() for the top-right panel.
+
+    Topology (direct mode):
+      UE → AccessSat → ISL → BenchmarkSat → Internet Server
     """
     ax.set_xlim(0, 10)
     ax.set_ylim(0, 5)
@@ -341,11 +367,10 @@ def _mini_topology(ax) -> None:
                     ha="center", va="center", fontsize=5.5, color="#555",
                     zorder=4)
 
-    _box(2, 4.2, "LEO Sat 0", "~90°", fc="#cce5ff")
-    _box(6, 4.2, "LEO Sat 1", "~75°", fc="#cce5ff")
-    _box(1.5, 2,  "UE", "street-level", fc="#d4edda")
-    _box(6.5, 2,  "GS", "ground stn", fc="#fff3cd")
-    _box(9, 2,   "Server", "internet", fc="#f8d7da")
+    _box(2,   4.2, "AccessSat",  "~75°",        fc="#cce5ff")
+    _box(7,   4.2, "BenchSat",   "~90° (ISL)",  fc="#cce5ff")
+    _box(1.5, 2,   "UE",         "street-level", fc="#d4edda")
+    _box(9,   2,   "Server",     "internet",     fc="#f8d7da")
 
     # Arrows
     def _arr(x1, y1, x2, y2, col="#333", ls="-", lw=1):
@@ -353,16 +378,15 @@ def _mini_topology(ax) -> None:
                     arrowprops=dict(arrowstyle="-|>", color=col,
                                     lw=lw, linestyle=ls), zorder=2)
 
-    _arr(1.5, 2.35, 2, 3.85, col="#0056b3", lw=1.5)   # UE → Sat0
-    _arr(1.5, 2.35, 6, 3.85, col="#888", ls="--")     # UE → Sat1
-    _arr(2, 3.85, 6.5, 2.35, col="#856404")            # Sat0 → GS
-    _arr(7.6, 2.0, 7.9, 2.0, col="#155724", lw=1)     # GS → Server
+    _arr(1.5, 2.35, 2,   3.85, col="#0056b3", lw=1.5)  # UE → AccessSat (NTN)
+    _arr(3.1, 4.2,  5.9, 4.2,  col="#856404", lw=1.2)  # AccessSat → BenchSat (ISL)
+    _arr(7,   3.85, 9,   2.35, col="#155724", lw=1.0)  # BenchSat → Server
 
-    ax.text(3.8, 3.5, "NTN svc\nlink", ha="center", fontsize=5.5,
+    ax.text(1.0, 3.3, "NTN svc\nlink", ha="center", fontsize=5.5,
             color="#0056b3")
-    ax.text(4.2, 2.8, "Ka feeder", ha="center", fontsize=5.5,
+    ax.text(4.5, 4.5, "ISL", ha="center", fontsize=5.5,
             color="#856404")
-    ax.text(8.2, 2.2, "fibre", ha="center", fontsize=5.5,
+    ax.text(8.4, 3.2, "direct\nIP", ha="center", fontsize=5.5,
             color="#155724")
 
 
@@ -604,8 +628,8 @@ def draw_latency_breakdown(ns3_results: list,
 
     Hop breakdown:
       - NTN propagation (slant range delay, one-way)
-      - Feeder link propagation (one-way)
-      - Terrestrial backhaul (GS→Server: 10 ms)
+      - ISL (access sat → benchmark sat, one-way)
+      - Backhaul (benchmark sat → internet server: TERRESTRIAL_BACKHAUL_DELAY_MS)
       - Protocol overhead (queuing, retransmission — residual from measurement)
 
     Parameters
@@ -617,29 +641,28 @@ def draw_latency_breakdown(ns3_results: list,
     -------
     str  Path of the saved figure.
     """
-    from config import SAT_HEIGHT_M
+    from config import SAT_HEIGHT_M, ISL_DELAY_MS, TERRESTRIAL_BACKHAUL_DELAY_MS
     from ntn_ns3 import _one_way_delay_ms
 
     if not ns3_results:
         print("[LatBreakdown]  No results — skipping.")
         return out
 
-    # Fixed hop delays (one-way, ms) — derived from first satellite in schedule
-    # Use a typical 60° elevation for the NTN hop (access satellite)
-    ntn_delay   = _one_way_delay_ms(SAT_HEIGHT_M, 60.0)
-    feeder_ms   = _one_way_delay_ms(SAT_HEIGHT_M, 80.0)
-    backhaul_ms = 10.0
+    # Fixed hop delays (one-way, ms)
+    ntn_delay   = _one_way_delay_ms(SAT_HEIGHT_M, 60.0)  # typical 60° elevation
+    isl_ms      = float(ISL_DELAY_MS)
+    backhaul_ms = float(TERRESTRIAL_BACKHAUL_DELAY_MS)
 
     rows = []
     for i, r in enumerate(ns3_results):
         lbl = r["label"]
-        fixed = ntn_delay + feeder_ms + backhaul_ms
+        fixed = ntn_delay + isl_ms + backhaul_ms
         overhead = max(0.0, r["mean_delay_ms"] - fixed)
         rows.append({
             "label":    lbl,
             "color":    _proto_color(lbl, i),
             "ntn":      ntn_delay,
-            "feeder":   feeder_ms,
+            "isl":      isl_ms,
             "backhaul": backhaul_ms,
             "overhead": overhead,
         })
@@ -649,26 +672,26 @@ def draw_latency_breakdown(ns3_results: list,
     height = 0.55
 
     HOP_COLORS = {
-        "ntn":         "#42A5F5",
-        "feeder":      "#FFA726",
-        "backhaul":    "#AB47BC",
-        "overhead":    "#EF5350",
+        "ntn":      "#42A5F5",
+        "isl":      "#FFA726",
+        "backhaul": "#AB47BC",
+        "overhead": "#EF5350",
     }
     HOP_LABELS = {
-        "ntn":         "NTN propagation",
-        "feeder":      "Feeder link",
-        "backhaul":    "Backhaul (GS→Server)",
-        "overhead":    "Protocol overhead",
+        "ntn":      "NTN propagation",
+        "isl":      "ISL (access→benchmark sat)",
+        "backhaul": "Backhaul (sat→internet)",
+        "overhead": "Protocol overhead",
     }
 
     fig, ax = plt.subplots(figsize=(10, max(4, n * 0.7 + 1.5)))
     fig.patch.set_facecolor("#f8f9fa")
     ax.set_facecolor("#f8f9fa")
 
-    hops = ["ntn", "feeder", "backhaul", "overhead"]
+    hops = ["ntn", "isl", "backhaul", "overhead"]
     for hop in hops:
         lefts = np.zeros(n)
-        for hi, h in enumerate(hops):
+        for h in hops:
             if h == hop:
                 break
             lefts += np.array([r[h] for r in rows])
@@ -690,7 +713,7 @@ def draw_latency_breakdown(ns3_results: list,
 
     # Total latency labels
     for i, r in enumerate(rows):
-        total = r["ntn"] + r["feeder"] + r["backhaul"] + r["overhead"]
+        total = r["ntn"] + r["isl"] + r["backhaul"] + r["overhead"]
         ax.text(total + 0.3, i, f"{total:.1f} ms",
                 va="center", fontsize=7.5, color="#333")
 
@@ -959,5 +982,290 @@ def draw_combined_results(ns3_results: list,
     plt.tight_layout(rect=[0, 0.05, 1, 0.97])
     plt.savefig(out, dpi=150, bbox_inches="tight")
     print(f"[CombinedResults]  Saved -> {out}")
+    plt.close()
+    return out
+
+
+# =============================================================================
+# 7. Per-second throughput time-series
+# =============================================================================
+
+def draw_timeseries(ns3_results: list,
+                    out: str = "output/ntn_timeseries.png") -> str:
+    """
+    Per-second throughput time-series for all protocols, one subplot per
+    protocol, with handover beam-interruption gaps shown as shaded regions
+    and handover start times as vertical dashed lines.
+
+    Parameters
+    ----------
+    ns3_results : list[dict]
+        Output of run_ns3_protocol_suite().  Each dict must contain a
+        ``timeseries`` key with sub-keys:
+          t_s             : list[float]  probe times [s]
+          throughput_kbps : list[float]  per-second throughput [kbps]
+          handover_times  : list[(float,float)]  (t_start, t_end) of each gap
+    out : str
+        Output filename.
+
+    Returns
+    -------
+    str  Path of the saved figure.
+    """
+    if not ns3_results:
+        print("[Timeseries]  No results — skipping.")
+        return out
+
+    n_protos = len(ns3_results)
+    fig, axes = plt.subplots(n_protos, 1,
+                             figsize=(14, 2.8 * n_protos),
+                             sharex=True)
+    if n_protos == 1:
+        axes = [axes]
+
+    fig.suptitle(
+        "Per-Second Throughput Time-Series — 5G-NTN LEO Satellite Link\n"
+        "Grey shading = beam interruption gap during handover   "
+        "Red dashed = handover start",
+        fontsize=10,
+    )
+
+    for ax, r in zip(axes, ns3_results):
+        ts = r.get("timeseries", {})
+        t_s    = ts.get("t_s", [])
+        tput   = ts.get("throughput_kbps", [])
+        ho_times = ts.get("handover_times", [])
+
+        color  = _proto_color(r["label"], ns3_results.index(r))
+        mean_t = r.get("throughput_kbps", 0.0)
+
+        if t_s and tput:
+            ax.step(t_s, tput, where="post", color=color, linewidth=1.4,
+                    alpha=0.85)
+            ax.fill_between(t_s, tput, step="post", alpha=0.18, color=color)
+        else:
+            ax.text(0.5, 0.5, "No time-series data",
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=9, color="#888")
+
+        # Mean throughput reference line
+        ax.axhline(mean_t, color=color, linewidth=1.0, linestyle="--",
+                   alpha=0.55, label=f"Mean {mean_t:.0f} kbps")
+
+        # Handover beam-gap shading and start markers
+        for t_start, t_end in ho_times:
+            ax.axvspan(t_start, t_end, alpha=0.18, color="#d62728", zorder=0)
+            ax.axvline(t_start, color="#d62728", linewidth=1.2,
+                       linestyle="--", alpha=0.8, zorder=1)
+
+        ax.set_ylabel("Throughput\n[kbps]", fontsize=8)
+        ax.set_title(r["label"], fontsize=9, fontweight="bold",
+                     color=color, loc="left")
+        ax.grid(axis="both", alpha=0.25)
+        ax.legend(fontsize=7.5, loc="upper right", framealpha=0.85)
+        y_top = max(tput) * 1.3 + 1 if tput else max(mean_t * 1.5, 10)
+        ax.set_ylim(0, y_top)
+
+    axes[-1].set_xlabel("Simulation Time [s]", fontsize=9)
+    from config import SIM_DURATION_S as _SIM_S
+    axes[-1].set_xlim(0, _SIM_S)
+
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"[Timeseries]  Saved -> {out}")
+    plt.close()
+    return out
+
+
+# =============================================================================
+# 8. Jain's fairness index
+# =============================================================================
+
+def draw_fairness(ns3_results: list,
+                  out: str = "output/ntn_fairness.png") -> str:
+    """
+    Bar chart of Jain's fairness index per protocol, with reference lines
+    at 0.5 (poor), 0.75 (fair), and 1.0 (perfect).
+
+    Jain's fairness index J = (Σxᵢ)² / (n · Σxᵢ²) where xᵢ is the
+    per-flow throughput.  J = 1.0 means perfectly equal sharing;
+    J → 1/n means only one flow is active.
+
+    Parameters
+    ----------
+    ns3_results : list[dict]
+        Each dict must contain a ``fairness_index`` key (float in [0, 1]).
+    out : str
+        Output filename.
+
+    Returns
+    -------
+    str  Path of the saved figure.
+    """
+    if not ns3_results:
+        print("[Fairness]  No results — skipping.")
+        return out
+
+    labels   = [r["label"]                    for r in ns3_results]
+    fairness = [r.get("fairness_index", 0.0)  for r in ns3_results]
+    colors   = [_proto_color(lbl, i) for i, lbl in enumerate(labels)]
+
+    x     = np.arange(len(labels))
+    bar_w = 0.55
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    fig.suptitle(
+        "Jain's Fairness Index — 5G-NTN Satellite Link\n"
+        "J = 1.0 = perfect fairness  |  J → 1/n = one flow dominates",
+        fontsize=10,
+    )
+
+    bars = ax.bar(x, fairness, bar_w, color=colors, edgecolor="#333",
+                  linewidth=0.8, alpha=0.88)
+
+    # Annotate bars with exact value
+    for bar, val in zip(bars, fairness):
+        ax.text(bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height() + 0.01,
+                f"{val:.3f}", ha="center", va="bottom",
+                fontsize=9, fontweight="bold")
+
+    # Reference lines
+    ref_lines = [(1.00, "#155724", "1.00 — Perfect"),
+                 (0.75, "#856404", "0.75 — Fair"),
+                 (0.50, "#d62728", "0.50 — Poor")]
+    for val, col, lbl in ref_lines:
+        ax.axhline(val, color=col, linewidth=1.2, linestyle="--",
+                   alpha=0.75, label=lbl)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=10)
+    ax.set_ylabel("Jain's Fairness Index", fontsize=10)
+    ax.set_ylim(0, 1.15)
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(fontsize=8.5, loc="lower right", framealpha=0.9)
+
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"[Fairness]  Saved -> {out}")
+    plt.close()
+    return out
+
+
+# =============================================================================
+# 9. Per-traffic-profile breakdown
+# =============================================================================
+
+def draw_profile_breakdown(ns3_results: list,
+                            out: str = "output/ntn_profile_breakdown.png") -> str:
+    """
+    Grouped bar chart showing throughput and packet loss rate broken down
+    by traffic profile (video / gaming / iot / bulk) for each protocol.
+
+    Parameters
+    ----------
+    ns3_results : list[dict]
+        Each dict must contain a ``profile_stats`` key mapping profile name
+        → {tx, rx, rx_bytes, delay_sum}.
+    out : str
+        Output filename.
+
+    Returns
+    -------
+    str  Path of the saved figure.
+    """
+    from config import SIM_DURATION_S as _SIM_S, TRAFFIC_PROFILES
+
+    if not ns3_results:
+        print("[ProfileBreakdown]  No results — skipping.")
+        return out
+
+    # Check that profile_stats is actually populated
+    has_data = any(
+        any(v["rx"] > 0 for v in r.get("profile_stats", {}).values())
+        for r in ns3_results
+    )
+    if not has_data:
+        print("[ProfileBreakdown]  profile_stats empty — skipping.")
+        return out
+
+    profiles    = list(TRAFFIC_PROFILES.keys())  # ["video","gaming","iot","bulk"]
+    proto_labels = [r["label"] for r in ns3_results]
+    n_protos     = len(proto_labels)
+    n_profiles   = len(profiles)
+
+    PROFILE_COLORS = {
+        "video":  "#1f77b4",
+        "gaming": "#2ca02c",
+        "iot":    "#ff7f0e",
+        "bulk":   "#9467bd",
+    }
+
+    active_s = _SIM_S - 1.0
+
+    # Build per-protocol, per-profile throughput and loss arrays
+    tput_matrix = np.zeros((n_protos, n_profiles))
+    loss_matrix = np.zeros((n_protos, n_profiles))
+
+    for pi, r in enumerate(ns3_results):
+        ps = r.get("profile_stats", {})
+        for qi, prof in enumerate(profiles):
+            stats = ps.get(prof, {"tx": 0, "rx": 0, "rx_bytes": 0})
+            rx_b  = stats.get("rx_bytes", 0)
+            tx_n  = max(stats.get("tx", 0), 1)
+            rx_n  = stats.get("rx", 0)
+            tput_matrix[pi, qi] = rx_b * 8.0 / active_s / 1e3   # kbps
+            loss_matrix[pi, qi] = 100.0 * (1 - rx_n / tx_n) if tx_n > 0 else 0.0
+
+    x     = np.arange(n_protos)
+    bar_w = 0.8 / n_profiles
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 9))
+    fig.suptitle(
+        "Per-Traffic-Profile Performance Breakdown — 5G-NTN Satellite Link\n"
+        "Profiles: video (2 Mbps UDP)  |  gaming (100 kbps UDP)  |  "
+        "IoT (10 kbps, 10% duty)  |  bulk (TCP BulkSend)",
+        fontsize=10,
+    )
+
+    # ── Top: Throughput ───────────────────────────────────────────────────────
+    for qi, prof in enumerate(profiles):
+        offset = (qi - n_profiles / 2 + 0.5) * bar_w
+        vals   = tput_matrix[:, qi]
+        bars   = ax1.bar(x + offset, vals, bar_w,
+                         color=PROFILE_COLORS[prof],
+                         edgecolor="#333", linewidth=0.6, alpha=0.85,
+                         label=prof.capitalize())
+        ax1.bar_label(bars, fmt="%.0f", fontsize=6.5, padding=1)
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(proto_labels, fontsize=9)
+    ax1.set_ylabel("Throughput [kbps]", fontsize=9)
+    ax1.set_title("Throughput by Traffic Profile", fontsize=9)
+    ax1.legend(fontsize=8.5, loc="upper right", framealpha=0.9)
+    ax1.grid(axis="y", alpha=0.3)
+    ax1.set_ylim(0, tput_matrix.max() * 1.3 + 1)
+
+    # ── Bottom: Packet loss ───────────────────────────────────────────────────
+    for qi, prof in enumerate(profiles):
+        offset = (qi - n_profiles / 2 + 0.5) * bar_w
+        vals   = loss_matrix[:, qi]
+        bars   = ax2.bar(x + offset, vals, bar_w,
+                         color=PROFILE_COLORS[prof],
+                         edgecolor="#333", linewidth=0.6, alpha=0.85,
+                         label=prof.capitalize())
+        ax2.bar_label(bars, fmt="%.1f%%", fontsize=6.5, padding=1)
+
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(proto_labels, fontsize=9)
+    ax2.set_ylabel("Packet Loss [%]", fontsize=9)
+    ax2.set_title("Packet Loss by Traffic Profile", fontsize=9)
+    ax2.legend(fontsize=8.5, loc="upper right", framealpha=0.9)
+    ax2.grid(axis="y", alpha=0.3)
+    ax2.set_ylim(0, loss_matrix.max() * 1.35 + 0.5)
+
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"[ProfileBreakdown]  Saved -> {out}")
     plt.close()
     return out

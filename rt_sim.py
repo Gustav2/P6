@@ -19,9 +19,8 @@ NUM_SATELLITES proxy transmitters are placed at angular offsets
 in the constellation.  For each, ray tracing is performed independently
 and per-satellite channel statistics are returned.
 
-Two receivers are placed in the scene:
+One receiver is placed in the scene:
   - UE  at RT_UE_POSITION  — service link (sat → UE)
-  - GS  at RT_GS_POSITION  — feeder link  (sat → Ground Station)
 
 Outputs
 -------
@@ -41,13 +40,6 @@ Returns
         los_exists            bool  True if at least one LoS path found
         sat_x_m               float proxy TX x-position [m]
         sat_y_m               float proxy TX y-position [m]
-      Feeder-link keys (sat → GS):
-        feeder_elevation_deg      float GS elevation angle [deg]
-        feeder_mean_path_gain_db  float mean |h| over valid feeder paths [dB]
-        feeder_delay_spread_ns    float RMS feeder delay spread [ns]
-        feeder_num_paths          int   valid feeder path count
-        feeder_propagation_delay_ms float one-way propagation delay [ms]
-                                        computed from GS elevation geometry
 """
 
 import math
@@ -78,7 +70,6 @@ from config import (
     RT_SAMPLES_PER_TX,
     RT_CELL_SIZE,
     RT_UE_POSITION,
-    RT_GS_POSITION,
     RT_SAT_SCENE_HEIGHT_M,
     RT_SAT_INITIAL_ZENITH_DEG,
     RT_CAM_POSITION,
@@ -277,119 +268,15 @@ def _extract_channel_stats(paths, sat_id: int,
     )
 
 
-def _extract_feeder_stats(paths, sat_id: int,
-                           sat_pos: tuple, gs_elev_deg: float) -> dict:
+def _load_scene_with_ue(ue_pos: list) -> tuple:
     """
-    Compute feeder-link channel statistics from a Sionna RT Paths object,
-    using the Ground Station (GS) receiver slice of the paths tensor.
-
-    Sionna RT stores paths for all receivers in a single tensor with shape
-    [..., num_rx, ...].  Receiver index 0 = UE, receiver index 1 = GS.
-    This function extracts the GS slice (index 1) to characterise the
-    satellite → GS feeder link.
-
-    The propagation delay is computed analytically from the GS elevation
-    angle and the real 550 km orbital altitude (SAT_HEIGHT_M), because the
-    proxy TX is only 300 m above the scene and the RT path delays do not
-    represent the true 550 km slant range.
-
-    Parameters
-    ----------
-    paths       : sionna.rt.Paths  Computed propagation paths (both receivers).
-    sat_id      : int              Satellite index (0-based).
-    sat_pos     : (x, y, z)        Satellite proxy position [m].
-    gs_elev_deg : float            Elevation angle from GS to satellite [deg].
-
-    Returns
-    -------
-    dict with keys:
-        feeder_elevation_deg      float
-        feeder_mean_path_gain_db  float  [dB]; −200 if no paths
-        feeder_delay_spread_ns    float  [ns]
-        feeder_num_paths          int
-        feeder_propagation_delay_ms float  analytic one-way delay [ms]
-    """
-    # Receiver index 1 = GS (0 = UE).  Sionna RT path tensors have shape
-    # [2, num_rx, num_tx, rx_ant, tx_ant, max_paths] where axis-0 is
-    # (real, imaginary).  We select receiver 1 along axis 1.
-    num_paths = 0
-    valid_a   = np.array([], dtype=np.float64)
-    valid_tau = np.array([], dtype=np.float64)
-    try:
-        tau_np   = np.array(paths.tau)       # [..., num_rx, ..., num_paths]
-        a_re_np  = np.array(paths.a[0])      # real part
-        a_im_np  = np.array(paths.a[1])      # imaginary part
-        valid_np = np.array(paths.valid).astype(bool)
-
-        # Select GS receiver (index 1) along the num_rx axis.
-        # paths.tau shape: (num_rx, num_tx, rx_ant, tx_ant, max_paths)
-        # paths.a   shape: (num_rx, num_tx, rx_ant, tx_ant, max_paths)
-        # paths.valid shape: (num_rx, num_tx, rx_ant, tx_ant, max_paths)
-        # (Sionna 1.x — receiver axis is axis 0 of the non-real/imag dims)
-        if tau_np.ndim >= 1 and tau_np.shape[0] >= 2:
-            tau_gs   = tau_np[1]
-            a_re_gs  = a_re_np[1]
-            a_im_gs  = a_im_np[1]
-            valid_gs = valid_np[1]
-        else:
-            # Fallback: single receiver — feeder channel not available
-            raise ValueError("paths tensor has fewer than 2 receivers")
-
-        a_mag_gs   = np.sqrt(a_re_gs ** 2 + a_im_gs ** 2)
-        valid_flat = valid_gs.flatten()
-        tau_flat   = tau_gs.flatten()
-        a_flat     = a_mag_gs.flatten()
-
-        valid_tau = tau_flat[valid_flat]
-        valid_a   = a_flat[valid_flat]
-        num_paths = int(valid_flat.sum())
-
-    except Exception as exc:
-        # If the tensor structure differs from expectation, fall back gracefully
-        print(f"    [Feeder] Could not extract GS paths for sat{sat_id}: {exc}")
-        num_paths = 0
-
-    prop_delay_ms = _propagation_delay_ms(SAT_HEIGHT_M, gs_elev_deg)
-
-    if num_paths == 0:
-        return dict(
-            feeder_elevation_deg      = round(gs_elev_deg, 1),
-            feeder_mean_path_gain_db  = -200.0,
-            feeder_delay_spread_ns    = 0.0,
-            feeder_num_paths          = 0,
-            feeder_propagation_delay_ms = round(prop_delay_ms, 3),
-        )
-
-    mean_power_lin  = float(np.mean(valid_a ** 2))
-    mean_gain_db    = float(10.0 * np.log10(mean_power_lin + 1e-60))
-    power_weights   = valid_a ** 2 / (valid_a ** 2).sum()
-    mean_tau_f      = float((power_weights * valid_tau).sum())
-    delay_spread_ns = float(
-        np.sqrt((power_weights * (valid_tau - mean_tau_f) ** 2).sum()) * 1e9
-    )
-
-    return dict(
-        feeder_elevation_deg      = round(gs_elev_deg, 1),
-        feeder_mean_path_gain_db  = round(mean_gain_db, 2),
-        feeder_delay_spread_ns    = round(delay_spread_ns, 2),
-        feeder_num_paths          = num_paths,
-        feeder_propagation_delay_ms = round(prop_delay_ms, 3),
-    )
-
-def _load_scene_with_ue(ue_pos: list, gs_pos: list) -> tuple:
-    """
-    Load the Munich scene, set the carrier frequency, and place both the UE
-    and the Ground Station receivers in the scene.
-
-    Two receivers allow a single PathSolver call to return paths toward both
-    the UE (service link, receiver index 0) and the GS (feeder link,
-    receiver index 1) simultaneously.
+    Load the Munich scene, set the carrier frequency, and place the UE
+    receiver in the scene.
 
     Returns
     -------
     scene  : sionna.rt.Scene
-    rx_ue  : sionna.rt.Receiver  (the UE, receiver index 0)
-    rx_gs  : sionna.rt.Receiver  (the Ground Station, receiver index 1)
+    rx_ue  : sionna.rt.Receiver  (the UE)
     """
     scene = load_scene(sionna.rt.scene.munich, merge_shapes=True)
     scene.frequency = RT_SCENE_FREQ_HZ
@@ -406,9 +293,9 @@ def _load_scene_with_ue(ue_pos: list, gs_pos: list) -> tuple:
         polarization="V",
     )
 
-    # RX array: single dipole with cross-polarisation (used for both UE
-    # and GS receivers — realistic for a hand-held phone and a gateway
-    # dish that may have arbitrary polarisation alignment).
+    # RX array: single dipole with cross-polarisation (used for the UE
+    # receiver — realistic for a hand-held phone with arbitrary
+    # polarisation alignment).
     scene.rx_array = PlanarArray(
         num_rows=1,
         num_cols=1,
@@ -418,15 +305,11 @@ def _load_scene_with_ue(ue_pos: list, gs_pos: list) -> tuple:
         polarization="cross",
     )
 
-    # UE (phone) — service link receiver (index 0)
+    # UE (phone) — service link receiver
     rx_ue = Receiver(name="ue", position=ue_pos, display_radius=3)
     scene.add(rx_ue)
 
-    # Ground Station — feeder link receiver (index 1)
-    rx_gs = Receiver(name="gs", position=gs_pos, display_radius=5)
-    scene.add(rx_gs)
-
-    return scene, rx_ue, rx_gs
+    return scene, rx_ue
 
 
 def _make_camera() -> Camera:
@@ -442,11 +325,11 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
                      elev_deg: float) -> tuple:
     """
     Add the satellite proxy transmitter to the scene, run PathSolver for
-    both receivers (UE and GS), render a paths image, then remove the TX.
+    the UE receiver, render a paths image, then remove the TX.
 
     Parameters
     ----------
-    scene    : sionna.rt.Scene  (must already contain "ue" and "gs" receivers)
+    scene    : sionna.rt.Scene  (must already contain the "ue" receiver)
     sat_id   : int
     sat_pos  : (x, y, z)  Proxy transmitter position [m].
     elev_deg : float       UE elevation angle [deg] for logging.
@@ -454,7 +337,7 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
     Returns
     -------
     paths : sionna.rt.Paths
-    stats : dict  Service-link + feeder-link channel statistics merged.
+    stats : dict  Service-link channel statistics.
     """
     tx_name = f"sat{sat_id}"
     tx = Transmitter(
@@ -467,8 +350,7 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
     )
     scene.add(tx)
 
-    # Path computation — both UE and GS receivers are in the scene;
-    # Sionna RT returns paths to all receivers in a single call.
+    # Path computation — UE receiver is in the scene.
     solver = PathSolver()
     paths  = solver(
         scene              = scene,
@@ -499,11 +381,6 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
 
     # Service-link stats (sat → UE)
     stats = _extract_channel_stats(paths, sat_id, sat_pos, elev_deg)
-
-    # Feeder-link stats (sat → GS)
-    gs_elev_deg = _sat_elevation_deg(*sat_pos, *RT_GS_POSITION)
-    feeder_stats = _extract_feeder_stats(paths, sat_id, sat_pos, gs_elev_deg)
-    stats.update(feeder_stats)
 
     # Remove this satellite before adding the next one
     scene.remove(tx_name)
@@ -553,12 +430,11 @@ def run_ray_tracing() -> list:
     """
     Execute the full Sionna RT ray tracing pipeline:
 
-    1. Load the Munich scene and place the UE and Ground Station receivers.
+    1. Load the Munich scene and place the UE receiver.
     2. For each satellite in the constellation snapshot:
-       a. Compute its proxy position and elevation angles to both UE and GS.
-       b. Run PathSolver (LoS + specular reflections + refractions) toward
-          both receivers simultaneously.
-       c. Extract service-link stats (sat→UE) and feeder-link stats (sat→GS).
+       a. Compute its proxy position and elevation angle to the UE.
+       b. Run PathSolver (LoS + specular reflections + refractions).
+       c. Extract service-link channel statistics (sat→UE).
        d. Save a scene render with paths overlaid.
     3. Compute and save a composite radio map.
 
@@ -570,12 +446,10 @@ def run_ray_tracing() -> list:
     -------
     channel_stats : list[dict]
         One dict per satellite (in order of simulation index).
-        Service-link keys: sat_id, elevation_deg, mean_path_gain_db,
-          delay_spread_ns, num_paths, los_exists, sat_x_m, sat_y_m.
-        Feeder-link keys: feeder_elevation_deg, feeder_mean_path_gain_db,
-          feeder_delay_spread_ns, feeder_num_paths, feeder_propagation_delay_ms.
+        Keys: sat_id, elevation_deg, mean_path_gain_db,
+              delay_spread_ns, num_paths, los_exists, sat_x_m, sat_y_m.
         This list is passed directly to ntn_ns3.run_ns3() so that the
-        NS-3 link budget uses RT-informed channel parameters for both hops.
+        NS-3 link budget uses RT-informed channel parameters.
     """
     # NOTE: RT_UE_POSITION is used as a single representative UE position for
     # all clients in the multi-client topology.  All clients are deployed within
@@ -587,7 +461,6 @@ def run_ray_tracing() -> list:
     print(f"  Frequency      : {RT_SCENE_FREQ_HZ/1e9:.2f} GHz")
     print(f"  UE position    : {RT_UE_POSITION} m  "
           f"(representative for all clients within CLIENT_AREA_RADIUS_M)")
-    print(f"  GS position    : {RT_GS_POSITION} m")
     print(f"  Proxy altitude : {RT_SAT_SCENE_HEIGHT_M} m")
     print(f"  Satellites     : {NUM_SATELLITES}  "
           f"(initial zenith {RT_SAT_INITIAL_ZENITH_DEG}°, "
@@ -608,15 +481,13 @@ def run_ray_tracing() -> list:
     ]
 
     # ── Load scene once, trace each satellite sequentially ───────────────────
-    scene, rx_ue, rx_gs = _load_scene_with_ue(RT_UE_POSITION, RT_GS_POSITION)
+    scene, rx_ue = _load_scene_with_ue(RT_UE_POSITION)
 
     all_stats = []
 
     for sat_id, (sat_pos, elev_deg) in enumerate(zip(sat_positions, elev_angles)):
         visible = elev_deg >= SAT_HANDOVER_ELEVATION_DEG
-        gs_elev = _sat_elevation_deg(*sat_pos, *RT_GS_POSITION)
         print(f"  Satellite {sat_id}:  UE elev={elev_deg:5.1f}°  "
-              f"GS elev={gs_elev:5.1f}°  "
               f"pos=({sat_pos[0]:6.1f}, {sat_pos[1]:5.1f}, {sat_pos[2]:.0f}) m  "
               f"{'[visible]' if visible else '[below horizon threshold]'}")
 
@@ -626,9 +497,6 @@ def run_ray_tracing() -> list:
         print(f"    svc:    paths={stats['num_paths']}  "
               f"gain={stats['mean_path_gain_db']:.1f} dB  "
               f"ds={stats['delay_spread_ns']:.1f} ns")
-        print(f"    feeder: paths={stats['feeder_num_paths']}  "
-              f"gain={stats['feeder_mean_path_gain_db']:.1f} dB  "
-              f"delay={stats['feeder_propagation_delay_ms']:.2f} ms")
 
     # ── Composite radio map: add all visible sats back simultaneously ─────────
     visible_sats = [

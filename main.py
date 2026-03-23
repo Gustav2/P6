@@ -89,6 +89,9 @@ from topology_diagram import (
     draw_handover_impact,
     draw_protocol_radar,
     draw_combined_results,
+    draw_timeseries,
+    draw_fairness,
+    draw_profile_breakdown,
 )
 
 
@@ -244,19 +247,31 @@ def main() -> None:
     draw_combined_results(direct_results, out="output/ntn_results.png")
     print("  [8/8]  output/ntn_results.png")
 
+    draw_timeseries(direct_results, out="output/ntn_timeseries.png")
+    print("  [9/11] output/ntn_timeseries.png")
+
+    draw_fairness(direct_results, out="output/ntn_fairness.png")
+    print("  [10/11] output/ntn_fairness.png")
+
+    draw_profile_breakdown(direct_results, out="output/ntn_profile_breakdown.png")
+    print("  [11/11] output/ntn_profile_breakdown.png")
+
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("  Simulation complete.")
     print()
     print("  Output files (output/ subdirectory):")
-    print("    output/ntn_protocol_comparison.png    — protocol comparison bar chart")
+    print("    output/ntn_protocol_comparison.png    — 4-panel protocol comparison")
     print("    output/ntn_summary.png                — BER/BLER + NS-3 combined figure")
     print("    output/ntn_link_budget_waterfall.png  — per-satellite link budget waterfall")
     print("    output/ntn_snr_vs_elevation.png       — SNR vs elevation + PER sigmoid")
-    print("    output/ntn_latency_breakdown.png      — per-hop stacked latency bars")
+    print("    output/ntn_latency_breakdown.png      — per-hop stacked latency bars (NTN/ISL/backhaul)")
     print("    output/ntn_handover_impact.png        — per-slot throughput bars")
     print("    output/ntn_protocol_radar.png         — 5-axis radar chart")
     print("    output/ntn_results.png                — 3-panel combined summary")
+    print("    output/ntn_timeseries.png             — per-second throughput with HO gap markers")
+    print("    output/ntn_fairness.png               — Jain's fairness index per protocol")
+    print("    output/ntn_profile_breakdown.png      — throughput/loss by traffic profile")
     print("    output/ntn_rt_paths_sat<N>.png        — RT paths per satellite")
     print("    output/ntn_rt_radiomap.png            — composite radio map")
     print("=" * 70)
@@ -264,12 +279,14 @@ def main() -> None:
     # ── Protocol results table ────────────────────────────────────────────────
     print()
     print(f"  {'Protocol':<16}  {'Latency (ms)':>12}  {'Tput (kbps)':>12}"
-          f"  {'Loss (%)':>9}  {'Handovers':>10}")
-    print("  " + "─" * 64)
+          f"  {'Loss (%)':>9}  {'Jitter (ms)':>12}  {'Fairness':>9}  {'Handovers':>10}")
+    print("  " + "─" * 85)
     for r in direct_results:
         print(f"  {r['label']:<16}  {r['mean_delay_ms']:>12.1f}"
               f"  {r['throughput_kbps']:>12.0f}"
               f"  {r['loss_pct']:>9.2f}"
+              f"  {r.get('jitter_ms', 0.0):>12.2f}"
+              f"  {r.get('fairness_index', 0.0):>9.4f}"
               f"  {r.get('handovers', 0):>10}")
 
 

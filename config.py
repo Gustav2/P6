@@ -289,7 +289,7 @@ Proxy satellite transmitter power [dBm] used in Sionna RT scenes.
 - This value is used only for the RT proxy TX in rt_sim.py; it does not
   affect the analytical link budget in ntn_ns3.py (which uses
   PHONE_EIRP_DBM / GNB_EIRP_DBM for the uplink service link and
-  SAT_TX_EIRP_FEEDER_DBM for the feeder link).
+  RT_TX_POWER_DBM for the service link).
 - The absolute RT path gains are not used directly for PER calculation;
   only the *relative* gain differences between satellites are meaningful.
 Source: [3GPP-38.821] §6.1, Table 6.1.1-1 (LEO sat downlink EIRP range).
@@ -301,15 +301,7 @@ RT_CAM_POSITION = [-170, -170, 140]
 RT_CAM_LOOK_AT = [50, 50, 0]
 """Look-at target [x, y, z] in metres for scene renders."""
 
-RT_GS_POSITION = [400.0, 80.0, 10.0]
-"""
-Ground Station (GS) position [x, y, z] in metres within the Munich scene.
-- z = 10 m represents a rooftop dish installation.
-- x=400, y=80 places the GS in an open area near the scene edge (east side),
-  well separated from the UE at [50, 80, 1.5] so that the sat→GS geometry
-  (elevation angle, shadowing) differs meaningfully from the sat→UE service link.
-- Scene bounding box: x ∈ [−806, 670] m, y ∈ [−689, 517] m.
-"""
+
 
 # =============================================================================
 # NS-3 network simulation parameters
@@ -383,7 +375,7 @@ TCP_SNDRCV_BUF_BYTES = 512_000
 """
 TCP send and receive socket buffer size [bytes].
 - Must be at least BDP = RTT × bandwidth to avoid throughput starvation.
-- At 550 km LEO (RTT ≈ 34 ms round-trip through sat+feeder+fibre ≈ 54 ms)
+- At 550 km LEO (RTT ≈ 34 ms round-trip through sat+ISL+backhaul ≈ 54 ms)
   and 10 Mbps: BDP ≈ 68 kB.  512 kB gives ~7× headroom.
 - Both snd and rcv buffers are set to this value.
 """
@@ -466,14 +458,14 @@ Sources:
 
 TERRESTRIAL_BACKHAUL_DELAY_MS = 10.0
 """
-One-way latency of the Ground Station ↔ Internet Server terrestrial fibre
-link [ms].
+One-way latency of the Benchmark Satellite → Internet Server link [ms].
 
-- 10 ms is representative of a metro-area fibre path from a satellite ground
-  station to a regional data centre / Internet exchange point.
+- 10 ms is representative of the internet backbone latency from wherever
+  the satellite constellation terminates into the public internet to a
+  regional data centre / Internet Exchange Point (IXP).
 - Derivation: typical backbone fibre propagation velocity ≈ 0.67 c
-  (200 000 km/s); a 2 000 km GS-to-IXP fibre route gives
-  10 ms one-way delay.
+  (200 000 km/s); a 2 000 km satellite PoP-to-IXP route gives
+  ~10 ms one-way delay.
 - Sources:
     Singla et al., "Middleboxes as a Cloud Service" (HotNets 2014): measured
       fibre latency ≈ 5 µs/km for terrestrial routes.
@@ -524,63 +516,22 @@ Source: [3GPP-38.821] §6.1, Table 6.1.1-1 (satellite Rx antenna gain
 """
 
 # =============================================================================
-# Feeder link parameters (Satellite → Ground Station, Ka-band)
+# Satellite → Internet Server link parameters
 # =============================================================================
 
-FEEDER_FREQ_HZ = 26.5e9
+SAT_SERVER_DATARATE = "1Gbps"
 """
-Feeder link downlink frequency [Hz].
-- 26.5 GHz (Ka-band) is used by modern LEO NTN feeder links.  Starlink
-  uses 26.5–27.0 GHz (Ku/Ka transition) for the gateway downlink.
-- Higher than the service link (3.5 GHz), so FSPL is ~17.5 dB greater
-  for the same slant range.  Compensated by the larger GS dish gain.
-- Sionna RT proxy paths are traced at RT_SCENE_FREQ_HZ (3.5 GHz); only
-  the relative multipath correction is taken from RT.  The absolute FSPL
-  is applied analytically using this frequency.
-Source: [Starlink-FCC] Attachment B, §2 (Ka-band gateway 26.5–27.0 GHz).
-        [3GPP-38.821] §6.1 (feeder link: Ka-band, 20/30 GHz bands).
-"""
+Data rate of the benchmark satellite → Internet Server direct link [NS-3 string].
 
-FEEDER_BANDWIDTH_HZ = 250e6
-"""
-Feeder link channel bandwidth [Hz].
-- 250 MHz is the per-gateway Ka-band allocation used by Starlink (FCC
-  approval 2020).  The ITU-R Ka-band feeder allocation for FSS gateways
-  is up to 500 MHz per beam under S.524-9.
-- Used in the Shannon capacity formula C = B · log₂(1 + SNR) to derive
-  the RT-calibrated data rate that replaces the hardcoded "100Mbps" string.
-Source: [Starlink-FCC] Attachment B, §2 (gateway bandwidth 250 MHz/beam).
-        [ITU-R-S.524] §2 (Ka-band earth-station e.i.r.p. and bandwidth).
-"""
+The benchmark satellite connects directly to the internet server — there
+is no ground station node in the simulated topology.  This link represents
+the satellite's direct IP peering into the public internet backbone via
+ISL-connected gateway nodes or a cloud PoP (Point of Presence).
 
-GS_RX_ANTENNA_GAIN_DB = 42.7
-"""
-Ground Station receive antenna gain [dBi].
-- A 2.4 m parabolic dish at 26.5 GHz with 60 % aperture efficiency:
-    G = η · (π · D · f / c)²  [linear]
-    G_dB = 10·log10(0.60 · (π · 2.4 · 26.5e9 / 3e8)²) = 42.7 dBi
-- This matches a Starlink/OneWeb-class gateway dish (typical: 2.4–3.8 m).
-- Included in the feeder-link SNR budget:
-    SNR_feeder = SAT_TX_EIRP_FEEDER − FSPL_Ka + urban_correction
-                 + GS_RX_ANTENNA_GAIN_DB − NOISE_FLOOR_DBM
-Source: [ITU-R-S.465] §2 (reference GS dish performance at Ka-band).
-        [Starlink-FCC] Attachment B (gateway antenna diameter 2.4 m,
-          gain ≥ 42 dBi at 26.5 GHz).
-"""
-
-SAT_TX_EIRP_FEEDER_DBM = 57.0
-"""
-Satellite feeder downlink EIRP [dBm] toward the Ground Station.
-- Represents the Ka-band spot-beam transmit power from a modern LEO
-  satellite toward a fixed gateway.
-- Derivation: 10 W RF output power = 40 dBm + 17 dBi Ka-band spot-beam
-  transmit antenna = 57 dBm EIRP.  This is consistent with published
-  Starlink satellite EIRP in FCC filings (55–60 dBm for gateway beams).
-- The 3GPP NTN feeder-link reference uses a satellite TX power of
-  10–30 W combined with spot-beam antennas of 12–20 dBi, giving
-  ~52–62 dBm EIRP.
-Source: [3GPP-38.821] §6.1, Table 6.1.2-1 (feeder-link satellite EIRP).
-        [Starlink-FCC] Attachment B (satellite gateway EIRP ≥ 55 dBm).
+- 1 Gbps is achievable via high-throughput satellite transponders or
+  optical inter-satellite links terminating at internet exchange points.
+- This link should never be the bottleneck; the service link (10 Mbps)
+  and ISL are the limiting hops.
 """
 
 # =============================================================================
@@ -589,8 +540,7 @@ Source: [3GPP-38.821] §6.1, Table 6.1.2-1 (feeder-link satellite EIRP).
 
 NOISE_FLOOR_DBM = -121.0
 """
-Receiver thermal noise floor [dBm] for both service-link and feeder-link
-budgets.
+Receiver thermal noise floor [dBm] for the service-link budget.
 
 Derivation (Johnson–Nyquist thermal noise, per NR subcarrier):
   N₀ = k · T · B
@@ -810,4 +760,173 @@ Packet error rate on the access → benchmark satellite ISL.
   low elevation, and inter-satellite link geometry changes.
 - Even at 10⁻⁴ PER, the ISL contributes negligibly to end-to-end loss
   compared with the ground service link (PER typically 0.01–0.3).
+"""
+
+# =============================================================================
+# Beam management / handover interruption parameters
+# =============================================================================
+# Models the 3-phase NTN conditional handover procedure per
+# 3GPP TS 38.300 §10.1.2.3 and 3GPP TR 38.821 §6.2.
+
+BEAM_FAILURE_DETECTION_MS = 50.0
+"""
+Time for the UE to detect beam failure after the serving satellite drops
+below SAT_HANDOVER_ELEVATION_DEG [ms].
+
+- During this window the link is in a degraded / unreliable state.
+  Modelled as a link blackout starting at the handover trigger time.
+- 50 ms corresponds to a BFD (Beam Failure Detection) timer of
+  T_BFD = 50 ms, the minimum value allowed by 3GPP TS 38.321 §5.17.
+Source: 3GPP TS 38.321 v17.x §5.17 (BFD timer range 10–200 ms).
+        3GPP TS 38.300 §10.1.2.3 (conditional handover procedure).
+"""
+
+RANDOM_ACCESS_DELAY_MS = 10.0
+"""
+Duration of the Random Access Channel (RACH) procedure on the new
+satellite beam [ms].
+
+- After beam failure detection the UE initiates PRACH on the target beam.
+  The RACH round trip (preamble TX + RAR reception + Msg3/Msg4) takes
+  one RACH occasion + round-trip propagation.
+- At 550 km LEO: RACH occasion every 1–5 ms + ~3.7 ms propagation ≈ 10 ms.
+Source: 3GPP TS 38.321 §5.1.2 (RACH procedure timing).
+        3GPP TR 38.821 §6.2 (NTN RACH design).
+"""
+
+CONDITIONAL_HO_PREP_MS = 20.0
+"""
+Conditional Handover (CHO) preparation and execution offset [ms].
+
+- CHO preparation runs in parallel with the serving link; at execution
+  the UE applies the prepared configuration to the target cell.
+  This 20 ms models the RRC reconfiguration and path switch signalling
+  that completes after RACH.
+Source: 3GPP TS 38.300 §10.1.2.3 (CHO execution delay).
+        3GPP TR 38.821 §6.2.2 (NTN-specific CHO timing).
+"""
+
+HANDOVER_INTERRUPTION_MS_MIN = 50.0
+"""
+Minimum total link-layer interruption time per handover event [ms].
+
+The total blackout duration = BEAM_FAILURE_DETECTION_MS
+                             + RANDOM_ACCESS_DELAY_MS
+                             + CONDITIONAL_HO_PREP_MS
+                           ≈ 80 ms at minimum.
+50 ms is used as the floor to account for favourable conditions
+(pre-positioned target beam, short RACH slot).
+Source: 3GPP TR 38.821 §6.2.2 (NTN handover interruption time
+        target ≤ 0 ms for seamless HO; realistic range 50–300 ms
+        for conventional NTN CHO without predictive scheduling).
+"""
+
+HANDOVER_INTERRUPTION_MS_MAX = 200.0
+"""
+Maximum total link-layer interruption time per handover event [ms].
+
+200 ms covers worst-case BFD timer expiry + congested RACH + slow
+RRC path switch under high orbital Doppler and multipath uncertainty.
+Source: 3GPP TR 38.821 §6.2.2; 3GPP TS 38.321 §5.17 (BFD max 200 ms).
+"""
+
+# =============================================================================
+# Traffic profiles and client assignment
+# =============================================================================
+
+TRAFFIC_PROFILES = {
+    "video": {
+        "app_type":   "udp_cbr",
+        "data_rate":  "2Mbps",
+        "packet_size": 1316,
+        "duty":        1.0,
+    },
+    "gaming": {
+        "app_type":   "udp_cbr",
+        "data_rate":  "100kbps",
+        "packet_size": 200,
+        "duty":        1.0,
+    },
+    "iot": {
+        "app_type":   "udp_cbr",
+        "data_rate":  "10kbps",
+        "packet_size": 64,
+        "duty":        0.1,
+    },
+    "bulk": {
+        "app_type":   "tcp_bulk",
+        "data_rate":  None,
+        "packet_size": 1400,
+        "duty":        1.0,
+    },
+}
+"""
+Traffic profile definitions for heterogeneous client simulation.
+
+Each profile is a dict with:
+  app_type   : "udp_cbr"  → OnOffHelper over UDP (constant-bit-rate when on)
+               "tcp_bulk" → BulkSendHelper over TCP (saturating sender)
+  data_rate  : NS-3 data-rate string for CBR profiles; None for bulk TCP.
+  packet_size: Application payload bytes per packet.
+  duty       : Fraction of time the application is active (OnTime / period).
+               1.0 = always on.  0.1 = 10% on-time (IoT burst pattern).
+
+Profile characteristics:
+  video  — 2 Mbps UDP CBR, 1316-byte RTP-sized packets (always on).
+           Models real-time video streaming (e.g. 1080p H.264 at 2 Mbps).
+  gaming — 100 kbps UDP CBR, 200-byte packets (always on).
+           Models interactive gaming traffic: small, frequent datagrams.
+  iot    — 10 kbps UDP CBR, 64-byte packets, 10% duty cycle.
+           Models IoT sensor reporting with long sleep intervals.
+  bulk   — TCP BulkSend, 1400-byte segments, capped at DATA_VOLUME_MB.
+           Models file transfer / software update (saturating sender).
+
+Source for traffic characterisation:
+  ETSI TR 103 559 v1.1.1 (2021) §5 (NTN traffic models for validation).
+  3GPP TR 38.913 §7.1 (IMT-2020 usage scenarios: eMBB, URLLC, mMTC).
+"""
+
+CLIENT_PROFILES = (
+    ["video"]  * 12 +
+    ["gaming"] * 13 +
+    ["iot"]    * 12 +
+    ["bulk"]   * 13
+)
+"""
+Traffic profile assignment for each of the
+(NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS) = 50 clients.
+
+Distribution (equal split):
+  12 × video   (indices  0–11)
+  13 × gaming  (indices 12–24)
+  12 × iot     (indices 25–36)
+  13 × bulk    (indices 37–49)
+
+The first NUM_STATIONARY_CLIENTS entries are assigned to stationary clients;
+the remaining NUM_MOVING_CLIENTS entries are assigned to moving clients.
+Profiles are intentionally mixed between stationary and moving clients so
+that mobility effects are visible across all traffic types.
+
+To change the distribution, edit this list directly.  len(CLIENT_PROFILES)
+must equal NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS.
+"""
+
+# =============================================================================
+# Time-series collection
+# =============================================================================
+
+TIMESERIES_BUCKET_S = 1.0
+"""
+Probe interval [s] for per-second throughput time-series collection.
+
+A recurring NS-3 Simulator callback fires every TIMESERIES_BUCKET_S seconds
+and reads the cumulative received bytes from the PacketSink application on
+the server node.  The per-second throughput is computed as the byte-count
+delta between consecutive probes.
+
+- 1.0 s gives 60 data points for a 60 s simulation — fine enough to
+  resolve handover dips (~50–200 ms blackout) while keeping probe overhead
+  negligible.
+- Reducing to 0.1 s would show finer handover transients but introduces
+  ~600 extra Simulator events per run.
 """

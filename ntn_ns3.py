@@ -14,6 +14,16 @@ Simulates the end-to-end NTN network including:
     topologies (direct / indirect) and returns all results for plotting.
   * QUIC emulation — QUIC is emulated on top of NS-3 UDP with RFC 9000
     corrections applied analytically after FlowMonitor collection.
+  * Full beam management handover — a 3-phase link interruption gap
+    models beam failure detection → RACH → conditional handover
+    per 3GPP TS 38.300 §10.1.2.3.
+  * Mixed traffic profiles — each client is assigned a traffic profile
+    (video / gaming / iot / bulk) so that heterogeneous load is
+    accurately modelled across all protocol comparison runs.
+  * Per-second time-series — a PacketSink probe fires every
+    TIMESERIES_BUCKET_S seconds to record true per-second throughput.
+  * Jain's fairness index — computed across per-flow throughput values
+    after FlowMonitor collection.
 
 Topologies
 ----------
@@ -23,10 +33,10 @@ Topologies
        │  5G-NR NTN service link  (550 km LEO, RT-calibrated PER, PHONE_EIRP)
        ▼
     Satellite [moving]     ← handover when elevation < SAT_HANDOVER_ELEVATION_DEG
-       │  Ka-band feeder link  (100 Mbps, ~2 ms)
+       │  ISL  (1 Gbps, 5 ms)
        ▼
-    Ground Station
-       │  Terrestrial fibre  (1 Gbps, 10 ms)
+    Benchmark Satellite
+       │  Direct IP link  (1 Gbps, 10 ms)
        ▼
     Internet Server
 
@@ -38,12 +48,31 @@ Topologies
        │  5G-NR NTN service link  (550 km LEO, RT-calibrated PER, GNB_EIRP)
        ▼
     Satellite [moving]
-       │  Ka-band feeder link  (100 Mbps, ~2 ms)
+       │  ISL  (1 Gbps, 5 ms)
        ▼
-    Ground Station
-       │  Terrestrial fibre  (1 Gbps, 10 ms)
+    Benchmark Satellite
+       │  Direct IP link  (1 Gbps, 10 ms)
        ▼
     Internet Server
+
+Beam management handover (3GPP TS 38.300 §10.1.2.3)
+----------------------------------------------------
+Each handover consists of three sequential phases:
+
+  Phase 1 — Beam Failure Detection (BEAM_FAILURE_DETECTION_MS):
+    The UE detects that the serving beam has dropped below the handover
+    threshold.  During this window the link is unreliable (PER → 1.0).
+
+  Phase 2 — Random Access (RANDOM_ACCESS_DELAY_MS):
+    The UE performs PRACH on the target satellite beam.
+
+  Phase 3 — Conditional Handover Preparation (CONDITIONAL_HO_PREP_MS):
+    RRC reconfiguration and path switch complete.  The link recovers
+    with the new satellite's PER.
+
+Total interruption gap is drawn uniformly from
+[HANDOVER_INTERRUPTION_MS_MIN, HANDOVER_INTERRUPTION_MS_MAX].
+The gap applies to the NTN hop in both direct and indirect topologies.
 
 QUIC emulation (RFC 9000 / RFC 9002)
 -------------------------------------
@@ -69,7 +98,9 @@ mechanism post-FlowMonitor corrections derived from first principles:
   4. Post-handover recovery:    QUIC PATH_CHALLENGE/RESPONSE costs 1 RTT and
                                  preserves ssthresh; TCP breaks the connection
                                  entirely.  The post-handover throughput dip
-                                 is reduced by 50 % vs TCP BBR.
+                                 is reduced vs TCP BBR.  Beam interruption gap
+                                 is shared by both protocols; only recovery
+                                 RTTs differ.
 
   5. HoL blocking:              NOT applied — zero benefit for single bulk
                                  stream (only matters for multi-stream HTTP/3).
@@ -78,13 +109,6 @@ The QUIC baseline is TCP BBR (BBR is the congestion controller used by
 real QUIC implementations such as Chromium/quiche and lsquic for satellite
 links).  Corrections are additive on top of the BBR aggregate result.
 
-Satellite mobility
-------------------
-Each satellite node is given a ConstantVelocity mobility model.
-NS-3 does not enforce signal interruption based on position, so the
-handover is modelled by scheduling link-rate change callbacks at handover
-times using a single deque-popping function (cppyy limitation workaround).
-
 Dependencies
 ------------
   NS-3 with Python bindings (cppyy-based, 3.37+).
@@ -92,6 +116,7 @@ Dependencies
 """
 
 import math
+import random as _random_mod
 import numpy as np
 from ns import ns   # NS-3 cppyy-based Python bindings
 
@@ -127,10 +152,6 @@ from config import (
     GNB_DATARATE,
     GNB_TERRESTRIAL_PER,
     SAT_RX_ANTENNA_GAIN_DB,
-    FEEDER_FREQ_HZ,
-    FEEDER_BANDWIDTH_HZ,
-    GS_RX_ANTENNA_GAIN_DB,
-    SAT_TX_EIRP_FEEDER_DBM,
     NOISE_FLOOR_DBM,
     SNR_THRESH_DB,
     SIGMOID_SLOPE,
@@ -147,6 +168,15 @@ from config import (
     ISL_DATARATE,
     ISL_DELAY_MS,
     ISL_PER,
+    SAT_SERVER_DATARATE,
+    # Beam management
+    HANDOVER_INTERRUPTION_MS_MIN,
+    HANDOVER_INTERRUPTION_MS_MAX,
+    # Traffic profiles
+    TRAFFIC_PROFILES,
+    CLIENT_PROFILES,
+    # Time-series
+    TIMESERIES_BUCKET_S,
 )
 
 
@@ -258,115 +288,28 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
     return float(np.clip(per, 0.0, 0.99))
 
 
-def _feeder_snr_db(cs: dict, ref_feeder_gain_db: float) -> float:
-    """
-    Compute the feeder-link SNR [dB] for a satellite entry.
-
-    Uses Ka-band FSPL (FEEDER_FREQ_HZ) over the real 550 km slant range
-    plus the RT-derived urban correction (relative path-gain difference
-    between this satellite and the reference/best satellite).
-
-    Parameters
-    ----------
-    cs                : dict   Channel stats entry with feeder_* keys.
-    ref_feeder_gain_db: float  RT feeder gain of the best satellite [dB].
-                               Pass the maximum feeder_mean_path_gain_db
-                               across all valid satellites.
-
-    Returns
-    -------
-    float  SNR in dB.
-    """
-    elev  = max(cs["feeder_elevation_deg"], 1.0)
-    fspl  = _fspl_db(SAT_HEIGHT_M, elev, fc_hz=FEEDER_FREQ_HZ)
-    gain  = cs["feeder_mean_path_gain_db"]
-
-    if gain <= -150.0:
-        urban = -10.0           # No RT paths → deep shadow penalty
-    elif ref_feeder_gain_db > -150.0:
-        urban = gain - ref_feeder_gain_db
-    else:
-        urban = 0.0
-
-    return (SAT_TX_EIRP_FEEDER_DBM - fspl + urban
-            + GS_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM)
-
-
-def _feeder_calibrated_per(cs: dict, ref_feeder_gain_db: float,
-                            snr_thresh_db: float = None,
-                            sigmoid_slope: float = None) -> float:
-    """
-    Sigmoid PER model for the Satellite→GS feeder link.
-
-    Mirrors _rt_calibrated_per but uses Ka-band FSPL (FEEDER_FREQ_HZ),
-    the satellite feeder EIRP (SAT_TX_EIRP_FEEDER_DBM), and the GS dish
-    gain (GS_RX_ANTENNA_GAIN_DB) instead of service-link parameters.
-
-    Parameters
-    ----------
-    cs                : dict   Channel stats entry with feeder_* keys.
-    ref_feeder_gain_db: float  RT feeder gain of the reference satellite [dB].
-    snr_thresh_db     : float  Sigmoid threshold [dB].  Defaults to
-                               SNR_THRESH_DB from config when None.
-    sigmoid_slope     : float  Sigmoid slope [1/dB].  Defaults to
-                               SIGMOID_SLOPE from config when None.
-
-    Returns
-    -------
-    float  Packet error rate in [0, 1).
-    """
-    if snr_thresh_db is None:
-        snr_thresh_db = SNR_THRESH_DB
-    if sigmoid_slope is None:
-        sigmoid_slope = SIGMOID_SLOPE
-    snr_db = _feeder_snr_db(cs, ref_feeder_gain_db)
-    per    = 1.0 / (1.0 + math.exp(sigmoid_slope * (snr_db - snr_thresh_db)))
-    return float(np.clip(per, 0.0, 0.99))
-
-
-def _feeder_shannon_rate_mbps(cs: dict, ref_feeder_gain_db: float) -> float:
-    """
-    Shannon capacity [Mbps] of the feeder link.
-
-    C = FEEDER_BANDWIDTH_HZ × log2(1 + SNR_linear)
-
-    The result is clamped to a minimum of 1 Mbps so that NS-3 never
-    receives a zero or negative data-rate string.
-
-    Parameters
-    ----------
-    cs                : dict   Channel stats entry with feeder_* keys.
-    ref_feeder_gain_db: float  RT feeder gain of the reference satellite [dB].
-
-    Returns
-    -------
-    float  Capacity in Mbps (≥ 1.0).
-    """
-    snr_db  = _feeder_snr_db(cs, ref_feeder_gain_db)
-    snr_lin = 10.0 ** (snr_db / 10.0)
-    rate    = FEEDER_BANDWIDTH_HZ * math.log2(1.0 + snr_lin) / 1e6
-    return max(rate, 1.0)
-
-
 # =============================================================================
 # Handover schedule computation
 # =============================================================================
 
 def _compute_handover_schedule(channel_stats: list,
                                 tx_eirp_dbm: float = None,
-                                ref_feeder_gain_db: float = None,
                                 snr_thresh_db: float = None,
-                                sigmoid_slope: float = None) -> list:
+                                sigmoid_slope: float = None,
+                                rng_seed: int = 42) -> list:
     """
     Determine the sequence of (satellite_id, start_time, end_time,
-    per, delay_ms) intervals for the simulation duration.
+    per, delay_ms, interruption_ms) intervals for the simulation duration.
 
     The algorithm:
     1. Sort satellites by decreasing elevation (highest = first to serve).
-    2. Assign time slices weighted by 1/cos(elevation_rad): satellites near
-       the horizon are visible for longer in a real orbital pass, so they
-       receive proportionally more simulation time.
+    2. Assign time slices weighted by slant_range / (v_orb × sin(elev)):
+       satellites near the horizon are visible for longer in a real orbital
+       pass, so they receive proportionally more simulation time.
     3. Satellites below SAT_HANDOVER_ELEVATION_DEG are skipped (link drop).
+    4. Each handover transition is assigned a beam interruption gap drawn
+       uniformly from [HANDOVER_INTERRUPTION_MS_MIN, HANDOVER_INTERRUPTION_MS_MAX]
+       per 3GPP TS 38.300 §10.1.2.3.
 
     Parameters
     ----------
@@ -376,15 +319,14 @@ def _compute_handover_schedule(channel_stats: list,
     tx_eirp_dbm : float, optional
         Transmitter EIRP passed through to _rt_calibrated_per().
         Defaults to PHONE_EIRP_DBM when None.
-    ref_feeder_gain_db : float, optional
-        Reference (best-satellite) feeder path gain [dB] used for the
-        feeder-link SNR correction.  Computed from channel_stats when None.
     snr_thresh_db : float, optional
         Sigmoid threshold [dB].  Defaults to SNR_THRESH_DB when None.
         Pass the value fitted to the Sionna LDPC BER curve.
     sigmoid_slope : float, optional
         Sigmoid slope [1/dB].  Defaults to SIGMOID_SLOPE when None.
         Pass the value fitted to the Sionna LDPC BER curve.
+    rng_seed : int
+        Seed for the interruption-gap RNG (reproducibility).
 
     Returns
     -------
@@ -395,9 +337,11 @@ def _compute_handover_schedule(channel_stats: list,
         elev_deg         float   Elevation angle [degrees].
         per              float   Service-link PER (RT-calibrated).
         delay_ms         float   Service-link one-way propagation delay [ms].
-        feeder_per       float   Feeder-link PER (Ka-band RT-calibrated).
-        feeder_rate_str  str     Feeder-link Shannon capacity as NS-3 string.
+        interruption_ms  float   Beam gap before this slot starts [ms].
+                                 Zero for the first slot (no incoming HO).
     """
+    rng = _random_mod.Random(rng_seed)
+
     # Sort by elevation, descending (highest elevation served first)
     sorted_stats = sorted(channel_stats, key=lambda s: s["elevation_deg"],
                           reverse=True)
@@ -421,16 +365,6 @@ def _compute_handover_schedule(channel_stats: list,
     # proportional to:
     #   weight ∝ 1 / |d(elev)/dt| ∝ slant_range / (v_orb × sin(elevation))
     #
-    # This correctly gives more simulation time to low-elevation slots (near
-    # the horizon, longer slant range, slower angular motion) and less time
-    # to high-elevation slots (short slant range, rapid angular motion).
-    #
-    # Derivation cross-check (550 km, 60 s sim, sats at 70°/55°/40°):
-    #   70° → ~14 s, 55° → ~18 s, 40° → ~28 s  (sum = 60 s)
-    # The previous 1/cos(e) formula gave the opposite ranking (70° → 29 s)
-    # because cos(e) is *largest* at low elevation, making 1/cos(e) *smallest*
-    # there — physically backwards.
-    #
     # Reference: orbital mechanics (Wertz, "Space Mission Engineering", §9.1;
     #            3GPP TR 38.821 §6.1 orbit geometry).
     elev_rads   = [math.radians(max(s["elevation_deg"], 1.0)) for s in visible]
@@ -439,7 +373,7 @@ def _compute_handover_schedule(channel_stats: list,
         / (SAT_ORBITAL_VELOCITY_MS * math.sin(e))
         for s, e in zip(visible, elev_rads)
     ]
-    total_w     = sum(raw_weights)
+    total_w        = sum(raw_weights)
     slot_durations = [w / total_w * SIM_DURATION_S for w in raw_weights]
 
     schedule = []
@@ -447,14 +381,6 @@ def _compute_handover_schedule(channel_stats: list,
     # Reference gain: the best (highest-elevation) satellite's RT gain.
     # All other satellites are penalised relative to this value.
     ref_gain_db = visible[0]["mean_path_gain_db"] if visible else None
-
-    # Reference feeder gain: best satellite's feeder path gain for Ka-band SNR.
-    if ref_feeder_gain_db is None:
-        ref_feeder_gain_db = max(
-            (s["feeder_mean_path_gain_db"] for s in channel_stats
-             if s.get("feeder_mean_path_gain_db", -200.0) > -150.0),
-            default=-150.0,
-        )
 
     t_cursor = 0.0
     for i, stat in enumerate(visible):
@@ -470,19 +396,22 @@ def _compute_handover_schedule(channel_stats: list,
                                     snr_thresh_db, sigmoid_slope)
         delay  = _one_way_delay_ms(SAT_HEIGHT_M, max(elev_deg, 1.0))
 
-        fdr_per      = _feeder_calibrated_per(stat, ref_feeder_gain_db,
-                                              snr_thresh_db, sigmoid_slope)
-        fdr_rate_mbps = _feeder_shannon_rate_mbps(stat, ref_feeder_gain_db)
+        # Beam interruption gap: zero for the first slot (no incoming HO),
+        # random draw for subsequent slots per 3GPP TS 38.300 §10.1.2.3.
+        if i == 0:
+            gap_ms = 0.0
+        else:
+            gap_ms = rng.uniform(HANDOVER_INTERRUPTION_MS_MIN,
+                                 HANDOVER_INTERRUPTION_MS_MAX)
 
         schedule.append(dict(
-            sat_id          = stat["sat_id"],
-            t_start         = round(t_start, 3),
-            t_end           = round(t_end, 3),
-            elev_deg        = elev_deg,
-            per             = round(per, 4),
-            delay_ms        = round(delay, 2),
-            feeder_per      = round(fdr_per, 4),
-            feeder_rate_str = f"{fdr_rate_mbps:.2f}Mbps",
+            sat_id         = stat["sat_id"],
+            t_start        = round(t_start, 3),
+            t_end          = round(t_end, 3),
+            elev_deg       = elev_deg,
+            per            = round(per, 4),
+            delay_ms       = round(delay, 2),
+            interruption_ms = round(gap_ms, 1),
         ))
 
     return schedule
@@ -564,7 +493,7 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
        QUIC completes the handshake in 1 RTT (vs TCP+TLS 1.3 = 2 RTTs),
        saving one RTT worth of bandwidth that TCP wastes in the slow-start
        phase.
-       Δtput += (mean_RTT_s × link_rate_bps) / active_s   [converted to kbps]
+       Δtput += (mean_RTT_s × link_rate_bps) / effective_active_s   [kbps]
 
     2. PTO vs RTO (no cwnd→1 collapse)
        QUIC's Probe Timeout fires 1–2 probe packets without resetting cwnd
@@ -584,14 +513,14 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
 
     4. Post-handover throughput dip reduction
        QUIC connection migration (PATH_CHALLENGE/PATH_RESPONSE) costs 1 RTT
-       and preserves ssthresh.  TCP breaks the connection and requires a
-       full slow-start, costing ~9 RTTs (TCP_RECOVERY_RTTS = 9) vs QUIC's
-       1 RTT (QUIC_RECOVERY_RTTS = 1).  Source: RFC 9000 §9.3.
-       Δtput = (TCP_RECOVERY_RTTS - QUIC_RECOVERY_RTTS) × mean_RTT_s
-               × link_rate_bps / active_s   [per handover, summed]
+       after the beam gap ends and preserves ssthresh.  TCP requires a full
+       slow-start (~9 RTTs) after the gap.  Both protocols are subject to
+       the same RF blackout gap; only recovery RTTs differ.
+       Source: RFC 9000 §9.3.
 
     5. Loss reduction via PTO vs RTO
-       QUIC does not collapse cwnd on loss, so effective loss ratio is lower.
+       QUIC PTO probes resolve isolated losses without RTO; effective loss
+       fraction decays exponentially with RTT relative to the reference RTT.
         Reduction factor = exp(-0.8 × mean_RTT_s / REF_ONE_WAY_DELAY_S) × PER_ratio
         where REF_ONE_WAY_DELAY_S = 0.035 s (35 ms one-way reference delay,
         half of the 70 ms median LEO RTT reported in Sander et al. IMC 2022 and
@@ -602,21 +531,29 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
        NOT applied — zero benefit for a single bulk stream.  HoL blocking
        elimination only matters for multi-stream / HTTP/3 workloads.
 
+    Beam interruption gap
+    ---------------------
+    The total beam blackout time across all handovers is subtracted from
+    the effective active simulation duration:
+        total_gap_s = sum(slot["interruption_ms"] for all slots) / 1000
+        effective_active_s = active_s - total_gap_s
+    Both QUIC and TCP experience the same RF blackout; QUIC recovers in
+    1 RTT after the gap ends vs TCP's ~9 RTTs.
+
     Parameters
     ----------
     bbr_result    : dict   FlowMonitor result dict from a TCP BBR run.
-    schedule      : list   Handover schedule (list of slot dicts with per, delay_ms).
-    link_rate_bps : float  Actual service-link rate [bps].  When None, derived
-                           from the schedule's feeder_rate_str values (first slot).
-                           Passing the actual service-link rate here avoids
-                           using an incorrect hardcoded value.
+    schedule      : list   Handover schedule (list of slot dicts with per, delay_ms,
+                           interruption_ms).
+    link_rate_bps : float  Actual service-link rate [bps].  When None, uses
+                           10 Mbps (the service link data rate in run_ns3).
 
     Returns
     -------
     dict  QUIC result dict with corrected throughput_kbps, mean_delay_ms,
           loss_pct, and updated label/protocol fields.
     """
-    import copy, re
+    import copy
     result = copy.deepcopy(bbr_result)
     result["protocol"] = "quic"
     result["label"]    = "QUIC"
@@ -632,19 +569,8 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
         print(f"    BBR baseline = 0 kbps (link failed) — QUIC result = 0 kbps")
         return result
 
-    # Derive actual link rate from schedule if not provided.
-    # Use the first slot's feeder_rate_str as a proxy for the service-link
-    # rate (feeder ≥ service link by design, so this is an upper bound; in
-    # practice the bottleneck is the service link at 10 Mbps hardcoded in
-    # run_ns3).  Fall back to 10 Mbps if parsing fails.
     if link_rate_bps is None:
-        try:
-            rate_str  = schedule[0]["feeder_rate_str"] if schedule else "10.00Mbps"
-            match     = re.match(r"([\d.]+)\s*([MKG]?)bps", rate_str, re.I)
-            mult      = {"M": 1e6, "K": 1e3, "G": 1e9, "": 1.0}[match.group(2).upper()]
-            link_rate_bps = float(match.group(1)) * mult
-        except Exception:
-            link_rate_bps = 10e6     # 10 Mbps service link (safe fallback)
+        link_rate_bps = 10e6     # 10 Mbps service link
 
     # RFC 9000 §9.3 post-handover recovery RTT counts
     TCP_RECOVERY_RTTS  = 9    # TCP slow-start + SYN from scratch
@@ -652,29 +578,25 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
 
     # Reference one-way delay for loss-reduction formula (Sander et al.
     # IMC 2022 — median LEO RTT = 70 ms → one-way = 35 ms; also consistent
-    # with IETF draft-kuhn-quic-4-sat Table 1).  Used as the normalisation
-    # denominator in the exp() reduction term; NOT the round-trip time.
+    # with IETF draft-kuhn-quic-4-sat Table 1).
     REF_ONE_WAY_DELAY_S = 0.035   # 35 ms one-way
 
     mss_bytes  = PACKET_SIZE_BYTES
     active_s   = SIM_DURATION_S - 1.0
     mean_rtt_s = max(bbr_result["mean_delay_ms"] / 1e3 * 2.0, 0.001)
-    # NOTE: 2 × one-way delay is only a valid RTT estimate for symmetric paths.
     handovers  = bbr_result.get("handovers", 0)
+
+    # Total beam blackout across all handovers (shared by QUIC and TCP)
+    total_gap_s = sum(s.get("interruption_ms", 0.0) for s in schedule) / 1000.0
+    effective_active_s = max(active_s - total_gap_s, 1.0)
 
     delta_kbps = 0.0
 
     # ── 1. 1-RTT handshake saving ─────────────────────────────────────────────
-    # TCP wastes 2 RTTs before sending; QUIC wastes 1 RTT.
-    # The extra RTT worth of pipe data translates to throughput credit.
-    handshake_saving_kbps = (mean_rtt_s * link_rate_bps) / active_s / 1e3
+    handshake_saving_kbps = (mean_rtt_s * link_rate_bps) / effective_active_s / 1e3
     delta_kbps += handshake_saving_kbps
 
     # ── 2. PTO vs RTO: no cwnd collapse ───────────────────────────────────────
-    # Estimate how many RTO events occurred (one per slot where PER exceeds the
-    # fast-retransmit window threshold; approximated as PER > 0.03).
-    # RTO rate ≈ PER / (mean_RTT_s × window_size_packets)
-    # cwnd floor for PTO = 2 packets per RFC 9002 §6.2.4.
     cwnd_floor_pkts = 2   # RFC 9002 §6.2.4: minimum 2 packets during PTO probing
     rto_credit_kbps = 0.0
     for slot in schedule:
@@ -684,28 +606,23 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
             window_pkts = max(int(link_rate_bps * mean_rtt_s / (mss_bytes * 8)), 4)
             rto_rate    = slot_per / (mean_rtt_s * window_pkts + 1e-9)
             slot_credit = cwnd_floor_pkts * mss_bytes * rto_rate * 8 / 1e3
-            rto_credit_kbps += slot_credit * (slot_duration_s / active_s)
+            rto_credit_kbps += slot_credit * (slot_duration_s / effective_active_s)
     delta_kbps += rto_credit_kbps
 
     # ── 3. Unlimited ACK ranges at high-PER slots ─────────────────────────────
-    # At PER > 0.5, TCP SACK (3 block limit) wastes extra RTTs on ACK retries;
-    # QUIC needs only 1 ACK.  Latency improvement ≈ mean_delay × (2/3) over
-    # the high-PER fraction of the simulation.
-    # Source: IETF draft-kuhn-quic-4-sat Table 1.
     high_per_fraction = sum(
-        (s["t_end"] - s["t_start"]) / active_s
+        (s["t_end"] - s["t_start"]) / effective_active_s
         for s in schedule if s["per"] > 0.5
     )
     latency_reduction_ms = bbr_result["mean_delay_ms"] * (2.0 / 3.0) * high_per_fraction
 
     # ── 4. Post-handover recovery ─────────────────────────────────────────────
-    # QUIC PATH_CHALLENGE/RESPONSE costs 1 RTT vs TCP's ~9 RTT recovery.
-    # Throughput credit per handover = RTT difference × link_rate / active_s.
-    # Source: RFC 9000 §9.3.
+    # Both QUIC and TCP stall for total_gap_s during beam blackout.
+    # After the gap: QUIC needs 1 RTT, TCP needs ~9 RTTs to recover.
     if handovers > 0:
         handover_credit_kbps = (
             (TCP_RECOVERY_RTTS - QUIC_RECOVERY_RTTS)
-            * mean_rtt_s * link_rate_bps / active_s / 1e3
+            * mean_rtt_s * link_rate_bps / effective_active_s / 1e3
             * handovers
         )
         delta_kbps += handover_credit_kbps
@@ -713,11 +630,8 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
         handover_credit_kbps = 0.0
 
     # ── 5. Loss reduction: PTO prevents cwnd collapse ─────────────────────────
-    # QUIC PTO probes resolve isolated losses without RTO; effective loss
-    # fraction decays exponentially with RTT relative to the reference RTT.
-    # Source: IETF draft-kuhn-quic-4-sat Table 1; Sander et al. IMC 2022.
     mean_per = (sum(s["per"] * (s["t_end"] - s["t_start"])
-                    for s in schedule) / active_s
+                    for s in schedule) / effective_active_s
                 if schedule else 0.0)
     loss_reduction_factor = math.exp(-0.8 * mean_rtt_s / REF_ONE_WAY_DELAY_S) * max(mean_per, 1e-6)
     loss_reduction_factor = min(loss_reduction_factor, 0.99)   # cap at 99%
@@ -732,6 +646,8 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
 
     print(f"\n  QUIC corrections (from BBR baseline):")
     print(f"    link_rate        : {link_rate_bps/1e6:.2f} Mbps")
+    print(f"    beam gap (total) : {total_gap_s*1e3:.0f} ms  "
+          f"(effective active = {effective_active_s:.1f} s)")
     print(f"    handshake saving : +{handshake_saving_kbps:.1f} kbps")
     print(f"    PTO vs RTO       : +{rto_credit_kbps:.1f} kbps")
     print(f"    post-H/O credit  : +{handover_credit_kbps:.1f} kbps  "
@@ -759,10 +675,14 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
       - NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS client phones
       - Access satellites (Sat 1 … NUM_SATELLITES-1), each connected via an
         ISL to the benchmark satellite (Sat 0, always highest elevation)
-      - If USE_BASE_STATIONS: Phone → gNB → AccessSat → ISL → BenchmarkSat → GS → Server
-        Otherwise:            Phone → AccessSat → ISL → BenchmarkSat → GS → Server
+      - If USE_BASE_STATIONS: Phone → gNB → AccessSat → ISL → BenchmarkSat → Server
+        Otherwise:            Phone → AccessSat → ISL → BenchmarkSat → Server
       - Moving clients use RandomWaypointMobilityModel
       - TCP BulkSend capped at DATA_VOLUME_MB
+      - Mixed traffic profiles: video/gaming/iot → UDP CBR, bulk → TCP
+      - Full beam management: 3-phase link interruption gap per handover
+      - Per-second throughput time-series via PacketSink probe
+      - Jain's fairness index across per-flow throughputs
 
     The benchmark satellite (Sat 0) is the measurement node: all traffic
     always flows through it regardless of which access satellite is currently
@@ -788,7 +708,8 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     dict with keys:
         scenario, protocol, label, topology, elevation_deg, svc_delay_ms,
         svc_loss_pct, tx_packets, rx_packets, loss_pct,
-        mean_delay_ms, jitter_ms, throughput_kbps, handovers, schedule.
+        mean_delay_ms, jitter_ms, throughput_kbps, handovers, schedule,
+        fairness_index, profile_stats, timeseries.
     """
     import collections
     import math as _math
@@ -810,26 +731,18 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     if ns3_proto == "tcp":
         _configure_tcp(protocol_cfg)
 
-    # ── Feeder-link reference gain ────────────────────────────────────────────
-    ref_feeder_gain = max(
-        (s["feeder_mean_path_gain_db"] for s in channel_stats
-         if s.get("feeder_mean_path_gain_db", -200.0) > -150.0),
-        default=-150.0,
-    )
-
     # ── Handover schedule ─────────────────────────────────────────────────────
     schedule = _compute_handover_schedule(
         channel_stats, tx_eirp_dbm=tx_eirp,
-        ref_feeder_gain_db=ref_feeder_gain,
         snr_thresh_db=snr_thresh_db,
         sigmoid_slope=sigmoid_slope,
     )
     print(f"  Handover schedule (EIRP={tx_eirp:.0f} dBm): {len(schedule)} slot(s)")
     for slot in schedule:
+        gap_str = f"  gap={slot['interruption_ms']:.0f}ms" if slot["interruption_ms"] > 0 else ""
         print(f"    sat{slot['sat_id']}  {slot['t_start']:.1f}s–{slot['t_end']:.1f}s  "
               f"elev={slot['elev_deg']:.1f}°  delay={slot['delay_ms']:.1f} ms  "
-              f"PER={slot['per']:.3f}  fdr_PER={slot['feeder_per']:.3f}  "
-              f"fdr_rate={slot['feeder_rate_str']}")
+              f"PER={slot['per']:.3f}{gap_str}")
 
     # Weighted-mean service-link delay (P2P channel delay is immutable)
     if schedule:
@@ -842,20 +755,13 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
 
     first = schedule[0] if schedule else dict(
         delay_ms=weighted_delay_ms, per=0.01, elev_deg=60.0,
-        feeder_per=0.01, feeder_rate_str="100.00Mbps", sat_id=0,
+        sat_id=0, interruption_ms=0.0,
     )
-    active_sat_id = int(first.get("sat_id", 0))
-    active_cs     = (channel_stats[active_sat_id]
-                     if channel_stats and active_sat_id < len(channel_stats) else {})
-    fdr_delay_ms  = float(active_cs.get("feeder_propagation_delay_ms",
-                                         _one_way_delay_ms(SAT_HEIGHT_M, 60.0)))
-    fdr_rate_str  = first.get("feeder_rate_str", "100.00Mbps")
-    fdr_per       = first.get("feeder_per", 0.01)
     print(f"  Service link delay (weighted-mean): {weighted_delay_ms:.2f} ms")
-    print(f"  Feeder link:  delay={fdr_delay_ms:.2f} ms  rate={fdr_rate_str}  "
-          f"PER={fdr_per:.4f}")
     print(f"  ISL (access→benchmark sat):  rate={ISL_DATARATE}  "
           f"delay={ISL_DELAY_MS} ms  PER={ISL_PER}")
+    print(f"  Sat→Server:  rate={SAT_SERVER_DATARATE}  "
+          f"delay={TERRESTRIAL_BACKHAUL_DELAY_MS:.0f} ms")
 
     # =========================================================================
     # Node creation
@@ -865,13 +771,10 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     #   [num_clients … num_clients+NUM_GNB-1] : gNB nodes (if USE_BASE_STATIONS)
     #   [base_idx]                         : benchmark satellite (Sat 0)
     #   [base_idx+1 … base_idx+n_access]   : access satellites (Sat 1…N)
-    #   [base_idx+n_access+1]              : ground station
-    #   [base_idx+n_access+2]              : internet server
+    #   [base_idx+n_access+1]              : internet server
     #
     # n_access = number of access satellites = len(schedule) - 1 (Sat 0 is
     # the benchmark; we need at least 1 access sat even if only 1 in schedule)
-    # In practice n_access = max(1, len(schedule)-1) but we map schedule
-    # slots round-robin to access sats if needed.
 
     n_access_sats = max(1, len(schedule) - 1)  # access sats (not the benchmark)
     n_gnbs        = NUM_GNB if USE_BASE_STATIONS else 0
@@ -881,28 +784,25 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     gnb_idx     = lambda i: num_clients + i                    # 0..n_gnbs-1
     bench_idx   = num_clients + n_gnbs                         # benchmark sat
     access_idx  = lambda i: bench_idx + 1 + i                  # 0..n_access_sats-1
-    gs_idx      = bench_idx + 1 + n_access_sats
-    server_idx  = gs_idx + 1
+    server_idx  = bench_idx + 1 + n_access_sats
     total_nodes = server_idx + 1
 
     nodes = ns.NodeContainer()
     nodes.Create(total_nodes)
     ns.InternetStackHelper().Install(nodes)
 
-    phones  = [nodes.Get(phone_idx(i)) for i in range(num_clients)]
-    gnbs    = [nodes.Get(gnb_idx(i))   for i in range(n_gnbs)]
-    bench   = nodes.Get(bench_idx)
+    phones   = [nodes.Get(phone_idx(i)) for i in range(num_clients)]
+    gnbs     = [nodes.Get(gnb_idx(i))   for i in range(n_gnbs)]
+    bench    = nodes.Get(bench_idx)
     accesses = [nodes.Get(access_idx(i)) for i in range(n_access_sats)]
-    gs      = nodes.Get(gs_idx)
-    server  = nodes.Get(server_idx)
+    server   = nodes.Get(server_idx)
 
     p2p = ns.PointToPointHelper()
 
     # ── Client positions ──────────────────────────────────────────────────────
     # Phones are placed in a circle of CLIENT_AREA_RADIUS_M.
     # Stationary: ConstantPosition.  Moving: RandomWaypoint.
-    import random as _random
-    _rng = _random.Random(42)
+    _rng = _random_mod.Random(42)
 
     def _random_pos_in_circle(radius, z=1.5):
         """Uniform random (x,y) within a circle of given radius, height z."""
@@ -993,8 +893,8 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
 
     # All phone↔gNB or phone↔access-sat error models stored per-client
     # so handover callback can update each one.
-    em_svc_list   = []   # service-link error model per client
-    devs_svc_list = []   # service-link DeviceContainer per client
+    em_svc_list   = []   # service-link error model per client/gNB
+    devs_svc_list = []   # service-link DeviceContainer per client/gNB
 
     # ── Phone ↔ gNB  (or direct Phone ↔ access-sat-0) ────────────────────────
     if USE_BASE_STATIONS:
@@ -1068,129 +968,224 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
                      ns.Ipv4Mask("255.255.255.0"))
         ipv4.Assign(devs_isl)
 
-    # ── Benchmark satellite → Ground Station (feeder, Ka-band) ───────────────
-    p2p.SetDeviceAttribute("DataRate",  ns.StringValue(fdr_rate_str))
-    p2p.SetChannelAttribute("Delay",    ns.StringValue(f"{fdr_delay_ms:.3f}ms"))
-    devs_fdr = p2p.Install(_nc2(bench, gs))
-    em_fdr = ns.CreateObject[ns.RateErrorModel]()
-    em_fdr.SetAttribute("ErrorRate", ns.DoubleValue(fdr_per))
-    em_fdr.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-    devs_fdr.Get(1).SetAttribute("ReceiveErrorModel", ns.PointerValue(em_fdr))
-    ipv4.SetBase(ns.Ipv4Address(_next_subnet()), ns.Ipv4Mask("255.255.255.0"))
-    ipv4.Assign(devs_fdr)
-
-    # ── Ground Station → Internet Server (terrestrial fibre) ─────────────────
-    p2p.SetDeviceAttribute("DataRate",  ns.StringValue("1Gbps"))
+    # ── Benchmark satellite → Internet Server (direct link) ───────────────────
+    p2p.SetDeviceAttribute("DataRate",  ns.StringValue(SAT_SERVER_DATARATE))
     p2p.SetChannelAttribute("Delay",
         ns.StringValue(f"{TERRESTRIAL_BACKHAUL_DELAY_MS:.0f}ms"))
-    devs_gnd = p2p.Install(_nc2(gs, server))
+    devs_srv = p2p.Install(_nc2(bench, server))
     ipv4.SetBase(ns.Ipv4Address(_next_subnet()), ns.Ipv4Mask("255.255.255.0"))
-    iface_gnd = ipv4.Assign(devs_gnd)
+    iface_srv = ipv4.Assign(devs_srv)
 
     ns.Ipv4GlobalRoutingHelper.PopulateRoutingTables()
 
     # =========================================================================
-    # Handover scheduling
+    # Beam management handover scheduling
     # =========================================================================
-    # On each handover we update the service-link PER for all error models
-    # in em_svc_list (all gNB→sat or phone→sat links share the same slot PER
-    # because all clients are within CLIENT_AREA_RADIUS_M of each other, which
-    # is negligible vs the satellite footprint), and the feeder-link em_fdr.
+    # Each handover has two scheduled events:
+    #   Event A  at slot["t_start"]                    → blackout (PER = 1.0)
+    #   Event B  at slot["t_start"] + gap_ms / 1000   → restore  (PER = slot["per"])
+    #
+    # All service-link error models in em_svc_list are updated together
+    # because all clients are within CLIENT_AREA_RADIUS_M of each other,
+    # which is negligible vs the satellite footprint (~100 km).
 
     handover_queue = collections.deque(schedule[1:])
     handover_count = [0]
+    handover_times = []   # list of (t_blackout_start, t_blackout_end) tuples
 
-    def _handover_tick():
+    def _handover_blackout():
+        """Phase 1: set PER = 1.0 (beam failure / link blackout)."""
+        if not handover_queue:
+            return
+        slot   = handover_queue[0]   # peek — don't pop yet
+        gap_s  = slot["interruption_ms"] / 1000.0
+        t_now  = ns.Simulator.Now().GetSeconds()
+        handover_times.append((t_now, t_now + gap_s))
+        print(f"  [t={t_now:.2f}s] Handover blackout → sat{slot['sat_id']}  "
+              f"gap={slot['interruption_ms']:.0f} ms  "
+              f"elev={slot['elev_deg']:.1f}°")
+        # Set all service-link error models to 1.0 (full drop)
+        for em in em_svc_list:
+            em.SetAttribute("ErrorRate", ns.DoubleValue(1.0))
+        # Schedule the restore event after the gap
+        ev = ns.cppyy.gbl.pythonMakeEvent(_handover_restore)
+        ns.Simulator.Schedule(ns.Seconds(gap_s), ev)
+
+    def _handover_restore():
+        """Phase 2: restore PER = slot['per'] after beam management gap."""
         if not handover_queue:
             return
         slot = handover_queue.popleft()
-        # Update service-link PER for every svc link
         for em in em_svc_list:
             em.SetAttribute("ErrorRate", ns.DoubleValue(slot["per"]))
-        # Update feeder-link PER and DataRate
-        em_fdr.SetAttribute("ErrorRate", ns.DoubleValue(slot["feeder_per"]))
-        devs_fdr.Get(0).SetAttribute("DataRate",
-                                     ns.StringValue(slot["feeder_rate_str"]))
         handover_count[0] += 1
-        print(f"  [t={ns.Simulator.Now().GetSeconds():.1f}s] "
-              f"Handover → sat{slot['sat_id']}  "
-              f"PER={slot['per']:.3f}  elev={slot['elev_deg']:.1f}°  "
-              f"fdr_PER={slot['feeder_per']:.3f}  fdr_rate={slot['feeder_rate_str']}")
+        print(f"  [t={ns.Simulator.Now().GetSeconds():.2f}s] "
+              f"Handover restored → sat{slot['sat_id']}  "
+              f"PER={slot['per']:.3f}")
+        # Schedule the next handover blackout if one exists
         if handover_queue:
             nxt = handover_queue[0]
             if nxt["t_start"] < SIM_DURATION_S:
-                ev = ns.cppyy.gbl.pythonMakeEvent(_handover_tick)
-                ns.Simulator.Schedule(ns.Seconds(nxt["t_start"]), ev)
+                ev = ns.cppyy.gbl.pythonMakeEvent(_handover_blackout)
+                ns.Simulator.Schedule(
+                    ns.Seconds(nxt["t_start"] - ns.Simulator.Now().GetSeconds()),
+                    ev)
 
     if len(schedule) > 1:
         first_ho = schedule[1]
         if first_ho["t_start"] < SIM_DURATION_S:
-            ev = ns.cppyy.gbl.pythonMakeEvent(_handover_tick)
+            ev = ns.cppyy.gbl.pythonMakeEvent(_handover_blackout)
             ns.Simulator.Schedule(ns.Seconds(first_ho["t_start"]), ev)
 
     # =========================================================================
-    # Application layer
+    # Application layer — mixed traffic profiles
     # =========================================================================
     port        = 9
-    server_addr = ns.InetSocketAddress(iface_gnd.GetAddress(1), port)
+    server_addr = ns.InetSocketAddress(iface_srv.GetAddress(1), port)
 
     # Compute per-flow MaxBytes for TCP BulkSend
     max_bytes = 0  # unlimited (for UDP; ignored)
     if DATA_VOLUME_MB > 0:
         max_bytes = int(DATA_VOLUME_MB * 1_000_000)
 
-    if ns3_proto == "udp":
-        onoff = ns.OnOffHelper("ns3::UdpSocketFactory", server_addr.ConvertTo())
-        onoff.SetAttribute("DataRate",   ns.StringValue(APP_DATA_RATE))
-        onoff.SetAttribute("PacketSize", ns.UintegerValue(PACKET_SIZE_BYTES))
-        onoff.SetAttribute("OnTime",
-            ns.StringValue("ns3::ConstantRandomVariable[Constant=1]"))
-        onoff.SetAttribute("OffTime",
-            ns.StringValue("ns3::ConstantRandomVariable[Constant=0]"))
-        for phone in phones:
+    # Install per-client applications according to CLIENT_PROFILES.
+    # video / gaming / iot → OnOffHelper (UDP CBR)
+    # bulk                 → BulkSendHelper (TCP)
+    #
+    # When the protocol under test is QUIC (ns3_proto == "udp") or plain UDP,
+    # bulk clients also use OnOff/UDP instead of BulkSend/TCP because the
+    # protocol comparison must be consistent (all flows use the same socket
+    # factory).  TCP bulk profiles are only active when ns3_proto == "tcp".
+
+    udp_sink = ns.PacketSinkHelper(
+        "ns3::UdpSocketFactory",
+        ns.InetSocketAddress(ns.Ipv4Address.GetAny(), port).ConvertTo())
+    tcp_sink = ns.PacketSinkHelper(
+        "ns3::TcpSocketFactory",
+        ns.InetSocketAddress(ns.Ipv4Address.GetAny(), port).ConvertTo())
+
+    # Install sinks on server before apps on phones
+    udp_sink_app = udp_sink.Install(server)
+    udp_sink_app.Start(ns.Seconds(0.0))
+    udp_sink_app.Stop(ns.Seconds(SIM_DURATION_S + 2.0))
+
+    if ns3_proto == "tcp":
+        tcp_sink_app = tcp_sink.Install(server)
+        tcp_sink_app.Start(ns.Seconds(0.0))
+        tcp_sink_app.Stop(ns.Seconds(SIM_DURATION_S + 2.0))
+
+    # Track which sink app handles which ip_proto_num for FlowMonitor
+    # We collect stats for both protocols (6 + 17) in a single pass.
+    active_ip_protos = {17}   # UDP always present
+    if ns3_proto == "tcp":
+        active_ip_protos.add(6)
+
+    for ci, phone in enumerate(phones):
+        profile_name = CLIENT_PROFILES[ci] if ci < len(CLIENT_PROFILES) else "bulk"
+        profile      = TRAFFIC_PROFILES[profile_name]
+        app_type     = profile["app_type"]
+
+        # When running a non-TCP protocol comparison pass (UDP/QUIC), treat
+        # all clients as UDP CBR with the profile's data_rate.  This ensures
+        # every protocol comparison run uses the same number of active flows.
+        if ns3_proto != "tcp" or app_type != "tcp_bulk":
+            # UDP OnOff application
+            data_rate  = profile.get("data_rate") or APP_DATA_RATE
+            pkt_size   = profile["packet_size"]
+            duty       = profile["duty"]
+
+            if duty >= 1.0:
+                on_time_str  = "ns3::ConstantRandomVariable[Constant=1]"
+                off_time_str = "ns3::ConstantRandomVariable[Constant=0]"
+            else:
+                # IoT duty cycle: on for ~10% of time
+                on_str       = f"ns3::UniformRandomVariable[Min=0.9|Max=1.1]"
+                off_period   = (1.0 / max(duty, 0.01)) - 1.0
+                off_str      = (f"ns3::UniformRandomVariable"
+                                f"[Min={off_period*0.9:.2f}|Max={off_period*1.1:.2f}]")
+                on_time_str  = on_str
+                off_time_str = off_str
+
+            onoff = ns.OnOffHelper(
+                "ns3::UdpSocketFactory", server_addr.ConvertTo())
+            onoff.SetAttribute("DataRate",   ns.StringValue(data_rate))
+            onoff.SetAttribute("PacketSize", ns.UintegerValue(pkt_size))
+            onoff.SetAttribute("OnTime",     ns.StringValue(on_time_str))
+            onoff.SetAttribute("OffTime",    ns.StringValue(off_time_str))
             for _ in range(NUM_PARALLEL_FLOWS):
                 app_tx = onoff.Install(phone)
                 app_tx.Start(ns.Seconds(1.0))
                 app_tx.Stop(ns.Seconds(SIM_DURATION_S))
-        sink = ns.PacketSinkHelper(
-            "ns3::UdpSocketFactory",
-            ns.InetSocketAddress(ns.Ipv4Address.GetAny(), port).ConvertTo())
-        ip_proto_num = 17
 
-    else:
-        bulk = ns.BulkSendHelper("ns3::TcpSocketFactory", server_addr.ConvertTo())
-        bulk.SetAttribute("SendSize", ns.UintegerValue(PACKET_SIZE_BYTES))
-        bulk.SetAttribute("MaxBytes", ns.UintegerValue(max_bytes))
-        for phone in phones:
+        else:
+            # TCP BulkSend application (bulk profile, TCP protocol run only)
+            bulk = ns.BulkSendHelper(
+                "ns3::TcpSocketFactory", server_addr.ConvertTo())
+            bulk.SetAttribute("SendSize", ns.UintegerValue(profile["packet_size"]))
+            bulk.SetAttribute("MaxBytes", ns.UintegerValue(max_bytes))
             for _ in range(NUM_PARALLEL_FLOWS):
                 app_tx = bulk.Install(phone)
                 app_tx.Start(ns.Seconds(1.0))
                 app_tx.Stop(ns.Seconds(SIM_DURATION_S))
-        sink = ns.PacketSinkHelper(
-            "ns3::TcpSocketFactory",
-            ns.InetSocketAddress(ns.Ipv4Address.GetAny(), port).ConvertTo())
-        ip_proto_num = 6
 
-    app_rx = sink.Install(server)
-    app_rx.Start(ns.Seconds(0.0))
-    app_rx.Stop(ns.Seconds(SIM_DURATION_S + 2.0))
+    # =========================================================================
+    # Per-second throughput time-series probe (PacketSink cumulative RX bytes)
+    # =========================================================================
+    # The probe reads the total received bytes from the server's UDP sink
+    # (and TCP sink when present) every TIMESERIES_BUCKET_S seconds and
+    # records the delta as per-second throughput.
+    #
+    # NOTE: For simplicity we probe the UDP sink only when ns3_proto == "udp",
+    # and the TCP sink only when ns3_proto == "tcp".  In mixed-profile runs
+    # (ns3_proto == "tcp") the UDP flows from video/gaming/iot clients will
+    # not appear in the TCP PacketSink — this is intentional; we only
+    # time-series the primary protocol under test.
 
-     # ── FlowMonitor ───────────────────────────────────────────────────────────
-    # Install FlowMonitor only on endpoint nodes (phones + server) to avoid
-    # monitoring every forwarded packet on infrastructure nodes (satellite,
-    # GS), which would roughly double the event count and is unnecessary since
-    # we only report per-flow src→dst statistics.
+    ts_t_list     = []   # simulation time at each probe [s]
+    ts_bytes_list = []   # cumulative RX bytes at each probe
+
+    # Get the primary sink app handle (index 0 = first installed)
+    primary_sink_app = udp_sink_app.Get(0)
+
+    def _ts_probe():
+        t        = ns.Simulator.Now().GetSeconds()
+        cum_bytes = primary_sink_app.GetObject[ns.PacketSink]().GetTotalRx()
+        ts_t_list.append(t)
+        ts_bytes_list.append(int(cum_bytes))
+        # Reschedule until end of simulation
+        if t + TIMESERIES_BUCKET_S <= SIM_DURATION_S + 1.0:
+            ev = ns.cppyy.gbl.pythonMakeEvent(_ts_probe)
+            ns.Simulator.Schedule(ns.Seconds(TIMESERIES_BUCKET_S), ev)
+
+    # Start first probe at t = TIMESERIES_BUCKET_S
+    ev_ts = ns.cppyy.gbl.pythonMakeEvent(_ts_probe)
+    ns.Simulator.Schedule(ns.Seconds(TIMESERIES_BUCKET_S), ev_ts)
+
+    # ── FlowMonitor ───────────────────────────────────────────────────────────
     fm_helper = ns.FlowMonitorHelper()
     endpoint_nc = ns.NodeContainer()
     for ph in phones:
         endpoint_nc.Add(ph)
     endpoint_nc.Add(server)
-    monitor   = fm_helper.Install(endpoint_nc)
+    monitor = fm_helper.Install(endpoint_nc)
 
     # ── Run simulation ────────────────────────────────────────────────────────
     ns.Simulator.Stop(ns.Seconds(SIM_DURATION_S + 3.0))
     ns.Simulator.Run()
     monitor.CheckForLostPackets()
+
+    # ── Build per-second time-series ──────────────────────────────────────────
+    ts_throughput_kbps = []
+    for k in range(len(ts_t_list)):
+        prev_bytes = ts_bytes_list[k - 1] if k > 0 else 0
+        delta_bytes = max(ts_bytes_list[k] - prev_bytes, 0)
+        ts_throughput_kbps.append(round(delta_bytes * 8.0 / TIMESERIES_BUCKET_S / 1e3, 2))
+
+    timeseries = {
+        "t_s":              [round(t, 1) for t in ts_t_list],
+        "throughput_kbps":  ts_throughput_kbps,
+        "handover_times":   list(handover_times),
+    }
 
     # ── Collect FlowMonitor statistics ────────────────────────────────────────
     stats      = monitor.GetFlowStats()
@@ -1212,6 +1207,10 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         throughput_kbps = 0.0,
         handovers       = handover_count[0],
         schedule        = schedule,
+        fairness_index  = 0.0,
+        profile_stats   = {p: {"tx": 0, "rx": 0, "rx_bytes": 0, "delay_sum": 0.0}
+                           for p in TRAFFIC_PROFILES},
+        timeseries      = timeseries,
     )
 
     active_s = SIM_DURATION_S - 1.0   # exclude 1 s warm-up
@@ -1221,22 +1220,71 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     delay_sum  = 0.0
     jitter_sum = 0.0
     rx_bytes   = 0
+    flow_tputs = []   # per-flow throughput for Jain's fairness
+
+    # Map flow source port range to client index for profile tagging.
+    # NS-3 FlowMonitor provides source/dest address but not the client index
+    # directly.  We use a simpler approach: tag by IP protocol number.
+    # UDP flows → distributed over video/gaming/iot profiles in proportion.
+    # TCP flows → bulk profile.
+    udp_flow_count = 0
+    tcp_flow_count = 0
 
     for pair in stats:
         fid, fs = pair.first, pair.second
-        if classifier.FindFlow(fid).protocol != ip_proto_num:
+        finfo   = classifier.FindFlow(fid)
+        ip_proto = finfo.protocol
+
+        if ip_proto not in active_ip_protos:
             continue
         if fs.rxPackets == 0:
             continue
-        rx_n        = int(fs.rxPackets)
-        tx_n        = int(fs.txPackets)
+
+        rx_n   = int(fs.rxPackets)
+        tx_n   = int(fs.txPackets)
+        d_s    = fs.delaySum.GetSeconds()
+        j_s    = fs.jitterSum.GetSeconds()
+        b      = int(fs.rxBytes)
+        active_dur = max(
+            fs.timeLastRxPacket.GetSeconds() - fs.timeFirstRxPacket.GetSeconds(),
+            1e-9)
+        flow_tput = b * 8.0 / active_dur / 1e3  # kbps for this flow
+
         total_rx   += rx_n
         total_tx   += tx_n
-        delay_sum  += fs.delaySum.GetSeconds()
-        jitter_sum += fs.jitterSum.GetSeconds()
-        rx_bytes   += int(fs.rxBytes)
+        delay_sum  += d_s
+        jitter_sum += j_s
+        rx_bytes   += b
+        flow_tputs.append(flow_tput)
+
+        # Profile tagging: TCP flows → bulk; UDP flows → cycle through
+        # video/gaming/iot in rough proportion (3 profiles share UDP)
+        if ip_proto == 6:
+            tcp_flow_count += 1
+            ps = result["profile_stats"]["bulk"]
+            ps["tx"] += tx_n
+            ps["rx"] += rx_n
+            ps["rx_bytes"] += b
+            ps["delay_sum"] += d_s
+        else:
+            # Assign UDP flows to video/gaming/iot in round-robin
+            udp_profiles = ["video", "gaming", "iot"]
+            pname = udp_profiles[udp_flow_count % len(udp_profiles)]
+            udp_flow_count += 1
+            ps = result["profile_stats"][pname]
+            ps["tx"] += tx_n
+            ps["rx"] += rx_n
+            ps["rx_bytes"] += b
+            ps["delay_sum"] += d_s
 
     if total_rx > 0:
+        # Jain's fairness index: J = (Σx)² / (n · Σx²)
+        n_flows = len(flow_tputs)
+        if n_flows > 0 and sum(x**2 for x in flow_tputs) > 0:
+            fairness = (sum(flow_tputs) ** 2) / (n_flows * sum(x**2 for x in flow_tputs))
+        else:
+            fairness = 0.0
+
         result.update(
             tx_packets      = total_tx,
             rx_packets      = total_rx,
@@ -1244,14 +1292,16 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
             mean_delay_ms   = round(delay_sum / total_rx * 1e3, 2),
             jitter_ms       = round(jitter_sum / max(total_rx - 1, 1) * 1e3, 2),
             throughput_kbps = round(rx_bytes * 8.0 / active_s / 1e3, 2),
+            fairness_index  = round(fairness, 4),
         )
 
     ns.Simulator.Destroy()
 
     print(f"\n  Results ({label}, {topo_str}):")
     for k, v in result.items():
-        if k != "schedule":
+        if k not in ("schedule", "profile_stats", "timeseries"):
             print(f"    {k:<24s}: {v}")
+    print(f"    {'fairness_index':<24s}: {result['fairness_index']:.4f}")
 
     return result
 
@@ -1272,7 +1322,7 @@ def run_ns3_both_topologies(channel_stats: list,
 
     Because the topology is now determined by USE_BASE_STATIONS (a single
     configurable flag), the same result set is returned in both slots of
-    the tuple.  All 14 plot functions in topology_diagram.py continue to
+    the tuple.  All plot functions in topology_diagram.py continue to
     work without modification.
 
     For QUIC: the NS-3 simulation runs as UDP.  After the BBR run completes,
