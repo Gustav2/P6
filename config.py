@@ -167,28 +167,36 @@ Orbital velocity of a LEO satellite at SAT_HEIGHT_M [m/s].
 Source: Standard orbital mechanics (IERS Conventions 2010, §6.1).
 """
 
-NUM_SATELLITES = 3
+CONSTELLATION_TOTAL_SATS = 3000
+"""
+Approximate total number of satellites in the reference LEO shell.
+
+- This is metadata used to document constellation realism; the simulator does
+  not instantiate all of these satellites in NS-3 or Sionna RT.
+- 3000 is in-family with modern broadband LEO shell sizes (order of 10^3).
+"""
+
+VISIBLE_SATELLITES_PER_PASS = 8
+"""
+Number of satellites sampled as simultaneously visible during one urban pass.
+
+- This is the practical simulation density used by ray tracing and handover
+  scheduling (NUM_SATELLITES below).
+- 8 provides a more realistic visible-satellite density than 3 while keeping
+  runtime manageable on CPU-only setups.
+"""
+
+NUM_SATELLITES = VISIBLE_SATELLITES_PER_PASS
 """
 Number of satellites in the simulated constellation pass.
 
-This controls both the Sionna RT ray-tracing snapshot and the NS-3
-handover schedule.  Three satellites are used because:
-  - They produce 2 handover events during the 600 s simulation,
-    covering high (Sat 0), medium (Sat 1), and low (Sat 2) elevation
-    angles — the three link-budget regimes of interest.
-  - Ray tracing 3 satellites (PathSolver + render per satellite) takes
-    ~2–4 minutes on CPU-only hardware; each additional satellite adds
-    ~45–90 s.  300 satellites would take ~4–8 hours and is not feasible.
-  - The 3 satellite positions span zenith angles 20°, 35°, and 50°
-    (with SAT_SPACING_DEG = 15° and RT_SAT_INITIAL_ZENITH_DEG = 20°),
-    giving elevation angles 70°, 55°, and 40° — well above the 10°
-    handover threshold and representative of a realistic LEO pass.
-  - Minimum 2 to observe at least one handover event.
+This controls both the Sionna RT ray-tracing snapshot and the NS-3 handover
+schedule. It is interpreted as the sampled set of currently visible satellites
+from a much larger LEO constellation (CONSTELLATION_TOTAL_SATS).
 
-For the Starlink constellation context (300+ satellites in a shell),
-the NUM_SATELLITES value here represents the number of satellites that
-are active (above the horizon) during a single simulated orbital pass
-rather than the total constellation size.
+Use this value to trade realism vs runtime:
+  - Higher values improve handover granularity and elevation diversity.
+  - Lower values run faster.
 """
 
 SAT_HANDOVER_ELEVATION_DEG = 10.0
@@ -245,13 +253,28 @@ Radio map grid cell size [m, m] (x, y).
 
 RT_UE_POSITION = [50.0, 80.0, 1.5]
 """
-UE (phone) position [x, y, z] in metres within the Munich scene.
+Representative default UE (phone) position [x, y, z] in metres within
+the Munich scene.
+
 - z = 1.5 m represents a hand-held device at typical street level.
-- x=50, y=80 places the UE in a street canyon surrounded by buildings
-  so that reflected/diffracted paths from all satellite directions
-  can be resolved by the ray tracer (verified: 4/4/8 paths for
-  satellites at zenith 20°/35°/50°).
-- Scene bounding box: x ∈ [−806, 670] m, y ∈ [−689, 517] m.
+- x=50, y=80 places the UE in a street canyon surrounded by buildings.
+- This point is also included in RT_UE_SAMPLE_POSITIONS.
+"""
+
+RT_UE_SAMPLE_POSITIONS = [
+    [50.0, 80.0, 1.5],
+    [120.0, 30.0, 1.5],
+    [-20.0, 140.0, 1.5],
+    [180.0, -40.0, 1.5],
+]
+"""
+Representative UE sampling points [x, y, z] in the Munich scene for RT.
+
+- Instead of extracting channel stats from only one street location, the RT
+  stage traces all points in this list and aggregates per-satellite channel
+  statistics across them.
+- This improves realism for urban environments where canyons, blockages, and
+  facade materials vary significantly over short distances.
 """
 
 RT_SAT_INITIAL_ZENITH_DEG = 20.0
@@ -609,6 +632,23 @@ Initial steepness estimate for the PER sigmoid curve [1/dB].
   curves for QPSK r=0.5 in AWGN (3GPP TS 38.214, Annex A BLER curves).
 """
 
+RT_GAIN_P10_BLEND = 0.35
+"""
+Blend factor for conservative RT gain in PER modeling.
+
+In ntn_ns3.py, the effective RT gain used in the link budget is:
+
+  gain_eff = (1 - RT_GAIN_P10_BLEND) * mean_path_gain_db
+             + RT_GAIN_P10_BLEND * mean_path_gain_p10_db
+
+where mean_path_gain_p10_db is the 10th-percentile gain over sampled UE
+positions in the urban scene.
+
+- 0.0 uses only the mean gain.
+- 1.0 uses only the conservative percentile.
+- 0.35 gives moderate robustness to local urban blockages.
+"""
+
 # =============================================================================
 # Multi-client topology settings
 # =============================================================================
@@ -645,11 +685,33 @@ NUM_MOVING_CLIENTS = 20
 Number of mobile client (phone) nodes using the RandomWaypoint mobility
 model.  Each moving client is initialised at a random position within
 CLIENT_AREA_RADIUS_M and moves at a uniformly distributed speed between
-WAYPOINT_SPEED_MIN_MS and WAYPOINT_SPEED_MAX_MS m/s toward a random
+class-specific bounds toward a random
 destination within the same radius, with zero pause time at each waypoint.
 
 RandomWaypoint parameters are set in ntn_ns3.py using the bounds
 [−CLIENT_AREA_RADIUS_M, CLIENT_AREA_RADIUS_M] for both X and Y axes.
+"""
+
+NUM_PEDESTRIAN_MOVING_CLIENTS = 10
+"""
+Number of moving clients modelled as pedestrians.
+
+- These clients use the pedestrian RandomWaypoint speed range and represent
+  handheld users walking in the urban area.
+- Must satisfy:
+    NUM_PEDESTRIAN_MOVING_CLIENTS + NUM_VEHICULAR_MOVING_CLIENTS
+    == NUM_MOVING_CLIENTS
+"""
+
+NUM_VEHICULAR_MOVING_CLIENTS = 10
+"""
+Number of moving clients modelled as vehicular 5G modems.
+
+- These clients use the vehicular RandomWaypoint speed range and represent
+  direct-to-cell modems in moving cars.
+- Must satisfy:
+    NUM_PEDESTRIAN_MOVING_CLIENTS + NUM_VEHICULAR_MOVING_CLIENTS
+    == NUM_MOVING_CLIENTS
 """
 
 CLIENT_AREA_RADIUS_M = 500.0
@@ -665,11 +727,23 @@ Source: 3GPP TR 38.913 §8.1 (dense urban macro inter-site distance 200 m;
         urban macro 500 m).
 """
 
-WAYPOINT_SPEED_MIN_MS = 1.0
-"""Minimum moving-client waypoint speed [m/s] (≈ slow walk)."""
+PEDESTRIAN_SPEED_MIN_MS = 1.0
+"""Minimum pedestrian moving-client speed [m/s] (slow walk)."""
 
-WAYPOINT_SPEED_MAX_MS = 5.0
-"""Maximum moving-client waypoint speed [m/s] (≈ fast walk / slow jog)."""
+PEDESTRIAN_SPEED_MAX_MS = 2.2
+"""Maximum pedestrian moving-client speed [m/s] (brisk walk)."""
+
+VEHICULAR_SPEED_MIN_MS = 10.0
+"""Minimum vehicular moving-client speed [m/s] (36 km/h urban driving)."""
+
+VEHICULAR_SPEED_MAX_MS = 22.0
+"""Maximum vehicular moving-client speed [m/s] (79 km/h urban arterial)."""
+
+WAYPOINT_SPEED_MIN_MS = PEDESTRIAN_SPEED_MIN_MS
+"""Backward-compatible alias for minimum moving-client speed [m/s]."""
+
+WAYPOINT_SPEED_MAX_MS = VEHICULAR_SPEED_MAX_MS
+"""Backward-compatible alias for maximum moving-client speed [m/s]."""
 
 # =============================================================================
 # Base station positions (used only when USE_BASE_STATIONS = True)
@@ -835,23 +909,29 @@ Source: 3GPP TR 38.821 §6.2.2; 3GPP TS 38.321 §5.17 (BFD max 200 ms).
 # =============================================================================
 
 TRAFFIC_PROFILES = {
-    "video": {
+    "streaming": {
         "app_type":   "udp_cbr",
-        "data_rate":  "2Mbps",
+        "data_rate":  "2.5Mbps",
         "packet_size": 1316,
         "duty":        1.0,
     },
     "gaming": {
         "app_type":   "udp_cbr",
-        "data_rate":  "100kbps",
+        "data_rate":  "120kbps",
         "packet_size": 200,
         "duty":        1.0,
     },
-    "iot": {
+    "texting": {
         "app_type":   "udp_cbr",
-        "data_rate":  "10kbps",
-        "packet_size": 64,
-        "duty":        0.1,
+        "data_rate":  "30kbps",
+        "packet_size": 120,
+        "duty":        0.15,
+    },
+    "voice": {
+        "app_type":   "udp_cbr",
+        "data_rate":  "32kbps",
+        "packet_size": 160,
+        "duty":        1.0,
     },
     "bulk": {
         "app_type":   "tcp_bulk",
@@ -872,14 +952,16 @@ Each profile is a dict with:
                1.0 = always on.  0.1 = 10% on-time (IoT burst pattern).
 
 Profile characteristics:
-  video  — 2 Mbps UDP CBR, 1316-byte RTP-sized packets (always on).
-           Models real-time video streaming (e.g. 1080p H.264 at 2 Mbps).
-  gaming — 100 kbps UDP CBR, 200-byte packets (always on).
-           Models interactive gaming traffic: small, frequent datagrams.
-  iot    — 10 kbps UDP CBR, 64-byte packets, 10% duty cycle.
-           Models IoT sensor reporting with long sleep intervals.
-  bulk   — TCP BulkSend, 1400-byte segments, capped at DATA_VOLUME_MB.
-           Models file transfer / software update (saturating sender).
+  streaming — 2.5 Mbps UDP CBR, 1316-byte packets (always on).
+              Models downlink-heavy adaptive video streaming.
+  gaming    — 120 kbps UDP CBR, 200-byte packets (always on).
+            Models interactive gaming traffic: small, frequent datagrams.
+  texting   — 30 kbps UDP CBR, 120-byte packets, 15% duty cycle.
+              Models bursty messaging behavior (chat/text updates).
+  voice     — 32 kbps UDP CBR, 160-byte packets (always on).
+              Models packetized voice calls (VoIP-like cadence).
+  bulk      — TCP BulkSend, 1400-byte segments, capped at DATA_VOLUME_MB.
+              Optional background file-transfer traffic.
 
 Source for traffic characterisation:
   ETSI TR 103 559 v1.1.1 (2021) §5 (NTN traffic models for validation).
@@ -887,20 +969,22 @@ Source for traffic characterisation:
 """
 
 CLIENT_PROFILES = (
-    ["video"]  * 12 +
-    ["gaming"] * 13 +
-    ["iot"]    * 12 +
-    ["bulk"]   * 13
+    ["streaming"] * 10 +
+    ["gaming"]   * 10 +
+    ["texting"]  * 10 +
+    ["voice"]    * 10 +
+    ["bulk"]     * 10
 )
 """
 Traffic profile assignment for each of the
 (NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS) = 50 clients.
 
 Distribution (equal split):
-  12 × video   (indices  0–11)
-  13 × gaming  (indices 12–24)
-  12 × iot     (indices 25–36)
-  13 × bulk    (indices 37–49)
+  10 × streaming (indices  0–9)
+  10 × gaming    (indices 10–19)
+  10 × texting   (indices 20–29)
+  10 × voice     (indices 30–39)
+  10 × bulk      (indices 40–49)
 
 The first NUM_STATIONARY_CLIENTS entries are assigned to stationary clients;
 the remaining NUM_MOVING_CLIENTS entries are assigned to moving clients.

@@ -76,6 +76,15 @@ from config import (
     SNR_THRESH_DB,
     SIGMOID_SLOPE,
     PROTOCOLS,
+    CONSTELLATION_TOTAL_SATS,
+    VISIBLE_SATELLITES_PER_PASS,
+    NUM_PEDESTRIAN_MOVING_CLIENTS,
+    NUM_VEHICULAR_MOVING_CLIENTS,
+    PEDESTRIAN_SPEED_MIN_MS,
+    PEDESTRIAN_SPEED_MAX_MS,
+    VEHICULAR_SPEED_MIN_MS,
+    VEHICULAR_SPEED_MAX_MS,
+    RT_UE_SAMPLE_POSITIONS,
 )
 from ntn_phy          import run_sionna_ber
 from rt_sim           import run_ray_tracing
@@ -210,6 +219,13 @@ def main() -> None:
     print(f"  Clients  : {NUM_STATIONARY_CLIENTS} stationary + "
           f"{NUM_MOVING_CLIENTS} moving  "
           f"(total {NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS})")
+    print(f"  Mobility : pedestrians={NUM_PEDESTRIAN_MOVING_CLIENTS} "
+          f"({PEDESTRIAN_SPEED_MIN_MS:.1f}-{PEDESTRIAN_SPEED_MAX_MS:.1f} m/s), "
+          f"vehicular={NUM_VEHICULAR_MOVING_CLIENTS} "
+          f"({VEHICULAR_SPEED_MIN_MS:.1f}-{VEHICULAR_SPEED_MAX_MS:.1f} m/s)")
+    print(f"  Constell.: total≈{CONSTELLATION_TOTAL_SATS} sats, "
+          f"sampled-visible={VISIBLE_SATELLITES_PER_PASS}")
+    print(f"  RT UEs   : {len(RT_UE_SAMPLE_POSITIONS)} sample points")
     print("─" * 70)
 
     direct_results, _ = run_ns3_both_topologies(

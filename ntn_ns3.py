@@ -18,7 +18,7 @@ Simulates the end-to-end NTN network including:
     models beam failure detection → RACH → conditional handover
     per 3GPP TS 38.300 §10.1.2.3.
   * Mixed traffic profiles — each client is assigned a traffic profile
-    (video / gaming / iot / bulk) so that heterogeneous load is
+    (streaming / gaming / texting / voice / bulk) so that heterogeneous load is
     accurately modelled across all protocol comparison runs.
   * Per-second time-series — a PacketSink probe fires every
     TIMESERIES_BUCKET_S seconds to record true per-second throughput.
@@ -155,13 +155,18 @@ from config import (
     NOISE_FLOOR_DBM,
     SNR_THRESH_DB,
     SIGMOID_SLOPE,
+    RT_GAIN_P10_BLEND,
     # Multi-client topology
     USE_BASE_STATIONS,
     NUM_STATIONARY_CLIENTS,
     NUM_MOVING_CLIENTS,
     CLIENT_AREA_RADIUS_M,
-    WAYPOINT_SPEED_MIN_MS,
-    WAYPOINT_SPEED_MAX_MS,
+    NUM_PEDESTRIAN_MOVING_CLIENTS,
+    NUM_VEHICULAR_MOVING_CLIENTS,
+    PEDESTRIAN_SPEED_MIN_MS,
+    PEDESTRIAN_SPEED_MAX_MS,
+    VEHICULAR_SPEED_MIN_MS,
+    VEHICULAR_SPEED_MAX_MS,
     GNB_POSITIONS,
     NUM_GNB,
     DATA_VOLUME_MB,
@@ -217,9 +222,10 @@ def _fspl_db(height_m: float, elev_deg: float,
 
 
 def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
-                        rt_ref_gain_db: float = None,
-                        tx_eirp_dbm: float = None,
-                        snr_thresh_db: float = None,
+                        rt_gain_p10_db: float = None,
+                         rt_ref_gain_db: float = None,
+                         tx_eirp_dbm: float = None,
+                         snr_thresh_db: float = None,
                         sigmoid_slope: float = None) -> float:
     """
     Estimate packet error rate using a sigmoid link-budget model
@@ -271,10 +277,17 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
     # satellite.  The reference satellite gets 0 dB correction; others
     # receive a negative correction equal to their RT gain deficit.
     # If RT produced no valid paths (gain = −200 dB), apply a −10 dB penalty.
-    if rt_mean_gain_db <= -150.0:
+    gain_for_budget_db = rt_mean_gain_db
+    if rt_gain_p10_db is not None:
+        gain_for_budget_db = (
+            (1.0 - RT_GAIN_P10_BLEND) * rt_mean_gain_db
+            + RT_GAIN_P10_BLEND * rt_gain_p10_db
+        )
+
+    if gain_for_budget_db <= -150.0:
         urban_correction_db = -10.0    # No paths → deep shadow, penalty
     elif rt_ref_gain_db is not None and rt_ref_gain_db > -150.0:
-        urban_correction_db = rt_mean_gain_db - rt_ref_gain_db
+        urban_correction_db = gain_for_budget_db - rt_ref_gain_db
     else:
         urban_correction_db = 0.0
 
@@ -392,6 +405,7 @@ def _compute_handover_schedule(channel_stats: list,
 
         fspl   = _fspl_db(SAT_HEIGHT_M, max(elev_deg, 1.0))
         per    = _rt_calibrated_per(fspl, stat["mean_path_gain_db"],
+                                    stat.get("mean_path_gain_p10_db"),
                                     ref_gain_db, tx_eirp_dbm,
                                     snr_thresh_db, sigmoid_slope)
         delay  = _one_way_delay_ms(SAT_HEIGHT_M, max(elev_deg, 1.0))
@@ -679,7 +693,8 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         Otherwise:            Phone → AccessSat → ISL → BenchmarkSat → Server
       - Moving clients use RandomWaypointMobilityModel
       - TCP BulkSend capped at DATA_VOLUME_MB
-      - Mixed traffic profiles: video/gaming/iot → UDP CBR, bulk → TCP
+      - Mixed traffic profiles: streaming/gaming/texting/voice → UDP CBR,
+        bulk → TCP
       - Full beam management: 3-phase link interruption gap per handover
       - Per-second throughput time-series via PacketSink probe
       - Jain's fairness index across per-flow throughputs
@@ -826,13 +841,28 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     # NS-3 RandomWaypointMobilityModel has three attributes: Speed, Pause,
     # PositionAllocator.  There is no "Bounds" attribute — bounds are enforced
     # entirely via RandomRectanglePositionAllocator (X and Y random variables).
+    if NUM_PEDESTRIAN_MOVING_CLIENTS + NUM_VEHICULAR_MOVING_CLIENTS != NUM_MOVING_CLIENTS:
+        raise ValueError(
+            "NUM_PEDESTRIAN_MOVING_CLIENTS + NUM_VEHICULAR_MOVING_CLIENTS "
+            "must equal NUM_MOVING_CLIENTS"
+        )
+
+    moving_start = NUM_STATIONARY_CLIENTS
+    moving_end = NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS
+    pedestrian_end = moving_start + NUM_PEDESTRIAN_MOVING_CLIENTS
+
+    def _speed_bounds_for_client(client_idx: int) -> tuple:
+        if client_idx < pedestrian_end:
+            return PEDESTRIAN_SPEED_MIN_MS, PEDESTRIAN_SPEED_MAX_MS
+        return VEHICULAR_SPEED_MIN_MS, VEHICULAR_SPEED_MAX_MS
+
     for i in range(NUM_STATIONARY_CLIENTS, num_clients):
         px, py, pz = phone_positions[i]
         rwp_mob = ns.CreateObject[ns.RandomWaypointMobilityModel]()
         r = CLIENT_AREA_RADIUS_M
+        vmin, vmax = _speed_bounds_for_client(i)
         speed_var = ns.StringValue(
-            f"ns3::UniformRandomVariable[Min={WAYPOINT_SPEED_MIN_MS}"
-            f"|Max={WAYPOINT_SPEED_MAX_MS}]"
+            f"ns3::UniformRandomVariable[Min={vmin}|Max={vmax}]"
         )
         pause_var = ns.StringValue("ns3::ConstantRandomVariable[Constant=0]")
         pos_alloc = ns.CreateObject[ns.RandomRectanglePositionAllocator]()
@@ -1049,7 +1079,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         max_bytes = int(DATA_VOLUME_MB * 1_000_000)
 
     # Install per-client applications according to CLIENT_PROFILES.
-    # video / gaming / iot → OnOffHelper (UDP CBR)
+    # streaming / gaming / texting / voice → OnOffHelper (UDP CBR)
     # bulk                 → BulkSendHelper (TCP)
     #
     # When the protocol under test is QUIC (ns3_proto == "udp") or plain UDP,
@@ -1069,6 +1099,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     udp_sink_app.Start(ns.Seconds(0.0))
     udp_sink_app.Stop(ns.Seconds(SIM_DURATION_S + 2.0))
 
+    tcp_sink_app = None
     if ns3_proto == "tcp":
         tcp_sink_app = tcp_sink.Install(server)
         tcp_sink_app.Start(ns.Seconds(0.0))
@@ -1137,15 +1168,15 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     #
     # NOTE: For simplicity we probe the UDP sink only when ns3_proto == "udp",
     # and the TCP sink only when ns3_proto == "tcp".  In mixed-profile runs
-    # (ns3_proto == "tcp") the UDP flows from video/gaming/iot clients will
-    # not appear in the TCP PacketSink — this is intentional; we only
+    # (ns3_proto == "tcp") the UDP flows from streaming/gaming/texting/voice
+    # clients will not appear in the TCP PacketSink — this is intentional; we only
     # time-series the primary protocol under test.
 
     ts_t_list     = []   # simulation time at each probe [s]
     ts_bytes_list = []   # cumulative RX bytes at each probe
 
     # Get the primary sink app handle (index 0 = first installed)
-    primary_sink_app = udp_sink_app.Get(0)
+    primary_sink_app = tcp_sink_app.Get(0) if (ns3_proto == "tcp" and tcp_sink_app is not None) else udp_sink_app.Get(0)
 
     def _ts_probe():
         t        = ns.Simulator.Now().GetSeconds()
@@ -1225,7 +1256,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     # Map flow source port range to client index for profile tagging.
     # NS-3 FlowMonitor provides source/dest address but not the client index
     # directly.  We use a simpler approach: tag by IP protocol number.
-    # UDP flows → distributed over video/gaming/iot profiles in proportion.
+    # UDP flows → distributed over UDP CBR profile names in proportion.
     # TCP flows → bulk profile.
     udp_flow_count = 0
     tcp_flow_count = 0
@@ -1258,7 +1289,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         flow_tputs.append(flow_tput)
 
         # Profile tagging: TCP flows → bulk; UDP flows → cycle through
-        # video/gaming/iot in rough proportion (3 profiles share UDP)
+        # configured UDP profile names in rough proportion.
         if ip_proto == 6:
             tcp_flow_count += 1
             ps = result["profile_stats"]["bulk"]
@@ -1267,8 +1298,13 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
             ps["rx_bytes"] += b
             ps["delay_sum"] += d_s
         else:
-            # Assign UDP flows to video/gaming/iot in round-robin
-            udp_profiles = ["video", "gaming", "iot"]
+            # Assign UDP flows to all configured UDP profiles in round-robin
+            udp_profiles = [
+                pname for pname, pdef in TRAFFIC_PROFILES.items()
+                if pdef.get("app_type") == "udp_cbr"
+            ]
+            if not udp_profiles:
+                udp_profiles = ["streaming"]
             pname = udp_profiles[udp_flow_count % len(udp_profiles)]
             udp_flow_count += 1
             ps = result["profile_stats"][pname]

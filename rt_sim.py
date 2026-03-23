@@ -19,8 +19,8 @@ NUM_SATELLITES proxy transmitters are placed at angular offsets
 in the constellation.  For each, ray tracing is performed independently
 and per-satellite channel statistics are returned.
 
-One receiver is placed in the scene:
-  - UE  at RT_UE_POSITION  — service link (sat → UE)
+Multiple representative receivers are sampled in the scene:
+  - UEs at RT_UE_SAMPLE_POSITIONS  — service link (sat → UE)
 
 Outputs
 -------
@@ -34,12 +34,14 @@ Returns
       Service-link keys (sat → UE):
         sat_id                int   satellite index (0-based)
         elevation_deg         float UE elevation angle [deg]
-        mean_path_gain_db     float mean |h| over valid paths [dB]
+        mean_path_gain_db     float mean |h| over sampled UEs [dB]
+        mean_path_gain_p10_db float 10th-percentile gain over sampled UEs [dB]
         delay_spread_ns       float RMS delay spread [ns]
         num_paths             int   valid path count
         los_exists            bool  True if at least one LoS path found
         sat_x_m               float proxy TX x-position [m]
         sat_y_m               float proxy TX y-position [m]
+        sampled_ues           int   number of UE sample points aggregated
 """
 
 import math
@@ -70,6 +72,7 @@ from config import (
     RT_SAMPLES_PER_TX,
     RT_CELL_SIZE,
     RT_UE_POSITION,
+    RT_UE_SAMPLE_POSITIONS,
     RT_SAT_SCENE_HEIGHT_M,
     RT_SAT_INITIAL_ZENITH_DEG,
     RT_CAM_POSITION,
@@ -184,7 +187,7 @@ def _satellite_positions(ue_pos: list, height_m: float,
 # =============================================================================
 
 def _extract_channel_stats(paths, sat_id: int,
-                            sat_pos: tuple, elev_deg: float) -> dict:
+                             sat_pos: tuple, elev_deg: float) -> dict:
     """
     Compute scalar channel statistics from a Sionna RT Paths object.
 
@@ -268,7 +271,47 @@ def _extract_channel_stats(paths, sat_id: int,
     )
 
 
-def _load_scene_with_ue(ue_pos: list) -> tuple:
+def _aggregate_sample_stats(sample_stats: list, sat_id: int, sat_pos: tuple) -> dict:
+    """
+    Aggregate per-UE-sample channel stats into one per-satellite record.
+
+    Aggregation uses mean values for gain and delay spread, plus a conservative
+    10th-percentile gain which is consumed by NS-3 as an urban diversity penalty.
+    """
+    valid = [s for s in sample_stats if s.get("num_paths", 0) > 0]
+    if not valid:
+        return dict(
+            sat_id=sat_id,
+            elevation_deg=0.0,
+            mean_path_gain_db=-200.0,
+            mean_path_gain_p10_db=-200.0,
+            delay_spread_ns=0.0,
+            num_paths=0,
+            los_exists=False,
+            sat_x_m=round(sat_pos[0], 1),
+            sat_y_m=round(sat_pos[1], 1),
+            sampled_ues=len(sample_stats),
+        )
+
+    gains = np.array([s["mean_path_gain_db"] for s in valid], dtype=float)
+    dss = np.array([s["delay_spread_ns"] for s in valid], dtype=float)
+    elevs = np.array([s["elevation_deg"] for s in sample_stats], dtype=float)
+
+    return dict(
+        sat_id=sat_id,
+        elevation_deg=round(float(np.mean(elevs)), 1),
+        mean_path_gain_db=round(float(np.mean(gains)), 2),
+        mean_path_gain_p10_db=round(float(np.percentile(gains, 10)), 2),
+        delay_spread_ns=round(float(np.mean(dss)), 2),
+        num_paths=int(round(float(np.mean([s["num_paths"] for s in sample_stats])))),
+        los_exists=bool(any(s.get("los_exists", False) for s in sample_stats)),
+        sat_x_m=round(sat_pos[0], 1),
+        sat_y_m=round(sat_pos[1], 1),
+        sampled_ues=len(sample_stats),
+    )
+
+
+def _load_scene_with_ue(ue_pos: list, ue_name: str) -> tuple:
     """
     Load the Munich scene, set the carrier frequency, and place the UE
     receiver in the scene.
@@ -306,7 +349,7 @@ def _load_scene_with_ue(ue_pos: list) -> tuple:
     )
 
     # UE (phone) — service link receiver
-    rx_ue = Receiver(name="ue", position=ue_pos, display_radius=3)
+    rx_ue = Receiver(name=ue_name, position=ue_pos, display_radius=3)
     scene.add(rx_ue)
 
     return scene, rx_ue
@@ -321,8 +364,8 @@ def _make_camera() -> Camera:
 # Per-satellite ray tracing
 # =============================================================================
 
-def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
-                     elev_deg: float) -> tuple:
+def _trace_satellite(scene, sat_id: int, sat_pos: tuple, ue_pos: list,
+                     elev_deg: float, render_paths: bool = False) -> tuple:
     """
     Add the satellite proxy transmitter to the scene, run PathSolver for
     the UE receiver, render a paths image, then remove the TX.
@@ -343,7 +386,7 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
     tx = Transmitter(
         name     = tx_name,
         position = sat_pos,
-        look_at  = RT_UE_POSITION,   # Beam steered towards the UE
+        look_at  = ue_pos,   # Beam steered towards the UE
         velocity = (0.0, 0.0, 0.0),  # Static within this snapshot
         power_dbm = RT_TX_POWER_DBM, # from config.RT_TX_POWER_DBM
         display_radius = 5,
@@ -364,20 +407,21 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
     )
 
     # Render and save paths image for this satellite
-    cam      = _make_camera()
-    out_file = f"output/ntn_rt_paths_sat{sat_id}.png"
-    try:
-        scene.render_to_file(
-            camera     = cam,
-            filename   = out_file,
-            paths      = paths,
-            clip_at    = RT_SAT_SCENE_HEIGHT_M + 50,
-            resolution = (1280, 720),
-            num_samples = 256,
-        )
-        print(f"    [Render] {out_file}")
-    except Exception as e:
-        print(f"    [Render] Skipped {out_file}: {e}")
+    if render_paths:
+        cam      = _make_camera()
+        out_file = f"output/ntn_rt_paths_sat{sat_id}.png"
+        try:
+            scene.render_to_file(
+                camera     = cam,
+                filename   = out_file,
+                paths      = paths,
+                clip_at    = RT_SAT_SCENE_HEIGHT_M + 50,
+                resolution = (1280, 720),
+                num_samples = 256,
+            )
+            print(f"    [Render] {out_file}")
+        except Exception as e:
+            print(f"    [Render] Skipped {out_file}: {e}")
 
     # Service-link stats (sat → UE)
     stats = _extract_channel_stats(paths, sat_id, sat_pos, elev_deg)
@@ -434,7 +478,7 @@ def run_ray_tracing() -> list:
     2. For each satellite in the constellation snapshot:
        a. Compute its proxy position and elevation angle to the UE.
        b. Run PathSolver (LoS + specular reflections + refractions).
-       c. Extract service-link channel statistics (sat→UE).
+       c. Extract service-link channel statistics across sampled UEs.
        d. Save a scene render with paths overlaid.
     3. Compute and save a composite radio map.
 
@@ -446,21 +490,16 @@ def run_ray_tracing() -> list:
     -------
     channel_stats : list[dict]
         One dict per satellite (in order of simulation index).
-        Keys: sat_id, elevation_deg, mean_path_gain_db,
-              delay_spread_ns, num_paths, los_exists, sat_x_m, sat_y_m.
+         Keys: sat_id, elevation_deg, mean_path_gain_db,
+               mean_path_gain_p10_db, delay_spread_ns, num_paths,
+               los_exists, sat_x_m, sat_y_m, sampled_ues.
         This list is passed directly to ntn_ns3.run_ns3() so that the
         NS-3 link budget uses RT-informed channel parameters.
     """
-    # NOTE: RT_UE_POSITION is used as a single representative UE position for
-    # all clients in the multi-client topology.  All clients are deployed within
-    # CLIENT_AREA_RADIUS_M (500 m) of the NS-3 coordinate origin, which is
-    # negligible compared to the satellite footprint (~100 km).  The RT-derived
-    # urban channel statistics (multipath gain, delay spread) are therefore
-    # valid for the entire client population without per-client ray tracing.
     print("\n[Sionna RT]  5G-NTN Munich scene — satellite constellation pass")
     print(f"  Frequency      : {RT_SCENE_FREQ_HZ/1e9:.2f} GHz")
-    print(f"  UE position    : {RT_UE_POSITION} m  "
-          f"(representative for all clients within CLIENT_AREA_RADIUS_M)")
+    print(f"  UE samples     : {len(RT_UE_SAMPLE_POSITIONS)} points")
+    print(f"  Primary UE     : {RT_UE_POSITION} m")
     print(f"  Proxy altitude : {RT_SAT_SCENE_HEIGHT_M} m")
     print(f"  Satellites     : {NUM_SATELLITES}  "
           f"(initial zenith {RT_SAT_INITIAL_ZENITH_DEG}°, "
@@ -475,30 +514,50 @@ def run_ray_tracing() -> list:
         initial_zenith_deg = RT_SAT_INITIAL_ZENITH_DEG,
     )
 
+    # ── Load one scene per sampled UE position ────────────────────────────────
+    ue_samples = RT_UE_SAMPLE_POSITIONS if RT_UE_SAMPLE_POSITIONS else [RT_UE_POSITION]
+    scenes = []
+    for idx, ue_pos in enumerate(ue_samples):
+        scene_i, _ = _load_scene_with_ue(ue_pos, f"ue{idx}")
+        scenes.append((ue_pos, scene_i))
+
+    all_stats = []
+
+    for sat_id, sat_pos in enumerate(sat_positions):
+        elev_primary = _sat_elevation_deg(*sat_pos, *RT_UE_POSITION)
+        visible = elev_primary >= SAT_HANDOVER_ELEVATION_DEG
+        print(f"  Satellite {sat_id}:  UE elev={elev_primary:5.1f}°  "
+              f"pos=({sat_pos[0]:6.1f}, {sat_pos[1]:5.1f}, {sat_pos[2]:.0f}) m  "
+              f"{'[visible]' if visible else '[below horizon threshold]'}")
+
+        sample_stats = []
+        for idx, (ue_pos, scene_i) in enumerate(scenes):
+            elev_i = _sat_elevation_deg(*sat_pos, *ue_pos)
+            _, st_i = _trace_satellite(
+                scene_i,
+                sat_id,
+                sat_pos,
+                ue_pos,
+                elev_i,
+                render_paths=(idx == 0),
+            )
+            sample_stats.append(st_i)
+
+        stats = _aggregate_sample_stats(sample_stats, sat_id, sat_pos)
+        all_stats.append(stats)
+
+        print(f"    svc:    paths={stats['num_paths']}  "
+              f"gain={stats['mean_path_gain_db']:.1f} dB  "
+              f"p10={stats.get('mean_path_gain_p10_db', stats['mean_path_gain_db']):.1f} dB  "
+              f"ds={stats['delay_spread_ns']:.1f} ns")
+
+    # ── Composite radio map: add all visible sats back simultaneously ─────────
     elev_angles = [
         _sat_elevation_deg(*pos, *RT_UE_POSITION)
         for pos in sat_positions
     ]
 
-    # ── Load scene once, trace each satellite sequentially ───────────────────
-    scene, rx_ue = _load_scene_with_ue(RT_UE_POSITION)
-
-    all_stats = []
-
-    for sat_id, (sat_pos, elev_deg) in enumerate(zip(sat_positions, elev_angles)):
-        visible = elev_deg >= SAT_HANDOVER_ELEVATION_DEG
-        print(f"  Satellite {sat_id}:  UE elev={elev_deg:5.1f}°  "
-              f"pos=({sat_pos[0]:6.1f}, {sat_pos[1]:5.1f}, {sat_pos[2]:.0f}) m  "
-              f"{'[visible]' if visible else '[below horizon threshold]'}")
-
-        _, stats = _trace_satellite(scene, sat_id, sat_pos, elev_deg)
-        all_stats.append(stats)
-
-        print(f"    svc:    paths={stats['num_paths']}  "
-              f"gain={stats['mean_path_gain_db']:.1f} dB  "
-              f"ds={stats['delay_spread_ns']:.1f} ns")
-
-    # ── Composite radio map: add all visible sats back simultaneously ─────────
+    primary_scene = scenes[0][1]
     visible_sats = [
         (i, pos) for i, (pos, e) in enumerate(zip(sat_positions, elev_angles))
         if e >= SAT_HANDOVER_ELEVATION_DEG
@@ -510,9 +569,9 @@ def run_ray_tracing() -> list:
             look_at   = RT_UE_POSITION,
             power_dbm = RT_TX_POWER_DBM,
         )
-        scene.add(tx)
+        primary_scene.add(tx)
 
-    _compute_and_save_radiomap(scene)
+    _compute_and_save_radiomap(primary_scene)
 
     print(f"\n  Ray tracing complete.  {len(all_stats)} satellite snapshots computed.\n")
     return all_stats

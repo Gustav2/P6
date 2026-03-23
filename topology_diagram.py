@@ -435,7 +435,7 @@ def draw_link_budget_waterfall(channel_stats: list,
         else:
             urban = 0.0
         snr = eirp_dbm - fspl + urban + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM
-        per = _rt_calibrated_per(fspl, gain, ref_gain, eirp_dbm)
+        per = _rt_calibrated_per(fspl, gain, None, ref_gain, eirp_dbm)
         return dict(eirp=eirp_dbm, fspl=fspl, urban=urban,
                     noise=NOISE_FLOOR_DBM, snr=snr, thresh=SNR_THRESH_DB,
                     margin=snr - SNR_THRESH_DB, per=per)
@@ -555,7 +555,7 @@ def draw_snr_vs_elevation(channel_stats: list,
 
     def _per_curve(eirp_dbm):
         return np.array([
-            _rt_calibrated_per(_fspl_db(SAT_HEIGHT_M, e), -100.0, None, eirp_dbm)
+            _rt_calibrated_per(_fspl_db(SAT_HEIGHT_M, e), -100.0, None, None, eirp_dbm)
             for e in elev
         ])
 
@@ -1160,7 +1160,7 @@ def draw_profile_breakdown(ns3_results: list,
                             out: str = "output/ntn_profile_breakdown.png") -> str:
     """
     Grouped bar chart showing throughput and packet loss rate broken down
-    by traffic profile (video / gaming / iot / bulk) for each protocol.
+    by traffic profile for each protocol.
 
     Parameters
     ----------
@@ -1189,17 +1189,13 @@ def draw_profile_breakdown(ns3_results: list,
         print("[ProfileBreakdown]  profile_stats empty — skipping.")
         return out
 
-    profiles    = list(TRAFFIC_PROFILES.keys())  # ["video","gaming","iot","bulk"]
+    profiles    = list(TRAFFIC_PROFILES.keys())
     proto_labels = [r["label"] for r in ns3_results]
     n_protos     = len(proto_labels)
     n_profiles   = len(profiles)
 
-    PROFILE_COLORS = {
-        "video":  "#1f77b4",
-        "gaming": "#2ca02c",
-        "iot":    "#ff7f0e",
-        "bulk":   "#9467bd",
-    }
+    base_palette = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728", "#9467bd", "#8c564b", "#17becf"]
+    PROFILE_COLORS = {p: base_palette[i % len(base_palette)] for i, p in enumerate(profiles)}
 
     active_s = _SIM_S - 1.0
 
@@ -1221,10 +1217,17 @@ def draw_profile_breakdown(ns3_results: list,
     bar_w = 0.8 / n_profiles
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 9))
+    profile_desc = {
+        "streaming": "streaming (2.5 Mbps UDP)",
+        "gaming": "gaming (120 kbps UDP)",
+        "texting": "texting (bursty 30 kbps UDP)",
+        "voice": "voice (32 kbps UDP)",
+        "bulk": "bulk (TCP BulkSend)",
+    }
+    subtitle = "  |  ".join(profile_desc.get(p, p) for p in profiles)
     fig.suptitle(
         "Per-Traffic-Profile Performance Breakdown — 5G-NTN Satellite Link\n"
-        "Profiles: video (2 Mbps UDP)  |  gaming (100 kbps UDP)  |  "
-        "IoT (10 kbps, 10% duty)  |  bulk (TCP BulkSend)",
+        f"Profiles: {subtitle}",
         fontsize=10,
     )
 

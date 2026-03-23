@@ -3,7 +3,7 @@
 An end-to-end simulation of a 5G Non-Terrestrial Network (NTN) LEO satellite link.
 The pipeline integrates three simulation layers — PHY-layer link abstraction,
 urban ray tracing, and packet-level network simulation — and produces a set of
-diagnostic figures comparing four transport protocols under realistic satellite
+diagnostic figures comparing multiple transport protocols under realistic satellite
 channel conditions including handover events.
 
 ## Architecture
@@ -19,14 +19,14 @@ channel conditions including handover events.
 ┌────────────────────▼────────────────────────────────────────┐
 │  Part 2 — Ray tracing  (rt_sim.py)                          │
 │  Sionna RT · Munich OSM scene                               │
-│  UE at [50, 80, 1.5 m] · 3 satellites at elev 70°/55°/40°  │
-│  → per-satellite path gain, delay spread, PER               │
+│  Multi-UE samples in Munich OSM scene                        │
+│  → per-satellite path gain percentiles, delay spread, PER    │
 └────────────────────┬────────────────────────────────────────┘
                      │  channel_stats
 ┌────────────────────▼────────────────────────────────────────┐
 │  Part 3 — Network simulation  (ntn_ns3.py)                  │
-│  NS-3 · 4 protocols: UDP, TCP NewReno, CUBIC, BBR           │
-│  2 handovers (t=20 s → t=40 s) · 60 s simulation           │
+│  NS-3 · UDP, TCP NewReno/CUBIC/BBR, QUIC                    │
+│  realistic moving+stationary traffic mix · 60 s simulation  │
 │  → throughput, latency, packet loss per protocol            │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -44,15 +44,16 @@ UE (Phone)  ──5G-NR NTN──  LEO Satellite  ──Ka feeder──  Ground 
 | Carrier frequency | 3.5 GHz (5G NR n78) |
 | Modulation | QPSK |
 | Code rate | 0.5 (LDPC) |
-| Satellite altitude | 600 km (LEO) |
-| Constellation | 3 satellites |
-| Satellite elevations | 69.9° / 54.9° / 39.9° |
+| Satellite altitude | 550 km (LEO) |
+| Constellation context | ~3000 satellites total shell |
+| Sampled visible satellites | 8 per simulated pass |
 | Handover 1 | t = 20 s (Sat 0 → Sat 1) |
 | Handover 2 | t = 40 s (Sat 1 → Sat 2) |
-| Per-slot PER | 0.101 / 0.033 / 0.768 |
+| Traffic profiles | streaming, gaming, texting, voice (+ bulk background) |
+| Mobility classes | stationary, pedestrian, vehicular modem |
 | Simulation duration | 60 s |
 | Ray tracing scene | Munich (Sionna RT, OSM) |
-| UE position | [50, 80, 1.5 m] in Munich scene |
+| RT UE sampling | multiple UE points in Munich scene |
 
 ### NS-3 results (representative run)
 
@@ -124,11 +125,18 @@ All parameters are centralised in `config.py`.  Key knobs:
 | Parameter | Default | Description |
 |---|---|---|
 | `CARRIER_FREQ_HZ` | `3.5e9` | 5G NR carrier frequency [Hz] |
-| `SAT_HEIGHT_M` | `600_000` | LEO orbital altitude [m] |
-| `NUM_SATELLITES` | `3` | Satellites in the simulated pass |
+| `SAT_HEIGHT_M` | `550_000` | LEO orbital altitude [m] |
+| `CONSTELLATION_TOTAL_SATS` | `3000` | Constellation-scale realism metadata |
+| `VISIBLE_SATELLITES_PER_PASS` | `8` | Sampled visible satellites per pass |
+| `NUM_SATELLITES` | `VISIBLE_SATELLITES_PER_PASS` | Satellites used in RT + NS-3 pass |
 | `SIM_DURATION_S` | `60.0` | NS-3 simulation duration [s] |
 | `RT_MAX_DEPTH` | `5` | Max ray reflections per path |
-| `RT_UE_POSITION` | `[50, 80, 1.5]` | UE location in Munich scene [m] |
+| `RT_UE_SAMPLE_POSITIONS` | `4 points` | RT sampling points for urban diversity |
+| `RT_GAIN_P10_BLEND` | `0.35` | Blend between mean and p10 RT gain in PER model |
+| `NUM_PEDESTRIAN_MOVING_CLIENTS` | `10` | Pedestrian moving clients |
+| `NUM_VEHICULAR_MOVING_CLIENTS` | `10` | Vehicular-modem moving clients |
+| `PEDESTRIAN_SPEED_MIN_MS / MAX` | `1.0 / 2.2` | Pedestrian speed range [m/s] |
+| `VEHICULAR_SPEED_MIN_MS / MAX` | `10.0 / 22.0` | Vehicular speed range [m/s] |
 | `APP_DATA_RATE` | `"5Mbps"` | UDP CBR source rate |
 | `PACKET_SIZE_BYTES` | `1400` | Application payload size [bytes] |
 | `TCP_SNDRCV_BUF_BYTES` | `512_000` | TCP socket buffer [bytes] |
