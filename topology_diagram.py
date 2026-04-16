@@ -1,14 +1,14 @@
 """
-topology_diagram.py — Scenario topology illustration and protocol comparison
-=============================================================================
-Produces output figures for the NTN satellite simulation:
+topology_diagram.py — Visualisation functions for the NTN satellite simulation
+===============================================================================
+Produces output figures:
+
+  ntn_ber_bler.png
+      BER and BLER vs Eb/N0 for all OpenNTN scenarios (urban/dense/suburban).
 
   ntn_protocol_comparison.png
       Grouped bar chart comparing all transport protocols (UDP, TCP NewReno,
       TCP CUBIC, TCP BBR, QUIC) on latency, throughput, packet loss, jitter.
-
-  ntn_summary.png
-      Five-panel summary: BER/BLER from Sionna + 3 NS-3 bar charts.
 
   ntn_link_budget_waterfall.png
       Horizontal waterfall showing per-satellite link budget breakdown.
@@ -17,16 +17,13 @@ Produces output figures for the NTN satellite simulation:
       SNR vs elevation angle with PER sigmoid overlay.
 
   ntn_latency_breakdown.png
-      Per-hop stacked latency bar chart (NTN / ISL / backhaul / overhead).
+      Per-hop stacked latency bar chart (NTN propagation + protocol overhead).
 
   ntn_handover_impact.png
       Per-slot throughput showing TCP congestion collapse vs QUIC resilience.
 
-  ntn_protocol_radar.png
-      Spider/radar chart comparing protocols on 5 performance axes.
-
-  ntn_results.png
-      Three-panel combined results summary (throughput, latency, loss).
+  ntn_handover_schedule.png
+      Gantt-style timeline of the satellite handover schedule, coloured by PER.
 
   ntn_timeseries.png
       Per-second throughput time-series with handover gap markers.
@@ -209,185 +206,77 @@ def draw_protocol_comparison(ns3_results: list,
 
 
 # =============================================================================
-# Combined summary figure
+# BER / BLER curves
 # =============================================================================
 
-def draw_summary(ber_results: dict, ns3_results: list,
-                 snr_range=None,
-                 out: str = "output/ntn_summary.png") -> str:
+def draw_ber_bler(ber_results: dict, snr_range=None,
+                  out: str = "output/ntn_ber_bler.png") -> str:
     """
-    Five-panel summary figure combining BER/BLER (Part 1) with the
-    protocol comparison bar charts (Part 2) in a single page.
+    Two-panel BER and BLER vs Eb/N0 for all simulated NTN scenarios.
 
     Parameters
     ----------
-    ber_results  : dict        Mapping scenario -> (ber_array, bler_array).
-    ns3_results  : list        Output of run_ns3_protocol_suite().
-    snr_range    : array-like  Eb/N0 values [dB] matching the ber_results
-                               arrays.  If None, inferred from the first
-                               ber array length using 0.5 dB steps from 0.
-    out          : str         Output filename.
+    ber_results : dict  Mapping scenario -> (ber_array, bler_array).
+    snr_range   : array-like  Eb/N0 [dB].  Inferred from array length if None.
+    out         : str   Output filename.
 
     Returns
     -------
     str  Path of the saved figure.
     """
-    # Derive snr_range from the actual ber arrays if not supplied.
-    if snr_range is None and ber_results:
+    if not ber_results:
+        print("[BER/BLER]  No results — skipping.")
+        return out
+
+    if snr_range is None:
         first_ber, _ = next(iter(ber_results.values()))
         n = len(first_ber)
-        snr_range = np.arange(0, n * 0.5, 0.5, dtype=float)[:n]
-    elif snr_range is None:
-        snr_range = np.arange(0, 22, 2, dtype=float)
-    else:
-        snr_range = np.asarray(snr_range, dtype=float)
+        snr_range = np.arange(0, n, dtype=float)
+    snr_range = np.asarray(snr_range, dtype=float)
+
     ber_colors = {
         "urban":       "#1f77b4",
         "dense_urban": "#d62728",
         "suburban":    "#2ca02c",
     }
 
-    if not ns3_results:
-        print("[Summary]  No NS-3 results — skipping summary figure.")
-        return out
+    fig, (ax_ber, ax_bler) = plt.subplots(1, 2, figsize=(12, 5))
+    fig.patch.set_facecolor("#f8f9fa")
+    for ax in (ax_ber, ax_bler):
+        ax.set_facecolor("#f8f9fa")
 
-    labels    = [r["label"]           for r in ns3_results]
-    latencies = [r["mean_delay_ms"]   for r in ns3_results]
-    tputs     = [r["throughput_kbps"] for r in ns3_results]
-    losses    = [r["loss_pct"]        for r in ns3_results]
-    colors    = [_proto_color(lbl, i) for i, lbl in enumerate(labels)]
-    x         = np.arange(len(labels))
-    bar_w     = 0.62
-
-    fig = plt.figure(figsize=(20, 8))
     fig.suptitle(
-        "NTN Satellite Simulation — Full Results\n"
-        f"Sionna 1.2.1 + OpenNTN (TR38.811) + Sionna RT (Munich) + NS-3\n"
-        f"LEO {SAT_HEIGHT_M/1e3:.0f} km  |  {CARRIER_FREQ_HZ/1e9:.1f} GHz  |  "
-        f"Sim {SIM_DURATION_S:.0f} s",
-        fontsize=10, y=0.99,
+        "Sionna + OpenNTN (TR38.811) — Coded BER & BLER vs Eb/N0\n"
+        f"QPSK · LDPC r=0.5 · LEO {SAT_HEIGHT_M/1e3:.0f} km · "
+        f"{CARRIER_FREQ_HZ/1e9:.1f} GHz",
+        fontsize=10,
     )
 
-    # 2 rows × 3 cols; cols 1-2 in row 1 = BER/BLER; cols 1-3 in row 2 = NS-3
-    gs = fig.add_gridspec(2, 3, hspace=0.45, wspace=0.38)
-
-    # ── BER ───────────────────────────────────────────────────────────────────
-    ax_ber = fig.add_subplot(gs[0, 0])
-    for sc, (ber, _) in ber_results.items():
-        ax_ber.semilogy(snr_range, np.clip(ber, 1e-5, 1), "o-", ms=4,
-                        label=sc.replace("_", " "),
-                        color=ber_colors.get(sc, "gray"))
-    ax_ber.set_xlabel("Eb/N0 [dB]")
-    ax_ber.set_ylabel("Coded BER")
-    ax_ber.set_title("[Sionna + OpenNTN]  Coded BER\n(QPSK LDPC r=0.5)")
-    ax_ber.legend(fontsize=8)
-    ax_ber.grid(True, which="both", alpha=0.4)
-    ax_ber.set_ylim([1e-5, 1])
-
-    # ── BLER ──────────────────────────────────────────────────────────────────
-    ax_bler = fig.add_subplot(gs[0, 1])
-    for sc, (_, bler) in ber_results.items():
+    for sc, (ber, bler) in ber_results.items():
+        col   = ber_colors.get(sc, "gray")
+        label = sc.replace("_", " ").title()
+        ax_ber.semilogy(snr_range, np.clip(ber,  1e-5, 1), "o-", ms=4,
+                        color=col, label=label)
         ax_bler.semilogy(snr_range, np.clip(bler, 1e-5, 1), "s-", ms=4,
-                         label=sc.replace("_", " "),
-                         color=ber_colors.get(sc, "gray"))
-    ax_bler.set_xlabel("Eb/N0 [dB]")
-    ax_bler.set_ylabel("BLER")
-    ax_bler.set_title("[Sionna + OpenNTN]  BLER\n(QPSK LDPC r=0.5)")
-    ax_bler.legend(fontsize=8)
-    ax_bler.grid(True, which="both", alpha=0.4)
-    ax_bler.set_ylim([1e-5, 1])
+                         color=col, label=label)
 
-    # ── NS-3 latency ──────────────────────────────────────────────────────────
-    ax_lat = fig.add_subplot(gs[1, 0])
-    bars = ax_lat.bar(x, latencies, bar_w, color=colors, edgecolor="#333",
-                      linewidth=0.8, alpha=0.88)
-    ax_lat.bar_label(bars, fmt="%.1f", fontsize=7, padding=2)
-    ax_lat.set_xticks(x); ax_lat.set_xticklabels(labels, fontsize=8)
-    ax_lat.set_ylabel("Mean Latency [ms]")
-    ax_lat.set_title("[NS-3]  Latency")
-    ax_lat.grid(axis="y", alpha=0.35)
-    ax_lat.set_ylim(0, max(latencies) * 1.3 + 1)
+    for ax, title, ylabel in [
+        (ax_ber,  "Coded BER",  "Bit Error Rate"),
+        (ax_bler, "BLER",       "Block Error Rate"),
+    ]:
+        ax.set_xlabel("Eb/N0 [dB]", fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.set_title(title, fontsize=10)
+        ax.legend(fontsize=9, framealpha=0.9)
+        ax.grid(True, which="both", alpha=0.35)
+        ax.set_ylim([1e-5, 1.2])
+        ax.set_xlim([snr_range[0], snr_range[-1]])
 
-    # ── NS-3 throughput ───────────────────────────────────────────────────────
-    ax_tput = fig.add_subplot(gs[1, 1])
-    bars = ax_tput.bar(x, tputs, bar_w, color=colors, edgecolor="#333",
-                       linewidth=0.8, alpha=0.88)
-    ax_tput.bar_label(bars, fmt="%.0f", fontsize=7, padding=2)
-    ax_tput.set_xticks(x); ax_tput.set_xticklabels(labels, fontsize=8)
-    ax_tput.set_ylabel("Throughput [kbps]")
-    ax_tput.set_title("[NS-3]  Throughput")
-    ax_tput.grid(axis="y", alpha=0.35)
-    ax_tput.set_ylim(0, max(tputs) * 1.3 + 1)
-
-    # ── NS-3 loss ─────────────────────────────────────────────────────────────
-    ax_loss = fig.add_subplot(gs[1, 2])
-    bars = ax_loss.bar(x, losses, bar_w, color=colors, edgecolor="#333",
-                       linewidth=0.8, alpha=0.88)
-    ax_loss.bar_label(bars, fmt="%.2f%%", fontsize=7, padding=2)
-    ax_loss.set_xticks(x); ax_loss.set_xticklabels(labels, fontsize=8)
-    ax_loss.set_ylabel("Packet Loss [%]")
-    ax_loss.set_title("[NS-3]  Packet Loss")
-    ax_loss.grid(axis="y", alpha=0.35)
-    ax_loss.set_ylim(0, max(losses) * 1.35 + 0.1)
-
-    # ── Blank top-right cell: insert a mini topology sketch ──────────────────
-    ax_topo = fig.add_subplot(gs[0, 2])
-    ax_topo.axis("off")
-    _mini_topology(ax_topo)
-
+    plt.tight_layout()
     plt.savefig(out, dpi=150, bbox_inches="tight")
-    print(f"[Summary]  Saved -> {out}")
+    print(f"[BER/BLER]  Saved -> {out}")
     plt.close()
     return out
-
-
-def _mini_topology(ax) -> None:
-    """
-    Draw a compact inline topology sketch into a pre-existing axes.
-    Used by draw_summary() for the top-right panel.
-
-    Topology (direct mode):
-      UE → AccessSat → ISL → BenchmarkSat → Internet Server
-    """
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, 5)
-    ax.set_title("Topology sketch", fontsize=8)
-
-    # Nodes
-    def _box(cx, cy, label, sub="", fc="#dce9f7"):
-        b = FancyBboxPatch((cx - 1.1, cy - 0.35), 2.2, 0.7,
-                           boxstyle="round,pad=0.05",
-                           facecolor=fc, edgecolor="#555", lw=0.8, zorder=3)
-        ax.add_patch(b)
-        ax.text(cx, cy + (0.06 if sub else 0), label,
-                ha="center", va="center", fontsize=6.5, fontweight="bold",
-                color="black", zorder=4)
-        if sub:
-            ax.text(cx, cy - 0.14, sub,
-                    ha="center", va="center", fontsize=5.5, color="#555",
-                    zorder=4)
-
-    _box(2,   4.2, "AccessSat",  "~75°",        fc="#cce5ff")
-    _box(7,   4.2, "BenchSat",   "~90° (ISL)",  fc="#cce5ff")
-    _box(1.5, 2,   "UE",         "street-level", fc="#d4edda")
-    _box(9,   2,   "Server",     "internet",     fc="#f8d7da")
-
-    # Arrows
-    def _arr(x1, y1, x2, y2, col="#333", ls="-", lw=1):
-        ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
-                    arrowprops=dict(arrowstyle="-|>", color=col,
-                                    lw=lw, linestyle=ls), zorder=2)
-
-    _arr(1.5, 2.35, 2,   3.85, col="#0056b3", lw=1.5)  # UE → AccessSat (NTN)
-    _arr(3.1, 4.2,  5.9, 4.2,  col="#856404", lw=1.2)  # AccessSat → BenchSat (ISL)
-    _arr(7,   3.85, 9,   2.35, col="#155724", lw=1.0)  # BenchSat → Server
-
-    ax.text(1.0, 3.3, "NTN svc\nlink", ha="center", fontsize=5.5,
-            color="#0056b3")
-    ax.text(4.5, 4.5, "ISL", ha="center", fontsize=5.5,
-            color="#856404")
-    ax.text(8.4, 3.2, "direct\nIP", ha="center", fontsize=5.5,
-            color="#155724")
 
 
 # =============================================================================
@@ -811,22 +700,21 @@ def draw_handover_impact(ns3_results: list,
 
 
 # =============================================================================
-# 5. Protocol radar chart
+# 5. Handover schedule timeline (Gantt)
 # =============================================================================
 
-def draw_protocol_radar(ns3_results: list,
-                         out: str = "output/ntn_protocol_radar.png") -> str:
+def draw_handover_schedule(ns3_results: list,
+                            out: str = "output/ntn_handover_schedule.png") -> str:
     """
-    Radar / spider chart comparing all protocols on 5 axes:
-      1. Throughput            (higher = better)
-      2. Low Latency           (lower measured latency = better)
-      3. Reliability           (lower loss = better)
-      4. Handover Resilience   (expert-assigned, RFC-based)
-      5. Spectral Efficiency   (throughput / link rate, normalised)
+    Gantt-style chart of the satellite handover schedule.
+
+    Each row = one satellite service slot, coloured by PER.
+    Green = low PER (good link), red = high PER (near-dead link).
+    Handover interruption gaps are shown as grey shaded regions.
 
     Parameters
     ----------
-    ns3_results : list[dict]  Output of run_ns3_protocol_suite().
+    ns3_results : list[dict]  NS-3 results (uses the schedule from the first entry).
     out : str  Output filename.
 
     Returns
@@ -834,149 +722,79 @@ def draw_protocol_radar(ns3_results: list,
     str  Path of the saved figure.
     """
     if not ns3_results:
-        print("[Radar]  No results — skipping.")
+        print("[HOSchedule]  No results — skipping.")
         return out
 
-    axes_labels = [
-        "Throughput", "Low Latency", "Reliability",
-        "H/O Resilience", "Spectral\nEfficiency",
-    ]
-    N = len(axes_labels)
-    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
-    angles += angles[:1]   # close the polygon
+    schedule = ns3_results[0].get("schedule", [])
+    if not schedule:
+        print("[HOSchedule]  No handover schedule found — skipping.")
+        return out
 
-    # Normalise metric to [0, 1] where 1 = best
-    def _norm(vals, higher_is_better=True):
-        arr = np.array(vals, dtype=float)
-        mn, mx = arr.min(), arr.max()
-        if mx == mn:
-            return np.full_like(arr, 0.5)
-        normed = (arr - mn) / (mx - mn)
-        return normed if higher_is_better else 1.0 - normed
+    import matplotlib.colors as mcolors
+    cmap = plt.cm.RdYlGn_r   # green=0 PER, red=1 PER
 
-    # Fixed handover resilience scores (expert-assigned, RFC-based)
-    HO_RESILIENCE = {
-        "UDP":         0.90,   # stateless — not affected
-        "TCP NewReno": 0.30,   # cwnd→1, slow recovery
-        "TCP CUBIC":   0.40,   # slightly faster than NewReno
-        "TCP BBR":     0.65,   # BBR does not collapse on loss
-        "QUIC":        0.85,   # PATH_CHALLENGE, preserves ssthresh
-    }
+    fig, ax = plt.subplots(figsize=(13, max(3.5, len(schedule) * 0.65 + 1.5)))
+    fig.patch.set_facecolor("#f8f9fa")
+    ax.set_facecolor("#f8f9fa")
 
-    labels = [r["label"] for r in ns3_results]
+    for row_idx, slot in enumerate(schedule):
+        t0   = slot["t_start"]
+        t1   = slot["t_end"]
+        per  = slot["per"]
+        gap  = slot["interruption_ms"] / 1000.0
+        elev = slot["elev_deg"]
+        sid  = slot["sat_id"]
 
-    tput_n = _norm([r["throughput_kbps"] for r in ns3_results])
-    lat_n  = _norm([r["mean_delay_ms"]   for r in ns3_results], higher_is_better=False)
-    rel_n  = _norm([r["loss_pct"]        for r in ns3_results], higher_is_better=False)
-    ho_n   = np.array([HO_RESILIENCE.get(lbl, 0.5) for lbl in labels])
-    spec_n = tput_n   # spectral efficiency ∝ throughput at fixed link rate
+        color = cmap(per)
 
-    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(polar=True))
-    fig.suptitle(
-        "Protocol Performance Radar — 5G-NTN Satellite Link\n"
-        f"LEO {SAT_HEIGHT_M/1e3:.0f} km  |  {CARRIER_FREQ_HZ/1e9:.1f} GHz",
+        # Service bar
+        ax.barh(row_idx, t1 - t0, left=t0, height=0.6,
+                color=color, edgecolor="#444", linewidth=0.7, alpha=0.9)
+
+        # Label inside bar
+        mid = (t0 + t1) / 2
+        ax.text(mid, row_idx, f"Sat {sid}\n{elev:.0f}°  PER={per:.3f}",
+                ha="center", va="center", fontsize=7.5,
+                color="white" if per > 0.5 else "#111",
+                fontweight="bold")
+
+        # Handover gap (grey shading before this slot starts)
+        if gap > 0:
+            ax.barh(row_idx, gap, left=t0 - gap, height=0.6,
+                    color="#aaa", edgecolor="#777", linewidth=0.5,
+                    alpha=0.6, hatch="///")
+            ax.text(t0 - gap / 2, row_idx - 0.38, f"{gap*1e3:.0f} ms gap",
+                    ha="center", va="top", fontsize=6.5, color="#555")
+
+    ax.set_yticks(range(len(schedule)))
+    ax.set_yticklabels([f"Slot {i}" for i in range(len(schedule))], fontsize=8)
+    ax.set_xlabel("Simulation Time [s]", fontsize=10)
+    ax.set_xlim(0, SIM_DURATION_S)
+    ax.set_ylim(-0.6, len(schedule) - 0.4)
+    ax.invert_yaxis()
+    ax.grid(axis="x", alpha=0.3)
+
+    # Colour bar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(0, 1))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, orientation="vertical", shrink=0.7, pad=0.01)
+    cbar.set_label("Packet Error Rate", fontsize=9)
+
+    ax.set_title(
+        "Satellite Handover Schedule — 5G-NTN LEO Pass\n"
+        "Colour = PER  |  Grey hatching = beam interruption gap",
         fontsize=10,
     )
 
-    ax.set_theta_offset(np.pi / 2)
-    ax.set_theta_direction(-1)
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(axes_labels, fontsize=9)
-    ax.set_ylim(0, 1)
-    ax.set_yticks([0.25, 0.5, 0.75, 1.0])
-    ax.set_yticklabels(["25%", "50%", "75%", "100%"], fontsize=6.5, color="#666")
-    ax.grid(True, alpha=0.4)
-
-    for i, lbl in enumerate(labels):
-        sc = (tput_n[i], lat_n[i], rel_n[i], ho_n[i], spec_n[i])
-        values = list(sc) + [sc[0]]
-        col = _proto_color(lbl, i)
-        ax.plot(angles, values, linewidth=2.0, color=col, label=lbl)
-        ax.fill(angles, values, alpha=0.10, color=col)
-
-    ax.legend(loc="upper right", bbox_to_anchor=(1.35, 1.15),
-              fontsize=9, framealpha=0.9)
-
     plt.tight_layout()
     plt.savefig(out, dpi=150, bbox_inches="tight")
-    print(f"[Radar]  Saved -> {out}")
+    print(f"[HOSchedule]  Saved -> {out}")
     plt.close()
     return out
 
 
 # =============================================================================
-# 6. Combined results summary
-# =============================================================================
-
-def draw_combined_results(ns3_results: list,
-                           out: str = "output/ntn_results.png") -> str:
-    """
-    Three-panel combined results summary: throughput, latency, and loss
-    for all protocols from the NS-3 simulation.
-
-    Parameters
-    ----------
-    ns3_results : list[dict]  Output of run_ns3_protocol_suite().
-    out : str  Output filename.
-
-    Returns
-    -------
-    str  Path of the saved figure.
-    """
-    if not ns3_results:
-        print("[CombinedResults]  No results — skipping.")
-        return out
-
-    labels = [r["label"] for r in ns3_results]
-    n      = len(labels)
-    x      = np.arange(n)
-    w      = 0.62
-    colors = [_proto_color(lbl, i) for i, lbl in enumerate(labels)]
-
-    metrics = [
-        ("throughput_kbps", "Throughput [kbps]", "%.0f"),
-        ("mean_delay_ms",   "Mean Latency [ms]", "%.1f"),
-        ("loss_pct",        "Packet Loss [%]",   "%.2f%%"),
-    ]
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle(
-        "NTN Satellite Simulation — Combined Results\n"
-        f"Sionna RT (Munich) + NS-3  |  LEO {SAT_HEIGHT_M/1e3:.0f} km  |  "
-        f"{CARRIER_FREQ_HZ/1e9:.1f} GHz  |  Sim {SIM_DURATION_S:.0f} s",
-        fontsize=10, y=1.01,
-    )
-
-    for ax, (key, ylabel, fmt) in zip(axes, metrics):
-        vals  = [r[key] for r in ns3_results]
-        bars  = ax.bar(x, vals, w, color=colors, edgecolor="#333",
-                       linewidth=0.8, alpha=0.88)
-        ax.bar_label(bars, fmt=fmt, fontsize=8, padding=2)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=9, rotation=12, ha="right")
-        ax.set_ylabel(ylabel)
-        ax.set_title(ylabel.split("[")[0].strip())
-        ax.grid(axis="y", alpha=0.35)
-        top = max(vals) * 1.3 + 0.1
-        ax.set_ylim(0, top)
-
-    # Shared legend
-    legend_patches = [
-        mpatches.Patch(facecolor=_proto_color(lbl, i), edgecolor="#333", label=lbl)
-        for i, lbl in enumerate(labels)
-    ]
-    fig.legend(handles=legend_patches, loc="lower center",
-               ncol=n, fontsize=9, bbox_to_anchor=(0.5, -0.06), framealpha=0.9)
-
-    plt.tight_layout(rect=[0, 0.05, 1, 0.97])
-    plt.savefig(out, dpi=150, bbox_inches="tight")
-    print(f"[CombinedResults]  Saved -> {out}")
-    plt.close()
-    return out
-
-
-# =============================================================================
-# 7. Per-second throughput time-series
+# 6. Per-second throughput time-series
 # =============================================================================
 
 def draw_timeseries(ns3_results: list,

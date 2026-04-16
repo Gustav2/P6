@@ -1127,10 +1127,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         d_s    = fs.delaySum.GetSeconds()
         j_s    = fs.jitterSum.GetSeconds()
         b      = int(fs.rxBytes)
-        active_dur = max(
-            fs.timeLastRxPacket.GetSeconds() - fs.timeFirstRxPacket.GetSeconds(),
-            1e-9)
-        flow_tput = b * 8.0 / active_dur / 1e3  # kbps for this flow
+        flow_tput = b * 8.0 / active_s / 1e3  # kbps; fixed denominator → correct Jain's index
 
         total_rx   += rx_n
         total_tx   += tx_n

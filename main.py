@@ -105,14 +105,13 @@ from ntn_phy          import run_sionna_ber
 from rt_sim           import run_ray_tracing
 from ntn_ns3          import run_ns3_both_topologies
 from topology_diagram import (
+    draw_ber_bler,
     draw_protocol_comparison,
-    draw_summary,
     draw_link_budget_waterfall,
     draw_snr_vs_elevation,
     draw_latency_breakdown,
     draw_handover_impact,
-    draw_protocol_radar,
-    draw_combined_results,
+    draw_handover_schedule,
     draw_timeseries,
     draw_fairness,
     draw_profile_breakdown,
@@ -303,52 +302,48 @@ def main() -> None:
     print("  Plots")
     print("─" * 70)
 
-    draw_protocol_comparison(direct_results, out="output/ntn_protocol_comparison.png")
-    print("  [1/8]  output/ntn_protocol_comparison.png")
+    draw_ber_bler(ber_results, snr_range=snr_range, out="output/ntn_ber_bler.png")
+    print("  [1/10] output/ntn_ber_bler.png")
 
-    draw_summary(ber_results, direct_results, snr_range=snr_range, out="output/ntn_summary.png")
-    print("  [2/8]  output/ntn_summary.png")
+    draw_protocol_comparison(direct_results, out="output/ntn_protocol_comparison.png")
+    print("  [2/10] output/ntn_protocol_comparison.png")
 
     draw_link_budget_waterfall(channel_stats, out="output/ntn_link_budget_waterfall.png")
-    print("  [3/8]  output/ntn_link_budget_waterfall.png")
+    print("  [3/10] output/ntn_link_budget_waterfall.png")
 
     draw_snr_vs_elevation(channel_stats, out="output/ntn_snr_vs_elevation.png")
-    print("  [4/8]  output/ntn_snr_vs_elevation.png")
+    print("  [4/10] output/ntn_snr_vs_elevation.png")
 
     draw_latency_breakdown(direct_results, out="output/ntn_latency_breakdown.png")
-    print("  [5/8]  output/ntn_latency_breakdown.png")
+    print("  [5/10] output/ntn_latency_breakdown.png")
 
     draw_handover_impact(direct_results, out="output/ntn_handover_impact.png")
-    print("  [6/8]  output/ntn_handover_impact.png")
+    print("  [6/10] output/ntn_handover_impact.png")
 
-    draw_protocol_radar(direct_results, out="output/ntn_protocol_radar.png")
-    print("  [7/8]  output/ntn_protocol_radar.png")
-
-    draw_combined_results(direct_results, out="output/ntn_results.png")
-    print("  [8/8]  output/ntn_results.png")
+    draw_handover_schedule(direct_results, out="output/ntn_handover_schedule.png")
+    print("  [7/10] output/ntn_handover_schedule.png")
 
     draw_timeseries(direct_results, out="output/ntn_timeseries.png")
-    print("  [9/11] output/ntn_timeseries.png")
+    print("  [8/10] output/ntn_timeseries.png")
 
     draw_fairness(direct_results, out="output/ntn_fairness.png")
-    print("  [10/11] output/ntn_fairness.png")
+    print("  [9/10] output/ntn_fairness.png")
 
     draw_profile_breakdown(direct_results, out="output/ntn_profile_breakdown.png")
-    print("  [11/11] output/ntn_profile_breakdown.png")
+    print("  [10/10] output/ntn_profile_breakdown.png")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("  Simulation complete.")
     print()
     print("  Output files (output/ subdirectory):")
+    print("    output/ntn_ber_bler.png               — BER/BLER vs Eb/N0 (Sionna + OpenNTN)")
     print("    output/ntn_protocol_comparison.png    — 4-panel protocol comparison")
-    print("    output/ntn_summary.png                — BER/BLER + NS-3 combined figure")
     print("    output/ntn_link_budget_waterfall.png  — per-satellite link budget waterfall")
     print("    output/ntn_snr_vs_elevation.png       — SNR vs elevation + PER sigmoid")
-    print("    output/ntn_latency_breakdown.png      — per-hop stacked latency bars (NTN + overhead)")
+    print("    output/ntn_latency_breakdown.png      — per-hop latency breakdown (NTN + overhead)")
     print("    output/ntn_handover_impact.png        — per-slot throughput bars")
-    print("    output/ntn_protocol_radar.png         — 5-axis radar chart")
-    print("    output/ntn_results.png                — 3-panel combined summary")
+    print("    output/ntn_handover_schedule.png      — Gantt timeline of satellite service slots")
     print("    output/ntn_timeseries.png             — per-second throughput with HO gap markers")
     print("    output/ntn_fairness.png               — Jain's fairness index per protocol")
     print("    output/ntn_profile_breakdown.png      — throughput/loss by traffic profile")
