@@ -1,3 +1,6 @@
 sionna
 matplotlib
 ns
+# Jetson-specific TF build with CUDA support (JetPack 6.1+, CUDA 12.6, cuDNN 9)
+# Install with: pip install --extra-index-url https://developer.download.nvidia.com/compute/redist/jp/v61 tensorflow==2.16.1+nv24.8
+tensorflow==2.16.1+nv24.8
