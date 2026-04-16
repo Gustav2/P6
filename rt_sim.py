@@ -47,18 +47,16 @@ Returns
 import math
 import numpy as np
 
-# All Mitsuba 3 CUDA variants require OptiX (libnvoptix.so.1).
-# Jetson Orin has CUDA but NOT OptiX — it is an embedded/integrated GPU that
-# lacks the dedicated RT hardware and driver library OptiX needs.
-# Detect OptiX availability at import time via ctypes; fall back to the LLVM
-# (multi-threaded CPU JIT) variant when OptiX is absent.
+# Mitsuba's cuda_ad_mono_polarized variant requires OptiX for scene/BVH work.
+# Check for libnvoptix before committing to the CUDA variant; fall back to the
+# LLVM JIT variant (CPU) when OptiX is absent (e.g. Jetson Orin without OptiX).
 import ctypes.util as _ctypes_util
 import mitsuba as mi
 if mi.variant() is None:
     if _ctypes_util.find_library("nvoptix"):
-        mi.set_variant("cuda_ad_mono_polarized")   # discrete RTX GPU with OptiX
+        mi.set_variant("cuda_ad_mono_polarized")
     else:
-        mi.set_variant("llvm_ad_mono_polarized")   # CPU JIT (Jetson Orin path)
+        mi.set_variant("llvm_ad_mono_polarized")
 
 import sionna
 import sionna.rt

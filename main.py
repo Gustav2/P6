@@ -47,6 +47,7 @@ All PNG output files are written to the output/ subdirectory.
 import hashlib
 import os
 import pickle
+import time
 import numpy as np
 
 OUTPUT_DIR = "output"
@@ -56,16 +57,16 @@ matplotlib.use("Agg")
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-# All Mitsuba 3 CUDA variants require OptiX (libnvoptix.so.1).
-# Jetson Orin has CUDA but NOT OptiX (embedded GPU, no RTX hardware).
-# Detect OptiX availability via ctypes; use LLVM JIT on Jetson.
+# Mitsuba's cuda_ad_mono_polarized variant requires OptiX for scene/BVH work.
+# Check for libnvoptix before committing to the CUDA variant; fall back to the
+# LLVM JIT variant (CPU) when OptiX is absent (e.g. Jetson Orin without OptiX).
 import ctypes.util as _ctypes_util
 import mitsuba as mi
 if mi.variant() is None:
     if _ctypes_util.find_library("nvoptix"):
-        mi.set_variant("cuda_ad_mono_polarized")   # discrete RTX GPU with OptiX
+        mi.set_variant("cuda_ad_mono_polarized")
     else:
-        mi.set_variant("llvm_ad_mono_polarized")   # LLVM JIT (Jetson Orin path)
+        mi.set_variant("llvm_ad_mono_polarized")
 
 import tensorflow as tf
 tf.get_logger().setLevel("ERROR")
@@ -115,6 +116,7 @@ from topology_diagram import (
     draw_timeseries,
     draw_fairness,
     draw_profile_breakdown,
+    draw_timing_breakdown,
 )
 
 
@@ -169,6 +171,9 @@ def main() -> None:
     print(f"  TF threads      : {_n_cores} cores")
     print("=" * 70)
 
+    t_start = time.perf_counter()
+    timing  = {}   # stage → elapsed seconds
+
     # ── Part 1: PHY layer BER/BLER ────────────────────────────────────────────
     print("\n" + "─" * 70)
     print("  Part 1 — PHY layer BER/BLER  (Sionna + OpenNTN)")
@@ -178,12 +183,14 @@ def main() -> None:
     # and 2× faster than the original 0.5 dB grid (41 points).
     snr_range   = np.arange(0, 21.0, 1.0, dtype=float)
 
+    t0 = time.perf_counter()
     cached_phy, cache_path = _load_phy_cache()
     if cached_phy is not None:
         ber_results = cached_phy
         print(f"  [PHY cache hit]  Loaded from {cache_path}  (delete to re-run)")
         for sc, (ber, bler) in ber_results.items():
             print(f"  [{sc}]  BER @ 10 dB = {ber[20]:.4f}  BLER @ 10 dB = {bler[20]:.4f}")
+        timing["PHY (cached)"] = time.perf_counter() - t0
     else:
         ber_results = {}
         for sc in ["urban", "dense_urban", "suburban"]:
@@ -192,6 +199,7 @@ def main() -> None:
             print(f"  [{sc}]  BER @ 10 dB = {ber[20]:.4f}  BLER @ 10 dB = {bler[20]:.4f}")
         _save_phy_cache(ber_results)
         print(f"  [PHY cache saved]  {cache_path}")
+        timing["PHY (Sionna)"] = time.perf_counter() - t0
 
     # ── Sigmoid fitting (using "urban" scenario BLER curve) ──────────────────
     # Fit sigmoid(snr, thresh, slope) = 1 / (1 + exp(slope*(snr - thresh)))
@@ -264,7 +272,9 @@ def main() -> None:
     print("  Part 2 — Ray tracing  (Sionna RT, Munich scene)")
     print("─" * 70)
 
+    t0 = time.perf_counter()
     channel_stats = run_ray_tracing()
+    timing["RT (Sionna RT)"] = time.perf_counter() - t0
 
     print(f"\n  Channel stats ({len(channel_stats)} satellites):")
     for s in channel_stats:
@@ -291,17 +301,20 @@ def main() -> None:
     print(f"  RT UEs   : {len(RT_UE_SAMPLE_POSITIONS)} sample points")
     print("─" * 70)
 
+    t0 = time.perf_counter()
     direct_results, _ = run_ns3_both_topologies(
         channel_stats, scenario="urban",
         snr_thresh_db=fitted_snr_thresh,
         sigmoid_slope=fitted_sigmoid_slope,
     )
+    timing["NS-3 (4 protocols)"] = time.perf_counter() - t0
 
     # ── Plots ─────────────────────────────────────────────────────────────────
     print("\n" + "─" * 70)
     print("  Plots")
     print("─" * 70)
 
+    t0 = time.perf_counter()
     draw_ber_bler(ber_results, snr_range=snr_range, out="output/ntn_ber_bler.png")
     print("  [1/10] output/ntn_ber_bler.png")
 
@@ -331,6 +344,11 @@ def main() -> None:
 
     draw_profile_breakdown(direct_results, out="output/ntn_profile_breakdown.png")
     print("  [10/10] output/ntn_profile_breakdown.png")
+    timing["Plotting"] = time.perf_counter() - t0
+    timing["Total"] = time.perf_counter() - t_start
+
+    draw_timing_breakdown(timing, mi.variant(), out="output/ntn_timing.png")
+    print("  [+]   output/ntn_timing.png")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
@@ -347,9 +365,17 @@ def main() -> None:
     print("    output/ntn_timeseries.png             — per-second throughput with HO gap markers")
     print("    output/ntn_fairness.png               — Jain's fairness index per protocol")
     print("    output/ntn_profile_breakdown.png      — throughput/loss by traffic profile")
+    print("    output/ntn_timing.png                 — stage-by-stage runtime breakdown")
     print("    output/ntn_rt_paths_sat<N>.png        — RT paths per satellite")
     print("    output/ntn_rt_radiomap.png            — composite radio map")
     print("=" * 70)
+
+    print()
+    print("  Runtime breakdown:")
+    for stage, t in timing.items():
+        if stage != "Total":
+            print(f"    {stage:<22s}: {t:6.1f} s")
+    print(f"  {'Total':<22s}: {timing['Total']:6.1f} s")
 
     # ── Protocol results table ────────────────────────────────────────────────
     print()
