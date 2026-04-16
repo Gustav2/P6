@@ -25,33 +25,15 @@ Simulates the end-to-end NTN network including:
   * Jain's fairness index — computed across per-flow throughput values
     after FlowMonitor collection.
 
-Topologies
-----------
+Topology
+--------
 
-  Direct (4 nodes):
+  Direct (3 nodes):
     Phone (UE)
        │  5G-NR NTN service link  (550 km LEO, RT-calibrated PER, PHONE_EIRP)
        ▼
     Satellite [moving]     ← handover when elevation < SAT_HANDOVER_ELEVATION_DEG
-       │  ISL  (1 Gbps, 5 ms)
-       ▼
-    Benchmark Satellite
-       │  Direct IP link  (1 Gbps, 10 ms)
-       ▼
-    Internet Server
-
-  Indirect (5 nodes):
-    Phone (UE)
-       │  Terrestrial radio  (GNB_DATARATE, 1 ms, GNB_TERRESTRIAL_PER)
-       ▼
-    gNB (fixed antenna)
-       │  5G-NR NTN service link  (550 km LEO, RT-calibrated PER, GNB_EIRP)
-       ▼
-    Satellite [moving]
-       │  ISL  (1 Gbps, 5 ms)
-       ▼
-    Benchmark Satellite
-       │  Direct IP link  (1 Gbps, 10 ms)
+       │  Direct link  (SAT_SERVER_DATARATE, 1 ms, lossless)
        ▼
     Internet Server
 
@@ -156,7 +138,6 @@ from config import (
     TCP_TIMESTAMPS,
     PROTOCOLS,
     PHONE_EIRP_DBM,
-    TERRESTRIAL_BACKHAUL_DELAY_MS,
     SAT_RX_ANTENNA_GAIN_DB,
     NOISE_FLOOR_DBM,
     SNR_THRESH_DB,
@@ -173,9 +154,6 @@ from config import (
     VEHICULAR_SPEED_MIN_MS,
     VEHICULAR_SPEED_MAX_MS,
     DATA_VOLUME_MB,
-    ISL_DATARATE,
-    ISL_DELAY_MS,
-    ISL_PER,
     SAT_SERVER_DATARATE,
     # Beam management
     HANDOVER_INTERRUPTION_MS_MIN,
@@ -670,22 +648,16 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     """
     Run one full NS-3 5G-NTN simulation with:
       - NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS client phones
-      - Access satellites (Sat 1 … NUM_SATELLITES-1), each connected via an
-        ISL to the benchmark satellite (Sat 0, always highest elevation)
-      - If USE_BASE_STATIONS: Phone → gNB → AccessSat → ISL → BenchmarkSat → Server
-        Otherwise:            Phone → AccessSat → ISL → BenchmarkSat → Server
+      - One satellite node (always the highest-elevation satellite)
+      - Phone → Satellite → Server (no ISL or ground-station hops)
       - Moving clients use RandomWaypointMobilityModel
       - TCP BulkSend capped at DATA_VOLUME_MB
       - Mixed traffic profiles: streaming/gaming/texting/voice → UDP CBR,
         bulk → TCP
       - Full beam management: 3-phase link interruption gap per handover
+        (simulated via error model updates on the phone→sat link)
       - Per-second throughput time-series via PacketSink probe
       - Jain's fairness index across per-flow throughputs
-
-    The benchmark satellite (Sat 0) is the measurement node: all traffic
-    always flows through it regardless of which access satellite is currently
-    serving a client.  This keeps throughput measurements consistent across
-    handovers.
 
     Parameters
     ----------
@@ -752,35 +724,27 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         sat_id=0, interruption_ms=0.0,
     )
     print(f"  Service link delay (weighted-mean): {weighted_delay_ms:.2f} ms")
-    print(f"  ISL (access→benchmark sat):  rate={ISL_DATARATE}  "
-          f"delay={ISL_DELAY_MS} ms  PER={ISL_PER}")
-    print(f"  Sat→Server:  rate={SAT_SERVER_DATARATE}  "
-          f"delay={TERRESTRIAL_BACKHAUL_DELAY_MS:.0f} ms")
+    print(f"  Sat→Server:  rate={SAT_SERVER_DATARATE}  delay=1 ms")
 
     # =========================================================================
     # Node creation
     # =========================================================================
     # Node layout:
-    #   [0 … num_clients-1]                    : phone nodes
-    #   [num_clients]                          : benchmark satellite (Sat 0)
-    #   [num_clients+1 … num_clients+n_access] : access satellites (Sat 1…N)
-    #   [num_clients+n_access+1]               : internet server
+    #   [0 … num_clients-1] : phone nodes
+    #   [num_clients]        : satellite (highest-elevation)
+    #   [num_clients+1]      : internet server
 
-    n_access_sats = max(1, len(schedule) - 1)
-
-    bench_idx   = num_clients
-    access_idx  = lambda i: bench_idx + 1 + i
-    server_idx  = bench_idx + 1 + n_access_sats
-    total_nodes = server_idx + 1
+    sat_idx    = num_clients
+    server_idx = num_clients + 1
+    total_nodes = num_clients + 2
 
     nodes = ns.NodeContainer()
     nodes.Create(total_nodes)
     ns.InternetStackHelper().Install(nodes)
 
-    phones   = [nodes.Get(i)            for i in range(num_clients)]
-    bench    = nodes.Get(bench_idx)
-    accesses = [nodes.Get(access_idx(i)) for i in range(n_access_sats)]
-    server   = nodes.Get(server_idx)
+    phones  = [nodes.Get(i) for i in range(num_clients)]
+    sat     = nodes.Get(sat_idx)
+    server  = nodes.Get(server_idx)
 
     p2p = ns.PointToPointHelper()
 
@@ -846,18 +810,11 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         phones[i].AggregateObject(rwp_mob)
         rwp_mob.SetPosition(ns.Vector(px, py, pz))
 
-    # ── Satellite mobility: benchmark at zenith, access sats in orbit ─────────
-    sat_mob_b = ns.CreateObject[ns.ConstantVelocityMobilityModel]()
-    bench.AggregateObject(sat_mob_b)
-    sat_mob_b.SetPosition(ns.Vector(0.0, 0.0, SAT_HEIGHT_M))
-    sat_mob_b.SetVelocity(ns.Vector(SAT_ORBITAL_VELOCITY_MS, 0.0, 0.0))
-
-    for i, acc in enumerate(accesses):
-        sat_mob_a = ns.CreateObject[ns.ConstantVelocityMobilityModel]()
-        acc.AggregateObject(sat_mob_a)
-        offset = (i + 1) * 144_000.0   # ~144 km spacing at 550 km
-        sat_mob_a.SetPosition(ns.Vector(offset, 0.0, SAT_HEIGHT_M))
-        sat_mob_a.SetVelocity(ns.Vector(SAT_ORBITAL_VELOCITY_MS, 0.0, 0.0))
+    # ── Satellite mobility ─────────────────────────────────────────────────────
+    sat_mob = ns.CreateObject[ns.ConstantVelocityMobilityModel]()
+    sat.AggregateObject(sat_mob)
+    sat_mob.SetPosition(ns.Vector(0.0, 0.0, SAT_HEIGHT_M))
+    sat_mob.SetVelocity(ns.Vector(SAT_ORBITAL_VELOCITY_MS, 0.0, 0.0))
 
     # ── IP address allocator ──────────────────────────────────────────────────
     ipv4 = ns.Ipv4AddressHelper()
@@ -877,12 +834,12 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     em_svc_list   = []   # service-link RateErrorModel per phone
     devs_svc_list = []   # service-link DeviceContainer per phone
 
-    # ── Phone → access satellite 0 (direct NTN hop, 10 Mbps) ─────────────────
+    # ── Phone → satellite (direct NTN hop, 10 Mbps) ───────────────────────────
     p2p.SetDeviceAttribute("DataRate", ns.StringValue("10Mbps"))
     p2p.SetChannelAttribute("Delay",
         ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
     for i in range(num_clients):
-        devs_svc = p2p.Install(_nc2(phones[i], accesses[0]))
+        devs_svc = p2p.Install(_nc2(phones[i], sat))
         em = ns.CreateObject[ns.RateErrorModel]()
         em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
         em.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
@@ -893,27 +850,10 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
                      ns.Ipv4Mask("255.255.255.0"))
         ipv4.Assign(devs_svc)
 
-    # ── Access satellite(s) → Benchmark satellite (ISL) ──────────────────────
-    p2p.SetDeviceAttribute("DataRate", ns.StringValue(ISL_DATARATE))
-    p2p.SetChannelAttribute("Delay",   ns.StringValue(f"{ISL_DELAY_MS:.3f}ms"))
-    em_isl_list = []
-    for acc in accesses:
-        devs_isl = p2p.Install(_nc2(acc, bench))
-        em_isl = ns.CreateObject[ns.RateErrorModel]()
-        em_isl.SetAttribute("ErrorRate", ns.DoubleValue(ISL_PER))
-        em_isl.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-        devs_isl.Get(1).SetAttribute("ReceiveErrorModel",
-                                      ns.PointerValue(em_isl))
-        em_isl_list.append(em_isl)
-        ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
-                     ns.Ipv4Mask("255.255.255.0"))
-        ipv4.Assign(devs_isl)
-
-    # ── Benchmark satellite → Internet Server (direct link) ───────────────────
+    # ── Satellite → Internet Server (lossless direct link) ────────────────────
     p2p.SetDeviceAttribute("DataRate",  ns.StringValue(SAT_SERVER_DATARATE))
-    p2p.SetChannelAttribute("Delay",
-        ns.StringValue(f"{TERRESTRIAL_BACKHAUL_DELAY_MS:.0f}ms"))
-    devs_srv = p2p.Install(_nc2(bench, server))
+    p2p.SetChannelAttribute("Delay",    ns.StringValue("1ms"))
+    devs_srv = p2p.Install(_nc2(sat, server))
     ipv4.SetBase(ns.Ipv4Address(_next_subnet()), ns.Ipv4Mask("255.255.255.0"))
     iface_srv = ipv4.Assign(devs_srv)
 

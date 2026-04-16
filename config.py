@@ -457,23 +457,6 @@ Phone (UE) uplink EIRP [dBm] for the direct Phone→Satellite service link.
 Source: [3GPP-38.101-1] §6.2.2, Table 6.2.2-1 (UE Power Class 3 = 23 dBm).
 """
 
-TERRESTRIAL_BACKHAUL_DELAY_MS = 10.0
-"""
-One-way latency of the Benchmark Satellite → Internet Server link [ms].
-
-- 10 ms is representative of the internet backbone latency from wherever
-  the satellite constellation terminates into the public internet to a
-  regional data centre / Internet Exchange Point (IXP).
-- Derivation: typical backbone fibre propagation velocity ≈ 0.67 c
-  (200 000 km/s); a 2 000 km satellite PoP-to-IXP route gives
-  ~10 ms one-way delay.
-- Sources:
-    Singla et al., "Middleboxes as a Cloud Service" (HotNets 2014): measured
-      fibre latency ≈ 5 µs/km for terrestrial routes.
-    Akamai State of the Internet Q4 2022: regional CDN RTTs 15–30 ms imply
-      one-way backhaul of 7–15 ms for metro distances.
-"""
-
 SAT_RX_ANTENNA_GAIN_DB = 30.0
 """
 Satellite receive antenna gain [dBi] applied to the uplink link budget.
@@ -493,17 +476,16 @@ Source: [3GPP-38.821] §6.1, Table 6.1.1-1 (satellite Rx antenna gain
 
 SAT_SERVER_DATARATE = "1Gbps"
 """
-Data rate of the benchmark satellite → Internet Server direct link [NS-3 string].
+Data rate of the satellite → Internet Server direct link [NS-3 string].
 
-The benchmark satellite connects directly to the internet server — there
-is no ground station node in the simulated topology.  This link represents
-the satellite's direct IP peering into the public internet backbone via
-ISL-connected gateway nodes or a cloud PoP (Point of Presence).
+The satellite connects directly to the internet server; there are no
+ISL or ground-station hops in the simulated topology.  This link
+represents the satellite's direct IP peering into the public internet
+backbone (e.g. via a cloud PoP).
 
-- 1 Gbps is achievable via high-throughput satellite transponders or
-  optical inter-satellite links terminating at internet exchange points.
+- 1 Gbps is achievable via high-throughput satellite transponders.
 - This link should never be the bottleneck; the service link (10 Mbps)
-  and ISL are the limiting hops.
+  is the limiting hop.
 """
 
 # =============================================================================
@@ -690,50 +672,6 @@ saturating the link for the full SIM_DURATION_S.
 - Set to 0 to disable the cap (unlimited BulkSend, saturating sender).
 
 UDP OnOff flows are not capped by this value (they use APP_DATA_RATE).
-"""
-
-# =============================================================================
-# Inter-satellite link (ISL) parameters
-# =============================================================================
-
-ISL_DATARATE = "1Gbps"
-"""
-Data rate of the inter-satellite link between an access satellite and the
-benchmark satellite (Sat 0) [NS-3 string].
-
-- 1 Gbps is achievable with a space-borne optical (laser) ISL.
-  Starlink Gen-2 optical ISLs are rated at ~1–10 Gbps per link.
-- The ISL is the highest-capacity link in the chain; it should never be
-  the bottleneck.  The bottleneck is the ground service link (10 Mbps).
-Source: Bhattacherjee & Singla, "Network topology design at 27,000 km/hour"
-        (CoNEXT 2019) — laser ISL capacity 1–10 Gbps.
-"""
-
-ISL_DELAY_MS = 5.0
-"""
-One-way propagation delay of the access → benchmark satellite ISL [ms].
-
-- At 550 km altitude with SAT_SPACING_DEG = 15°, the inter-satellite
-  distance along the orbit is approximately:
-    d ≈ 2 × (R_E + h) × sin(π × SAT_SPACING_DEG / 360)
-      = 2 × 6921 km × sin(7.5°) ≈ 1808 km
-  One-way delay = 1808 km / (3×10⁵ km/s) ≈ 6.0 ms.
-- 5.0 ms is used as a round number slightly conservative of this estimate,
-  accounting for the fact that the access satellite and benchmark satellite
-  may be separated by less than one full SAT_SPACING_DEG in practice.
-"""
-
-ISL_PER = 0.0001
-"""
-Packet error rate on the access → benchmark satellite ISL.
-
-- Optical ISLs have an intrinsically very low BER (~10⁻¹² after FEC).
-  At the packet level (1400 B = 11200 bits), PER ≈ 1 − (1−BER)^11200 ≈ 10⁻⁸.
-- 10⁻⁴ is used as a conservative engineering margin that accounts for
-  occasional pointing-acquisition losses, atmospheric scintillation at
-  low elevation, and inter-satellite link geometry changes.
-- Even at 10⁻⁴ PER, the ISL contributes negligibly to end-to-end loss
-  compared with the ground service link (PER typically 0.01–0.3).
 """
 
 # =============================================================================

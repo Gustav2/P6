@@ -628,8 +628,6 @@ def draw_latency_breakdown(ns3_results: list,
 
     Hop breakdown:
       - NTN propagation (slant range delay, one-way)
-      - ISL (access sat → benchmark sat, one-way)
-      - Backhaul (benchmark sat → internet server: TERRESTRIAL_BACKHAUL_DELAY_MS)
       - Protocol overhead (queuing, retransmission — residual from measurement)
 
     Parameters
@@ -641,7 +639,7 @@ def draw_latency_breakdown(ns3_results: list,
     -------
     str  Path of the saved figure.
     """
-    from config import SAT_HEIGHT_M, ISL_DELAY_MS, TERRESTRIAL_BACKHAUL_DELAY_MS
+    from config import SAT_HEIGHT_M
     from ntn_ns3 import _one_way_delay_ms
 
     if not ns3_results:
@@ -649,21 +647,16 @@ def draw_latency_breakdown(ns3_results: list,
         return out
 
     # Fixed hop delays (one-way, ms)
-    ntn_delay   = _one_way_delay_ms(SAT_HEIGHT_M, 60.0)  # typical 60° elevation
-    isl_ms      = float(ISL_DELAY_MS)
-    backhaul_ms = float(TERRESTRIAL_BACKHAUL_DELAY_MS)
+    ntn_delay = _one_way_delay_ms(SAT_HEIGHT_M, 60.0)  # typical 60° elevation
 
     rows = []
     for i, r in enumerate(ns3_results):
         lbl = r["label"]
-        fixed = ntn_delay + isl_ms + backhaul_ms
-        overhead = max(0.0, r["mean_delay_ms"] - fixed)
+        overhead = max(0.0, r["mean_delay_ms"] - ntn_delay)
         rows.append({
             "label":    lbl,
             "color":    _proto_color(lbl, i),
             "ntn":      ntn_delay,
-            "isl":      isl_ms,
-            "backhaul": backhaul_ms,
             "overhead": overhead,
         })
 
@@ -673,14 +666,10 @@ def draw_latency_breakdown(ns3_results: list,
 
     HOP_COLORS = {
         "ntn":      "#42A5F5",
-        "isl":      "#FFA726",
-        "backhaul": "#AB47BC",
         "overhead": "#EF5350",
     }
     HOP_LABELS = {
         "ntn":      "NTN propagation",
-        "isl":      "ISL (access→benchmark sat)",
-        "backhaul": "Backhaul (sat→internet)",
         "overhead": "Protocol overhead",
     }
 
@@ -688,7 +677,7 @@ def draw_latency_breakdown(ns3_results: list,
     fig.patch.set_facecolor("#f8f9fa")
     ax.set_facecolor("#f8f9fa")
 
-    hops = ["ntn", "isl", "backhaul", "overhead"]
+    hops = ["ntn", "overhead"]
     for hop in hops:
         lefts = np.zeros(n)
         for h in hops:
@@ -713,7 +702,7 @@ def draw_latency_breakdown(ns3_results: list,
 
     # Total latency labels
     for i, r in enumerate(rows):
-        total = r["ntn"] + r["isl"] + r["backhaul"] + r["overhead"]
+        total = r["ntn"] + r["overhead"]
         ax.text(total + 0.3, i, f"{total:.1f} ms",
                 va="center", fontsize=7.5, color="#333")
 
