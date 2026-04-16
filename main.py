@@ -102,10 +102,10 @@ from config import (
     VEHICULAR_SPEED_MAX_MS,
     RT_UE_SAMPLE_POSITIONS,
 )
-from ntn_phy          import run_sionna_ber
-from rt_sim           import run_ray_tracing
-from ntn_ns3          import run_ns3_both_topologies
-from topology_diagram import (
+from sim.phy           import run_sionna_ber
+from sim.ray_tracing   import run_ray_tracing
+from sim.ns3           import run_ns3_both_topologies
+from plots import (
     draw_ber_bler,
     draw_protocol_comparison,
     draw_link_budget_waterfall,
