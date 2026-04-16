@@ -60,24 +60,30 @@ def draw_link_budget_waterfall(channel_stats: list,
                         NOISE_FLOOR_DBM, SNR_THRESH_DB)
     from sim.ns3 import _fspl_db as _ns3_fspl_db, _rt_calibrated_per
 
+    import math as _math
     # Sort by elevation descending
     stats = sorted(channel_stats, key=lambda s: s["elevation_deg"], reverse=True)
-    ref_gain = stats[0]["mean_path_gain_db"] if stats else -150.0
+    # Use normalised gains (proxy-FSPL-corrected) for the reference — consistent
+    # with the ns3.py link budget computation.
+    valid_norm = [s.get("normalized_gain_db", float("nan")) for s in stats
+                  if not _math.isnan(s.get("normalized_gain_db", float("nan")))]
+    ref_gain = max(valid_norm) if valid_norm else float("nan")
 
     n_sats = len(stats)
 
     # Build budget stages for each sat
     def _budget(stat, eirp_dbm):
-        fspl  = _ns3_fspl_db(SAT_HEIGHT_M, max(stat["elevation_deg"], 1.0))
-        gain  = stat["mean_path_gain_db"]
-        if gain <= -150.0:
+        fspl       = _ns3_fspl_db(SAT_HEIGHT_M, max(stat["elevation_deg"], 1.0))
+        norm_gain  = stat.get("normalized_gain_db", float("nan"))
+        if _math.isnan(norm_gain):
             urban = -10.0
-        elif ref_gain > -150.0:
-            urban = gain - ref_gain
+        elif not _math.isnan(ref_gain):
+            urban = float(np.clip(norm_gain - ref_gain, -12.0, 12.0))
         else:
             urban = 0.0
         snr = eirp_dbm - fspl + urban + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM
-        per = _rt_calibrated_per(fspl, gain, None, ref_gain, eirp_dbm)
+        per = _rt_calibrated_per(fspl, norm_gain, stat.get("normalized_p10_db"),
+                                 ref_gain, None, None)
         return dict(eirp=eirp_dbm, fspl=fspl, urban=urban,
                     noise=NOISE_FLOOR_DBM, snr=snr, thresh=SNR_THRESH_DB,
                     margin=snr - SNR_THRESH_DB, per=per)

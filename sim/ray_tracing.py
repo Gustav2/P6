@@ -191,9 +191,34 @@ def _satellite_positions(ue_pos: list, height_m: float,
 # Channel statistics extraction
 # =============================================================================
 
+def _proxy_fspl_db(sat_pos: tuple, ue_pos: list) -> float:
+    """
+    Free-space path loss [dB] from the proxy satellite TX to a UE position,
+    at the scene carrier frequency.
+
+    This is used to normalise RT path gains by removing the proxy-distance
+    contribution so that the remaining 'urban correction' reflects only the
+    building-shadow / multipath effect — not an artefact of how far the proxy
+    TX happens to sit from the UE in the scene.
+
+    For example, a proxy at 1776 m from the UE naturally shows ~12 dB lower
+    raw RT gain than a proxy at 506 m at the same building-shadow level; the
+    normalisation removes this geometric bias before computing inter-satellite
+    urban corrections.
+    """
+    dx = sat_pos[0] - ue_pos[0]
+    dy = sat_pos[1] - ue_pos[1]
+    dz = sat_pos[2] - ue_pos[2]
+    d  = math.sqrt(dx * dx + dy * dy + dz * dz)
+    d  = max(d, 1.0)   # guard: avoid log(0) for degenerate positions
+    lam = 3e8 / RT_SCENE_FREQ_HZ
+    return 20.0 * math.log10(4.0 * math.pi * d / lam)
+
+
 def _extract_channel_stats(paths, sat_id: int,
                              sat_pos: tuple, elev_deg: float,
-                             rx_idx: int = 0) -> dict:
+                             rx_idx: int = 0,
+                             ue_pos: list = None) -> dict:
     """
     Compute scalar channel statistics from a Sionna RT Paths object.
 
@@ -212,11 +237,22 @@ def _extract_channel_stats(paths, sat_id: int,
                                 Paths tensors have shape
                                 [num_rx, num_rx_ant, num_tx, num_tx_ant, max_paths].
                                 Slicing by rx_idx isolates one UE's paths.
+    ue_pos   : [x, y, z]       UE position in the scene [m].  Used to compute
+                                the proxy FSPL for gain normalisation.
 
     Returns
     -------
     dict  Channel statistics (see module docstring for keys).
     """
+    if ue_pos is None:
+        ue_pos = list(RT_UE_POSITION)
+
+    # Proxy FSPL: free-space loss from the proxy TX to this UE position [dB].
+    # Subtracting this from the raw RT gain yields a 'normalised gain' that
+    # represents only the shadow-fading / multipath correction relative to
+    # free space, independent of how far the proxy sits from the UE.
+    pfspl = _proxy_fspl_db(sat_pos, ue_pos)
+
     # paths.a returns (real_tensor, imag_tensor), each shaped
     # [num_rx, num_rx_ant, num_tx, num_tx_ant, max_paths].
     # Slice receiver rx_idx and flatten the remaining antenna/tx dims.
@@ -235,14 +271,16 @@ def _extract_channel_stats(paths, sat_id: int,
     if num_paths == 0:
         # No paths resolved (e.g. satellite below horizon / blocked)
         return dict(
-            sat_id          = sat_id,
-            elevation_deg   = round(elev_deg, 1),
-            mean_path_gain_db = -200.0,   # Effectively no signal
-            delay_spread_ns = 0.0,
-            num_paths       = 0,
-            los_exists      = False,
-            sat_x_m         = sat_pos[0],
-            sat_y_m         = sat_pos[1],
+            sat_id               = sat_id,
+            elevation_deg        = round(elev_deg, 1),
+            mean_path_gain_db    = -200.0,   # Effectively no signal
+            normalized_gain_db   = float("nan"),
+            proxy_fspl_db        = round(pfspl, 2),
+            delay_spread_ns      = 0.0,
+            num_paths            = 0,
+            los_exists           = False,
+            sat_x_m              = sat_pos[0],
+            sat_y_m              = sat_pos[1],
         )
 
     # Mean channel gain: average |h|² (power), then convert to dB.
@@ -250,6 +288,13 @@ def _extract_channel_stats(paths, sat_id: int,
     # 10·log10 is unbiased; averaging amplitude then 20·log10 overestimates.
     mean_power_lin = float(np.mean(valid_a ** 2))
     mean_gain_db   = float(10.0 * np.log10(mean_power_lin + 1e-60))
+
+    # Normalised gain: raw RT gain minus proxy FSPL.
+    # This represents shadow fading relative to free space at the proxy
+    # distance, removing the geometric bias introduced by different proxy
+    # positions.  Used by ns3.py instead of mean_path_gain_db when computing
+    # inter-satellite urban corrections.
+    normalized_gain_db = round(mean_gain_db + pfspl, 2)
 
     # Power-weighted RMS delay spread [ns].
     # Standard definition: σ_τ = sqrt(Σ p_k(τ_k − τ̄)² / Σ p_k)
@@ -281,15 +326,17 @@ def _extract_channel_stats(paths, sat_id: int,
         k_factor_db = float("nan")
 
     return dict(
-        sat_id            = sat_id,
-        elevation_deg     = round(elev_deg, 1),
-        mean_path_gain_db = round(mean_gain_db, 2),
-        delay_spread_ns   = round(delay_spread_ns, 2),
-        num_paths         = num_paths,
-        los_exists        = los_exists,
-        k_factor_db       = k_factor_db,
-        sat_x_m           = round(sat_pos[0], 1),
-        sat_y_m           = round(sat_pos[1], 1),
+        sat_id             = sat_id,
+        elevation_deg      = round(elev_deg, 1),
+        mean_path_gain_db  = round(mean_gain_db, 2),
+        normalized_gain_db = normalized_gain_db,
+        proxy_fspl_db      = round(pfspl, 2),
+        delay_spread_ns    = round(delay_spread_ns, 2),
+        num_paths          = num_paths,
+        los_exists         = los_exists,
+        k_factor_db        = k_factor_db,
+        sat_x_m            = round(sat_pos[0], 1),
+        sat_y_m            = round(sat_pos[1], 1),
     )
 
 
@@ -307,6 +354,8 @@ def _aggregate_sample_stats(sample_stats: list, sat_id: int, sat_pos: tuple) -> 
             elevation_deg=0.0,
             mean_path_gain_db=-200.0,
             mean_path_gain_p10_db=-200.0,
+            normalized_gain_db=float("nan"),
+            normalized_p10_db=float("nan"),
             delay_spread_ns=0.0,
             num_paths=0,
             los_exists=False,
@@ -319,23 +368,36 @@ def _aggregate_sample_stats(sample_stats: list, sat_id: int, sat_pos: tuple) -> 
     dss   = np.array([s["delay_spread_ns"]   for s in valid], dtype=float)
     elevs = np.array([s["elevation_deg"]     for s in sample_stats], dtype=float)
 
+    # Normalised gains: raw RT gain + proxy FSPL → shadow fading only.
+    # Filter out NaN (from samples with 0 paths) before aggregating.
+    norm_gains = np.array([s.get("normalized_gain_db", float("nan")) for s in valid], dtype=float)
+    norm_valid = norm_gains[~np.isnan(norm_gains)]
+    if len(norm_valid) > 0:
+        agg_normalized_gain_db = round(float(np.mean(norm_valid)), 2)
+        agg_normalized_p10_db  = round(float(np.percentile(norm_valid, 10)), 2)
+    else:
+        agg_normalized_gain_db = float("nan")
+        agg_normalized_p10_db  = float("nan")
+
     # Aggregate K-factor: mean over UE samples that have a valid (non-NaN) value.
     k_vals = np.array([s.get("k_factor_db", float("nan")) for s in valid], dtype=float)
     k_valid = k_vals[~np.isnan(k_vals)]
     k_factor_db_agg = round(float(np.mean(k_valid)), 2) if len(k_valid) > 0 else float("nan")
 
     return dict(
-        sat_id               = sat_id,
-        elevation_deg        = round(float(np.mean(elevs)), 1),
-        mean_path_gain_db    = round(float(np.mean(gains)), 2),
-        mean_path_gain_p10_db= round(float(np.percentile(gains, 10)), 2),
-        delay_spread_ns      = round(float(np.mean(dss)), 2),
-        num_paths            = int(round(float(np.mean([s["num_paths"] for s in valid])))),
-        los_exists           = bool(any(s.get("los_exists", False) for s in sample_stats)),
-        k_factor_db          = k_factor_db_agg,
-        sat_x_m              = round(sat_pos[0], 1),
-        sat_y_m              = round(sat_pos[1], 1),
-        sampled_ues          = len(sample_stats),
+        sat_id                = sat_id,
+        elevation_deg         = round(float(np.mean(elevs)), 1),
+        mean_path_gain_db     = round(float(np.mean(gains)), 2),
+        mean_path_gain_p10_db = round(float(np.percentile(gains, 10)), 2),
+        normalized_gain_db    = agg_normalized_gain_db,
+        normalized_p10_db     = agg_normalized_p10_db,
+        delay_spread_ns       = round(float(np.mean(dss)), 2),
+        num_paths             = int(round(float(np.mean([s["num_paths"] for s in valid])))),
+        los_exists            = bool(any(s.get("los_exists", False) for s in sample_stats)),
+        k_factor_db           = k_factor_db_agg,
+        sat_x_m               = round(sat_pos[0], 1),
+        sat_y_m               = round(sat_pos[1], 1),
+        sampled_ues           = len(sample_stats),
     )
 
 
@@ -469,11 +531,13 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
             print(f"    [Render] Skipped {out_file}: {e}")
 
     # Extract per-UE stats by slicing the rx_idx dimension of the Paths tensors.
+    # Pass ue_pos so that _extract_channel_stats can normalise the raw RT gain
+    # by the proxy FSPL from that specific UE location.
     sample_stats = []
     for rx_idx, ue_pos in enumerate(ue_positions):
         elev_i = _sat_elevation_deg(*sat_pos, *ue_pos)
         st = _extract_channel_stats(paths, sat_id, sat_pos, elev_i,
-                                    rx_idx=rx_idx)
+                                    rx_idx=rx_idx, ue_pos=list(ue_pos))
         sample_stats.append(st)
 
     scene.remove(tx_name)

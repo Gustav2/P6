@@ -238,21 +238,35 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
     if sigmoid_slope is None:
         sigmoid_slope = SIGMOID_SLOPE
 
-    # Urban multipath correction: relative RT gain compared to the best
-    # satellite.  The reference satellite gets 0 dB correction; others
-    # receive a negative correction equal to their RT gain deficit.
-    # If RT produced no valid paths (gain = −200 dB), apply a −10 dB penalty.
+    # Urban multipath correction: relative shadow-fading offset from the best
+    # satellite, using proxy-FSPL-normalised gains (normalized_gain_db from
+    # channel_stats).  Normalisation removes the geometric bias introduced by
+    # proxy transmitters at different scene distances, leaving only the true
+    # building-shadow / multipath contribution.
+    #
+    # The correction is capped at ±12 dB (3σ of 3GPP TR 38.811 Urban NTN LOS
+    # shadow fading σ = 4 dB) to prevent rare scene outliers from producing
+    # unrealistically high PER.
+    #
+    # If the normalised gain is NaN (no valid RT paths for this satellite),
+    # fall back to a −10 dB conservative shadow-fading penalty.
+    _URBAN_CORRECTION_CAP_DB = 12.0   # 3σ LOS per 3GPP TR 38.811 Table 6.7.2-1
+
+    no_paths = math.isnan(rt_mean_gain_db) if isinstance(rt_mean_gain_db, float) else False
     gain_for_budget_db = rt_mean_gain_db
-    if rt_gain_p10_db is not None:
+    if rt_gain_p10_db is not None and not math.isnan(rt_gain_p10_db):
         gain_for_budget_db = (
             (1.0 - RT_GAIN_P10_BLEND) * rt_mean_gain_db
             + RT_GAIN_P10_BLEND * rt_gain_p10_db
         )
 
-    if gain_for_budget_db <= -150.0:
-        urban_correction_db = -10.0    # No paths → deep shadow, penalty
-    elif rt_ref_gain_db is not None and rt_ref_gain_db > -150.0:
-        urban_correction_db = gain_for_budget_db - rt_ref_gain_db
+    if no_paths or math.isnan(gain_for_budget_db):
+        urban_correction_db = -10.0    # No paths → deep shadow penalty
+    elif rt_ref_gain_db is not None and not math.isnan(rt_ref_gain_db):
+        raw_correction = gain_for_budget_db - rt_ref_gain_db
+        urban_correction_db = float(np.clip(raw_correction,
+                                            -_URBAN_CORRECTION_CAP_DB,
+                                            _URBAN_CORRECTION_CAP_DB))
     else:
         urban_correction_db = 0.0
 
@@ -352,9 +366,16 @@ def _compute_handover_schedule(channel_stats: list,
 
     schedule = []
 
-    # Reference gain: the best (highest-elevation) satellite's RT gain.
-    # All other satellites are penalised relative to this value.
-    ref_gain_db = visible[0]["mean_path_gain_db"] if visible else None
+    # Reference gain: proxy-FSPL-normalised gain of the best visible satellite.
+    # Using normalised gains (mean_path_gain_db + proxy_fspl_db) removes the
+    # geometric bias introduced by proxy TXs at different scene distances, so
+    # the urban correction purely reflects shadow-fading differences.
+    def _norm_gain(stat):
+        v = stat.get("normalized_gain_db", float("nan"))
+        return v if not math.isnan(v) else float("-inf")
+
+    valid_visible = [s for s in visible if not math.isnan(_norm_gain(s))]
+    ref_gain_db = max((_norm_gain(s) for s in valid_visible), default=None)
 
     t_cursor = 0.0
     for i, stat in enumerate(visible):
@@ -365,8 +386,9 @@ def _compute_handover_schedule(channel_stats: list,
         elev_deg = stat["elevation_deg"]
 
         fspl   = _fspl_db(SAT_HEIGHT_M, max(elev_deg, 1.0))
-        per    = _rt_calibrated_per(fspl, stat["mean_path_gain_db"],
-                                    stat.get("mean_path_gain_p10_db"),
+        per    = _rt_calibrated_per(fspl,
+                                    stat.get("normalized_gain_db", float("nan")),
+                                    stat.get("normalized_p10_db"),
                                     ref_gain_db,
                                     snr_thresh_db, sigmoid_slope)
         delay  = _one_way_delay_ms(SAT_HEIGHT_M, max(elev_deg, 1.0))
