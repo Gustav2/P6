@@ -259,7 +259,7 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
     # Full uplink budget:
     #   SNR = TX_EIRP − FSPL + urban_correction + SAT_RX_GAIN − NOISE_FLOOR
     # SAT_RX_ANTENNA_GAIN_DB models the satellite's phased-array receive
-    # aperture (~30 dBi at 3.5 GHz for a modern LEO NTN spot beam).
+    # aperture (34 dBi at 2 GHz for a modern LEO NTN spot beam).
     snr_db = (PHONE_EIRP_DBM - fspl_db + urban_correction_db
               + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM)
     per    = 1.0 / (1.0 + math.exp(sigmoid_slope * (snr_db - snr_thresh_db)))

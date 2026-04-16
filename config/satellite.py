@@ -38,16 +38,16 @@ Orbital velocity of a LEO satellite at SAT_HEIGHT_M [m/s].
     R_E = 6.3781×10⁶ m            (WGS84 equatorial radius)
     h   = 5.50×10⁵ m              (550 km altitude)
   → v = sqrt(3.986e14 / 6.928e6) = 7,612 m/s
-- Doppler shift at 3.5 GHz (worst case, near horizon where radial velocity peaks):
-    Δf_max = v/c × f = 7612 / 3×10⁸ × 3.5×10⁹ ≈ ±88.8 kHz (full radial pass)
-    Δf at zenith ≈ 0 (perpendicular to LOS); peak near horizon ≈ ±88.8 kHz.
+- Doppler shift at 2.0 GHz (worst case, near horizon where radial velocity peaks):
+    Δf_max = v/c × f = 7612 / 3×10⁸ × 2.0×10⁹ ≈ ±50.7 kHz (full radial pass)
+    Δf at zenith ≈ 0 (perpendicular to LOS); peak near horizon ≈ ±50.7 kHz.
+  At µ=1 (30 kHz SCS) this is ~1.7× SCS — within pre-compensation range.
+  At µ=0 (15 kHz SCS) it would be ~3.4× SCS, causing significant ICI.
 - Used in ntn_phy.py: ut_velocities is set to zero, NOT to this value.
   3GPP TR 38.821 §6.1.2 mandates that NTN UEs pre-compensate the satellite
-  Doppler shift before the OFDM demodulator.  At 3.5 GHz, the max Doppler
-  from this speed is ~88 kHz >> 15 kHz SCS, which causes BER ≈ 0.5 if
-  applied without pre-compensation.  Setting ut_velocities = 0 models the
-  post-compensation residual.  This constant is retained for documentation
-  and for the NTN Doppler branch in Sionna (bs_height ≥ 600 km path).
+  Doppler shift before the OFDM demodulator.  Setting ut_velocities = 0
+  models the post-compensation residual.  This constant is retained for
+  documentation and for the NTN Doppler branch in Sionna (bs_height ≥ 600 km).
 Source: Standard orbital mechanics (IERS Conventions 2010, §6.1).
 """
 

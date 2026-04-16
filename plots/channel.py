@@ -88,10 +88,11 @@ def draw_link_budget_waterfall(channel_stats: list,
                               sharex=False)
     if n_sats == 1:
         axes = [axes]
+    freq_ghz = CARRIER_FREQ_HZ / 1e9
     fig.suptitle(
         "Link Budget Waterfall — Per Satellite\n"
         f"TX EIRP → FSPL → Urban correction → SNR → Margin vs threshold  "
-        f"(3.5 GHz, LEO {SAT_HEIGHT_M/1e3:.0f} km, Phone EIRP {PHONE_EIRP_DBM:.0f} dBm)",
+        f"({freq_ghz:.1f} GHz n255, LEO {SAT_HEIGHT_M/1e3:.0f} km, Phone EIRP {PHONE_EIRP_DBM:.0f} dBm)",
         fontsize=10,
     )
 
@@ -247,9 +248,10 @@ def draw_snr_vs_elevation(channel_stats: list,
     ax1.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left",
                framealpha=0.9)
 
+    freq_ghz = CARRIER_FREQ_HZ / 1e9
     ax1.set_title(
         f"SNR vs Elevation Angle — Phone EIRP ({PHONE_EIRP_DBM:.0f} dBm)\n"
-        f"LEO {SAT_HEIGHT_M/1e3:.0f} km  |  3.5 GHz  |  "
+        f"LEO {SAT_HEIGHT_M/1e3:.0f} km  |  {freq_ghz:.1f} GHz n255  |  "
         f"PER sigmoid on right axis",
         fontsize=10,
     )
@@ -287,8 +289,9 @@ def draw_channel_validation(channel_stats: list,
     elev_fine = np.linspace(5, 90, 200)
     fspl_fine = np.array([_fspl_db(e) for e in elev_fine])
 
-    # Atmospheric absorption at 3.5 GHz (clear sky, ITU-R P.676): ~0.5 dB
-    atm_db = 0.5
+    # Atmospheric absorption at 2 GHz (clear sky, ITU-R P.676): ~0.3 dB
+    # (Less than at 3.5 GHz because O₂/H₂O absorption peaks are above 22 GHz)
+    atm_db = 0.3
     # Shadow-fading σ for Urban NTN LOS from TR 38.811 Table 6.7.2-1: 4 dB
     sf_sigma_db = 4.0
 
@@ -310,8 +313,9 @@ def draw_channel_validation(channel_stats: list,
 
     # ── Figure ────────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    freq_ghz = CARRIER_FREQ_HZ / 1e9
     fig.suptitle(
-        "Channel Validation — 5G-NTN LEO 550 km  |  3.5 GHz  |  Urban (Munich)\n"
+        f"Channel Validation — 5G-NTN LEO 550 km  |  {freq_ghz:.1f} GHz n255  |  Urban (Munich)\n"
         "RT = Sionna RT (this simulation)    3GPP = TR 38.811 Table 6.7.2-3 reference",
         fontsize=10,
     )

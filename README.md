@@ -20,7 +20,8 @@ UE (Phone)  ──5G-NR NTN──  LEO Satellite  ──direct link──  Inter
 
 | Parameter | Value |
 |---|---|
-| Carrier frequency | 3.5 GHz (5G NR n78) |
+| Carrier frequency | 2.0 GHz (5G NR n255, S-band NTN) |
+| Numerology | µ=1 · 30 kHz SCS |
 | Modulation / code rate | QPSK · LDPC r=0.5 |
 | Satellite altitude | 550 km (LEO, Starlink Shell 1) |
 | Visible satellites simulated | 8 |

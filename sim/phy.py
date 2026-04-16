@@ -214,9 +214,9 @@ def run_sionna_ber(snr_db_range: np.ndarray, scenario: str):
     bs_orientations = tf.zeros([BATCH_SIZE, 1, 3], dtype=tf.float32)
     # Velocity: set to zero to model NTN-capable UEs with Doppler pre-compensation.
     # 3GPP TR 38.821 §6.1.2 mandates that NTN UEs pre-compensate the LEO satellite
-    # Doppler shift (up to ±88 kHz at 3.5 GHz) before the OFDM demodulator.
+    # Doppler shift (up to ±50.7 kHz at 2 GHz) before the OFDM demodulator.
     # Without pre-compensation, the 7612 m/s orbital velocity produces a Doppler
-    # shift of ~88 kHz >> 15 kHz SCS, causing catastrophic ICI (BER ≈ 0.5).
+    # shift of ~51 kHz >> 30 kHz SCS (µ=1), causing significant ICI.
     # Setting ut_velocities = 0 models a UE that has pre-compensated Doppler;
     # the channel statistics (delay spread, shadow fading) still reflect the NTN
     # environment per TR 38.811.

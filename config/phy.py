@@ -2,26 +2,33 @@
 config/phy.py — PHY / OFDM simulation parameters
 """
 
-CARRIER_FREQ_HZ = 3.5e9
+CARRIER_FREQ_HZ = 2.0e9
 """
 5G NR carrier frequency [Hz].
-- 3.5 GHz (n78 band) is the primary mid-band 5G-NTN service-link frequency
-  specified in 3GPP TR 38.821 §6.1 for LEO satellite service links.
+- 2.0 GHz (n255, S-band) is the 3GPP reference service-link frequency for
+  LEO NTN as specified in 3GPP TR 38.821 §6.1, Table 6.1.1-1.
+- n78 (3.5 GHz) is a terrestrial FR1 band not allocated for satellite
+  service links; n255 (1980–2010 MHz UL / 2170–2200 MHz DL) is the 3GPP
+  NTN S-band reference.
+- At 2.0 GHz the FSPL over 550 km is ~4.9 dB lower than at 3.5 GHz,
+  improving the link margin significantly.
 - Affects OFDM wavelength, free-space path loss (FSPL), and Doppler shifts.
-- Other valid choices: 2.0 GHz (n255, S-band NTN), 26.5 GHz (Ka-band feeder).
-Source: [3GPP-38.821] §6.1, Table 6.1.1-1 (service-link reference frequency).
+Source: [3GPP-38.821] §6.1, Table 6.1.1-1 (service-link reference = 2 GHz).
+         [3GPP-38.101-5] §5.2 (NR band n255 definition).
 """
 
-SUBCARRIER_SPACING = 15e3
+SUBCARRIER_SPACING = 30e3
 """
 OFDM subcarrier spacing [Hz].
-- 15 kHz = NR numerology µ=0, the baseline for FR1 sub-6 GHz deployments.
-- 3GPP TR 38.821 §6.1.2 notes that µ=1 (30 kHz) or µ=3 (120 kHz) may be
-  needed for LEO NTN because the satellite Doppler at 3.5 GHz reaches up to
-  ±88.8 kHz (v=7612 m/s, see SAT_ORBITAL_VELOCITY_MS) >> 15 kHz SCS.
-  µ=0 is retained here as the reference numerology for the Munich urban scene.
-- One NR slot at µ=0 has duration T_slot = 1 ms (14 OFDM symbols).
-Source: [3GPP-38.300] §5.3.1, Table 4.1-1 in [3GPP-38.101-1].
+- 30 kHz = NR numerology µ=1, recommended by 3GPP TR 38.821 for S-band NTN.
+- At 2 GHz the peak satellite Doppler is:
+    Δf_max = v/c × f = 7612 / 3×10⁸ × 2×10⁹ ≈ ±50.7 kHz
+  µ=0 (15 kHz SCS) would be overwhelmed (ICI ≈ 3× SCS); µ=1 (30 kHz)
+  keeps the worst-case Doppler to ~1.7× SCS, within UE pre-compensation
+  range per 3GPP TS 38.211 §7.3.
+- One NR slot at µ=1 has duration T_slot = 0.5 ms (14 OFDM symbols).
+Source: [3GPP-38.821] §6.1.2 (µ=1 reference numerology for S-band NTN).
+         [3GPP-38.300] §5.3.1, Table 4.1-1 in [3GPP-38.101-1].
 """
 
 FFT_SIZE = 128
