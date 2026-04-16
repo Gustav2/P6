@@ -1,4 +1,3 @@
-Test
 # 5G-NTN Satellite Link Simulation
 
 An end-to-end simulation of a 5G Non-Terrestrial Network (NTN) LEO satellite link.
@@ -35,8 +34,12 @@ channel conditions including handover events.
 ### End-to-end path
 
 ```
-UE (Phone)  ──5G-NR NTN──  LEO Satellite  ──Ka feeder──  Ground Station  ──Fibre──  Internet Server
+UE (Phone)  ──5G-NR NTN──  LEO Satellite  ──direct link──  Internet Server
 ```
+
+No ISL or ground-station hops — the satellite connects directly to the
+internet server node. The service link (phone→satellite) is the sole
+bottleneck and the only link with a realistic error model.
 
 ## Simulation scenario
 
@@ -48,8 +51,6 @@ UE (Phone)  ──5G-NR NTN──  LEO Satellite  ──Ka feeder──  Ground 
 | Satellite altitude | 550 km (LEO) |
 | Constellation context | ~3000 satellites total shell |
 | Sampled visible satellites | 8 per simulated pass |
-| Handover 1 | t = 20 s (Sat 0 → Sat 1) |
-| Handover 2 | t = 40 s (Sat 1 → Sat 2) |
 | Traffic profiles | streaming, gaming, texting, voice (+ bulk background) |
 | Mobility classes | stationary, pedestrian, vehicular modem |
 | Simulation duration | 60 s |
@@ -108,15 +109,15 @@ The full pipeline takes approximately 5–15 minutes depending on hardware
 
 | File | Description |
 |---|---|
-| `ntn_topology.png` | Basic end-to-end topology diagram |
-| `ntn_network_illustration.png` | Detailed NTN network diagram with Earth arc, orbit, link parameters |
-| `ntn_ue_satellite.png` | Artistic street-canyon scene with UE, satellite, and multipath rays |
 | `ntn_protocol_comparison.png` | Grouped bar chart: latency / throughput / loss per protocol |
-| `ntn_throughput_over_time.png` | Per-protocol throughput vs time with handover markers |
 | `ntn_summary.png` | Five-panel combined BER + NS-3 results figure |
-| `ntn_rt_paths_sat0.png` | Sionna RT ray paths for Sat 0 (elev 70°) |
-| `ntn_rt_paths_sat1.png` | Sionna RT ray paths for Sat 1 (elev 55°) |
-| `ntn_rt_paths_sat2.png` | Sionna RT ray paths for Sat 2 (elev 40°) |
+| `ntn_latency_breakdown.png` | Per-hop latency breakdown (NTN + protocol overhead) |
+| `ntn_handover_impact.png` | Per-slot throughput showing handover impact per protocol |
+| `ntn_timeseries.png` | Per-protocol throughput vs time with handover markers |
+| `ntn_fairness.png` | Jain's fairness index per protocol |
+| `ntn_profile_breakdown.png` | Per-traffic-profile throughput breakdown |
+| `ntn_results.png` | BER/BLER curves from PHY simulation |
+| `ntn_rt_paths_sat*.png` | Sionna RT ray paths per satellite |
 | `ntn_rt_radiomap.png` | Composite RT radio coverage map |
 
 ## Configuration
@@ -127,12 +128,11 @@ All parameters are centralised in `config.py`.  Key knobs:
 |---|---|---|
 | `CARRIER_FREQ_HZ` | `3.5e9` | 5G NR carrier frequency [Hz] |
 | `SAT_HEIGHT_M` | `550_000` | LEO orbital altitude [m] |
-| `CONSTELLATION_TOTAL_SATS` | `3000` | Constellation-scale realism metadata |
 | `VISIBLE_SATELLITES_PER_PASS` | `8` | Sampled visible satellites per pass |
-| `NUM_SATELLITES` | `VISIBLE_SATELLITES_PER_PASS` | Satellites used in RT + NS-3 pass |
 | `SIM_DURATION_S` | `60.0` | NS-3 simulation duration [s] |
 | `RT_MAX_DEPTH` | `5` | Max ray reflections per path |
-| `RT_UE_SAMPLE_POSITIONS` | `4 points` | RT sampling points for urban diversity |
+| `RT_RENDER_PATHS` | `True` | Set `False` to skip path renders and save RT time |
+| `RT_RENDER_NUM_SAMPLES` | `64` | Path-tracing samples per pixel for RT renders |
 | `RT_GAIN_P10_BLEND` | `0.35` | Blend between mean and p10 RT gain in PER model |
 | `NUM_PEDESTRIAN_MOVING_CLIENTS` | `10` | Pedestrian moving clients |
 | `NUM_VEHICULAR_MOVING_CLIENTS` | `10` | Vehicular-modem moving clients |
@@ -141,6 +141,7 @@ All parameters are centralised in `config.py`.  Key knobs:
 | `APP_DATA_RATE` | `"5Mbps"` | UDP CBR source rate |
 | `PACKET_SIZE_BYTES` | `1400` | Application payload size [bytes] |
 | `TCP_SNDRCV_BUF_BYTES` | `512_000` | TCP socket buffer [bytes] |
+| `SAT_SERVER_DATARATE` | `"1Gbps"` | Satellite → server link rate (never bottleneck) |
 
 ## File structure
 
@@ -164,9 +165,9 @@ All parameters are centralised in `config.py`.  Key knobs:
 - **Ray tracing** (Part 2): Higher elevation angles give fewer but stronger paths.
   Sat 0 (70°) returns 4 paths; Sat 2 (40°) returns 8 paths due to more
   building-wall reflections at shallower incidence.
-- **NS-3 throughput** (Part 3): BBR performs best under the high-PER Sat 2 slot
-  because it uses bandwidth probing rather than loss as a congestion signal.
-  TCP NewReno and CUBIC back off sharply when Sat 2 (PER = 0.768) is active.
-- **Throughput-over-time**: The Sat 1 slot (t = 20–40 s, PER = 0.033) is the
-  best window; all TCP variants show a brief recovery dip immediately after
-  each handover due to congestion-window reset.
+- **NS-3 throughput** (Part 3): BBR performs best under high-PER slots because
+  it uses bandwidth probing rather than loss as a congestion signal.
+  TCP NewReno and CUBIC back off sharply at high PER.
+- **Throughput-over-time**: The highest-elevation satellite slot is the best
+  window; all TCP variants show a brief recovery dip immediately after each
+  handover due to congestion-window reset.
