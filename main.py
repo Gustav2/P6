@@ -279,7 +279,7 @@ def main() -> None:
     print("  Part 3 — NS-3 multi-protocol simulation")
     print(f"  Protocols: {[p['label'] for p in PROTOCOLS]}")
     from config import NUM_STATIONARY_CLIENTS, NUM_MOVING_CLIENTS
-    print("  Topology : direct: Phone→AccessSat→ISL→BenchmarkSat→GS→Server")
+    print("  Topology : direct: Phone→Satellite→Server")
     print(f"  Clients  : {NUM_STATIONARY_CLIENTS} stationary + "
           f"{NUM_MOVING_CLIENTS} moving  "
           f"(total {NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS})")
@@ -345,7 +345,7 @@ def main() -> None:
     print("    output/ntn_summary.png                — BER/BLER + NS-3 combined figure")
     print("    output/ntn_link_budget_waterfall.png  — per-satellite link budget waterfall")
     print("    output/ntn_snr_vs_elevation.png       — SNR vs elevation + PER sigmoid")
-    print("    output/ntn_latency_breakdown.png      — per-hop stacked latency bars (NTN/ISL/backhaul)")
+    print("    output/ntn_latency_breakdown.png      — per-hop stacked latency bars (NTN + overhead)")
     print("    output/ntn_handover_impact.png        — per-slot throughput bars")
     print("    output/ntn_protocol_radar.png         — 5-axis radar chart")
     print("    output/ntn_results.png                — 3-panel combined summary")
