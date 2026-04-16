@@ -116,6 +116,7 @@ from topology_diagram import (
     draw_timeseries,
     draw_fairness,
     draw_profile_breakdown,
+    draw_channel_validation,
     draw_timing_breakdown,
 )
 
@@ -344,6 +345,9 @@ def main() -> None:
 
     draw_profile_breakdown(direct_results, out="output/ntn_profile_breakdown.png")
     print("  [10/10] output/ntn_profile_breakdown.png")
+
+    draw_channel_validation(channel_stats, out="output/ntn_channel_validation.png")
+    print("  [11/11] output/ntn_channel_validation.png")
     timing["Plotting"] = time.perf_counter() - t0
     timing["Total"] = time.perf_counter() - t_start
 
@@ -365,6 +369,7 @@ def main() -> None:
     print("    output/ntn_timeseries.png             — per-second throughput with HO gap markers")
     print("    output/ntn_fairness.png               — Jain's fairness index per protocol")
     print("    output/ntn_profile_breakdown.png      — throughput/loss by traffic profile")
+    print("    output/ntn_channel_validation.png     — FSPL / Rician K / delay spread vs 3GPP")
     print("    output/ntn_timing.png                 — stage-by-stage runtime breakdown")
     print("    output/ntn_rt_paths_sat<N>.png        — RT paths per satellite")
     print("    output/ntn_rt_radiomap.png            — composite radio map")

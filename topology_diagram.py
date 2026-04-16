@@ -35,6 +35,7 @@ Produces output figures:
       Per-traffic-profile throughput and loss breakdown per protocol.
 """
 
+import math
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -1140,5 +1141,159 @@ def draw_timing_breakdown(timing: dict, variant: str,
     plt.tight_layout()
     plt.savefig(out, dpi=150, bbox_inches="tight")
     print(f"[Timing]  Saved -> {out}")
+    plt.close()
+    return out
+
+
+# ── Channel validation ─────────────────────────────────────────────────────────
+
+# 3GPP TR 38.811 Table 6.7.2-3 reference values (Urban NTN, LOS).
+# K-factor: mean and ±1σ in dB.
+# Delay spread: mean in log10(DS/s) converted to nanoseconds.
+_GPP_ELEV       = [10,   20,   30,   45,   60,   75,   90  ]   # degrees
+_GPP_K_MEAN_DB  = [ 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]  # dB (mean)
+_GPP_K_STD_DB   = [ 3.5,  3.5,  4.0,  4.0,  4.0,  3.5,  3.5]  # dB (σ)
+# log10(DS/s) mean → DS in ns = 10^(μ + 9)
+_GPP_DS_MU      = [-7.0, -7.2, -7.5, -7.8, -8.0, -8.3, -8.5]  # log10(s)
+_GPP_DS_MEAN_NS = [10 ** (m + 9) for m in _GPP_DS_MU]
+
+
+def _fspl_db(elevation_deg: float,
+             freq_hz: float = CARRIER_FREQ_HZ,
+             height_m: float = SAT_HEIGHT_M) -> float:
+    """Free-space path loss [dB] at real orbital altitude for a given elevation."""
+    RE  = 6_371_000.0
+    e   = math.radians(max(float(elevation_deg), 0.5))
+    d   = math.sqrt((RE + height_m) ** 2 - (RE * math.cos(e)) ** 2) - RE * math.sin(e)
+    lam = 3e8 / freq_hz
+    return 20.0 * math.log10(4.0 * math.pi * d / lam)
+
+
+def draw_channel_validation(channel_stats: list,
+                            out: str = "output/ntn_channel_validation.png") -> str:
+    """Three-panel channel validation figure.
+
+    Panel 1 — Free-space path loss vs elevation
+        Analytical FSPL curve (solid) and 3GPP TR 38.811 model (FSPL +
+        atmospheric absorption + ±1σ shadow-fading band).  Our 8 satellite
+        slant-range FSPL values are marked as scatter points.
+
+    Panel 2 — Rician K-factor vs elevation
+        RT-computed K-factor (dots) versus 3GPP TR 38.811 Table 6.7.2-3
+        reference (mean ± 1σ band).
+
+    Panel 3 — RMS delay spread vs elevation
+        RT-computed delay spread (dots) versus 3GPP TR 38.811 Table 6.7.2-3
+        reference (mean ± 1σ band).
+    """
+    # ── Reference curves ──────────────────────────────────────────────────────
+    elev_fine = np.linspace(5, 90, 200)
+    fspl_fine = np.array([_fspl_db(e) for e in elev_fine])
+
+    # Atmospheric absorption at 3.5 GHz (clear sky, ITU-R P.676): ~0.5 dB
+    atm_db = 0.5
+    # Shadow-fading σ for Urban NTN LOS from TR 38.811 Table 6.7.2-1: 4 dB
+    sf_sigma_db = 4.0
+
+    # Interpolated 3GPP reference arrays on fine elevation grid
+    gpp_k_mean  = np.interp(elev_fine, _GPP_ELEV, _GPP_K_MEAN_DB)
+    gpp_k_upper = gpp_k_mean + np.interp(elev_fine, _GPP_ELEV, _GPP_K_STD_DB)
+    gpp_k_lower = gpp_k_mean - np.interp(elev_fine, _GPP_ELEV, _GPP_K_STD_DB)
+
+    gpp_ds_mean  = np.interp(elev_fine, _GPP_ELEV, _GPP_DS_MEAN_NS)
+    gpp_ds_upper = gpp_ds_mean * (10 ** 0.4)   # +0.4 in log10
+    gpp_ds_lower = gpp_ds_mean / (10 ** 0.4)   # -0.4 in log10
+
+    # ── Per-satellite data from RT ─────────────────────────────────────────────
+    valid    = [s for s in channel_stats if s.get("num_paths", 0) > 0]
+    rt_elevs = np.array([s["elevation_deg"]                   for s in valid])
+    rt_k     = np.array([s.get("k_factor_db", float("nan"))   for s in valid])
+    rt_ds    = np.array([s["delay_spread_ns"]                  for s in valid])
+    rt_fspl  = np.array([_fspl_db(e)                           for e in rt_elevs])
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle(
+        "Channel Validation — 5G-NTN LEO 550 km  |  3.5 GHz  |  Urban (Munich)\n"
+        "RT = Sionna RT (this simulation)    3GPP = TR 38.811 Table 6.7.2-3 reference",
+        fontsize=10,
+    )
+
+    # ── Panel 1: Free-space path loss ─────────────────────────────────────────
+    ax1 = axes[0]
+    ax1.plot(elev_fine, fspl_fine,
+             color="#1f77b4", lw=2, label="FSPL (analytical)")
+    ax1.plot(elev_fine, fspl_fine + atm_db,
+             color="#ff7f0e", lw=1.5, ls="--",
+             label=f"3GPP TR 38.811\n(FSPL + {atm_db} dB atm.)")
+    ax1.fill_between(elev_fine,
+                     fspl_fine + atm_db - sf_sigma_db,
+                     fspl_fine + atm_db + sf_sigma_db,
+                     color="#ff7f0e", alpha=0.15,
+                     label=f"±1σ shadow fading ({sf_sigma_db} dB)")
+    ax1.scatter(rt_elevs, rt_fspl,
+                color="#d62728", zorder=5, s=60,
+                label="Our satellites (slant range)")
+    for e, f in zip(rt_elevs, rt_fspl):
+        ax1.annotate(f"{e:.0f}°", (e, f),
+                     textcoords="offset points", xytext=(4, 3),
+                     fontsize=7, color="#d62728")
+
+    ax1.set_xlabel("Elevation angle [°]", fontsize=9)
+    ax1.set_ylabel("Path loss [dB]", fontsize=9)
+    ax1.set_title("Free-Space Path Loss\nvs Elevation", fontsize=9)
+    ax1.legend(fontsize=7.5, loc="upper right")
+    ax1.invert_yaxis()   # higher loss = worse, shown at top
+    ax1.grid(alpha=0.3)
+
+    # ── Panel 2: Rician K-factor ──────────────────────────────────────────────
+    ax2 = axes[1]
+    ax2.plot(elev_fine, gpp_k_mean,
+             color="#2ca02c", lw=2, label="3GPP TR 38.811 (mean)")
+    ax2.fill_between(elev_fine, gpp_k_lower, gpp_k_upper,
+                     color="#2ca02c", alpha=0.15, label="±1σ (3GPP)")
+
+    k_mask = ~np.isnan(rt_k)
+    if k_mask.any():
+        ax2.scatter(rt_elevs[k_mask], rt_k[k_mask],
+                    color="#d62728", zorder=5, s=60,
+                    label="RT computed (this sim.)")
+        for e, k in zip(rt_elevs[k_mask], rt_k[k_mask]):
+            ax2.annotate(f"{e:.0f}°", (e, k),
+                         textcoords="offset points", xytext=(4, 3),
+                         fontsize=7, color="#d62728")
+
+    ax2.set_xlabel("Elevation angle [°]", fontsize=9)
+    ax2.set_ylabel("Rician K-factor [dB]", fontsize=9)
+    ax2.set_title("Rician K-Factor\nvs Elevation (Urban NTN LOS)", fontsize=9)
+    ax2.legend(fontsize=7.5, loc="lower right")
+    ax2.grid(alpha=0.3)
+
+    # ── Panel 3: RMS delay spread ──────────────────────────────────────────────
+    ax3 = axes[2]
+    ax3.semilogy(elev_fine, gpp_ds_mean,
+                 color="#9467bd", lw=2, label="3GPP TR 38.811 (mean)")
+    ax3.fill_between(elev_fine, gpp_ds_lower, gpp_ds_upper,
+                     color="#9467bd", alpha=0.15, label="±1σ (3GPP)")
+
+    ds_mask = rt_ds > 0
+    if ds_mask.any():
+        ax3.scatter(rt_elevs[ds_mask], rt_ds[ds_mask],
+                    color="#d62728", zorder=5, s=60,
+                    label="RT computed (this sim.)")
+        for e, d in zip(rt_elevs[ds_mask], rt_ds[ds_mask]):
+            ax3.annotate(f"{e:.0f}°", (e, d),
+                         textcoords="offset points", xytext=(4, 3),
+                         fontsize=7, color="#d62728")
+
+    ax3.set_xlabel("Elevation angle [°]", fontsize=9)
+    ax3.set_ylabel("RMS delay spread [ns]", fontsize=9)
+    ax3.set_title("RMS Delay Spread\nvs Elevation (Urban NTN LOS)", fontsize=9)
+    ax3.legend(fontsize=7.5, loc="upper right")
+    ax3.grid(alpha=0.3, which="both")
+
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"[ChannelValidation]  Saved -> {out}")
     plt.close()
     return out

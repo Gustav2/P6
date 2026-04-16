@@ -269,15 +269,27 @@ def _extract_channel_stats(paths, sat_id: int,
     earliest_idx = int(np.argmin(valid_tau))
     los_exists   = bool(valid_a[earliest_idx] >= 0.5 * valid_a.max())
 
+    # Rician K-factor: ratio of LOS path power to total scattered power (linear).
+    # K = P_LOS / P_scatter = |a_LOS|² / (Σ|a_k|² − |a_LOS|²)
+    # Returns NaN if no LOS or no scatter paths present (degenerate cases).
+    los_power_lin     = float(valid_a[earliest_idx] ** 2)
+    total_power_lin   = float(np.sum(valid_a ** 2))
+    scatter_power_lin = total_power_lin - los_power_lin
+    if los_exists and scatter_power_lin > 1e-60:
+        k_factor_db = round(float(10.0 * np.log10(los_power_lin / scatter_power_lin)), 2)
+    else:
+        k_factor_db = float("nan")
+
     return dict(
-        sat_id          = sat_id,
-        elevation_deg   = round(elev_deg, 1),
+        sat_id            = sat_id,
+        elevation_deg     = round(elev_deg, 1),
         mean_path_gain_db = round(mean_gain_db, 2),
-        delay_spread_ns = round(delay_spread_ns, 2),
-        num_paths       = num_paths,
-        los_exists      = los_exists,
-        sat_x_m         = round(sat_pos[0], 1),
-        sat_y_m         = round(sat_pos[1], 1),
+        delay_spread_ns   = round(delay_spread_ns, 2),
+        num_paths         = num_paths,
+        los_exists        = los_exists,
+        k_factor_db       = k_factor_db,
+        sat_x_m           = round(sat_pos[0], 1),
+        sat_y_m           = round(sat_pos[1], 1),
     )
 
 
@@ -304,20 +316,26 @@ def _aggregate_sample_stats(sample_stats: list, sat_id: int, sat_pos: tuple) -> 
         )
 
     gains = np.array([s["mean_path_gain_db"] for s in valid], dtype=float)
-    dss = np.array([s["delay_spread_ns"] for s in valid], dtype=float)
-    elevs = np.array([s["elevation_deg"] for s in sample_stats], dtype=float)
+    dss   = np.array([s["delay_spread_ns"]   for s in valid], dtype=float)
+    elevs = np.array([s["elevation_deg"]     for s in sample_stats], dtype=float)
+
+    # Aggregate K-factor: mean over UE samples that have a valid (non-NaN) value.
+    k_vals = np.array([s.get("k_factor_db", float("nan")) for s in valid], dtype=float)
+    k_valid = k_vals[~np.isnan(k_vals)]
+    k_factor_db_agg = round(float(np.mean(k_valid)), 2) if len(k_valid) > 0 else float("nan")
 
     return dict(
-        sat_id=sat_id,
-        elevation_deg=round(float(np.mean(elevs)), 1),
-        mean_path_gain_db=round(float(np.mean(gains)), 2),
-        mean_path_gain_p10_db=round(float(np.percentile(gains, 10)), 2),
-        delay_spread_ns=round(float(np.mean(dss)), 2),
-        num_paths=int(round(float(np.mean([s["num_paths"] for s in valid])))),
-        los_exists=bool(any(s.get("los_exists", False) for s in sample_stats)),
-        sat_x_m=round(sat_pos[0], 1),
-        sat_y_m=round(sat_pos[1], 1),
-        sampled_ues=len(sample_stats),
+        sat_id               = sat_id,
+        elevation_deg        = round(float(np.mean(elevs)), 1),
+        mean_path_gain_db    = round(float(np.mean(gains)), 2),
+        mean_path_gain_p10_db= round(float(np.percentile(gains, 10)), 2),
+        delay_spread_ns      = round(float(np.mean(dss)), 2),
+        num_paths            = int(round(float(np.mean([s["num_paths"] for s in valid])))),
+        los_exists           = bool(any(s.get("los_exists", False) for s in sample_stats)),
+        k_factor_db          = k_factor_db_agg,
+        sat_x_m              = round(sat_pos[0], 1),
+        sat_y_m              = round(sat_pos[1], 1),
+        sampled_ues          = len(sample_stats),
     )
 
 
