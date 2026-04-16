@@ -89,7 +89,7 @@ def build_channel_model(scenario: str):
         carrier_frequency=CARRIER_FREQ_HZ,
         ut_array=ue_array,
         bs_array=sat_array,
-        direction="downlink",
+        direction="uplink",   # NS-3 link budget models UE/gNB→satellite uplink
         elevation_angle=ELEVATION_ANGLE_DEG,
         enable_pathloss=True,
         enable_shadow_fading=True,
@@ -153,7 +153,7 @@ class NTNOFDMModel(Block):
         self._demap   = Demapper("app", "qam", NUM_BITS_PER_SYMBOL)
         self._dec     = LDPC5GDecoder(self._enc, hard_out=True)
 
-    @tf.function(jit_compile=False)
+    @tf.function(jit_compile=True)   # XLA JIT: measurable speedup on CPU with 8 cores
     def call(self, batch_size, ebno_db):
         no   = ebnodb2no(ebno_db, NUM_BITS_PER_SYMBOL, CODERATE, self._rg)
 

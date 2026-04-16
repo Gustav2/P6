@@ -44,7 +44,9 @@ All PNG output files are written to the output/ subdirectory.
   output/ntn_rt_radiomap.png            — Composite radio map
 """
 
+import hashlib
 import os
+import pickle
 import numpy as np
 
 OUTPUT_DIR = "output"
@@ -54,25 +56,38 @@ matplotlib.use("Agg")
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-# Force LLVM (CPU) Mitsuba variant before any sionna.rt import.
-# Without this, Sionna tries cuda_ad_mono_polarized first; on CPU-only
-# machines the DrJIT GPU init crashes with a fatal GIL segfault.
+# All Mitsuba 3 CUDA variants require OptiX (libnvoptix.so.1).
+# Jetson Orin has CUDA but NOT OptiX (embedded GPU, no RTX hardware).
+# Detect OptiX availability via ctypes; use LLVM JIT on Jetson.
+import ctypes.util as _ctypes_util
 import mitsuba as mi
 if mi.variant() is None:
-    mi.set_variant("llvm_ad_mono_polarized")
+    if _ctypes_util.find_library("nvoptix"):
+        mi.set_variant("cuda_ad_mono_polarized")   # discrete RTX GPU with OptiX
+    else:
+        mi.set_variant("llvm_ad_mono_polarized")   # LLVM JIT (Jetson Orin path)
 
 import tensorflow as tf
 tf.get_logger().setLevel("ERROR")
 
+# Maximise CPU thread usage for TF PHY simulation on the 8-core Jetson CPU.
+# TF on Jetson has no GPU support compiled in, so all compute runs on CPU.
+_n_cores = os.cpu_count() or 8
+tf.config.threading.set_inter_op_parallelism_threads(_n_cores)
+tf.config.threading.set_intra_op_parallelism_threads(_n_cores)
+
 from config import (
     CARRIER_FREQ_HZ,
-    SAT_HEIGHT_M,
-    ELEVATION_ANGLE_DEG,
-    CODERATE,
-    NUM_BITS_PER_SYMBOL,
+    SUBCARRIER_SPACING,
     FFT_SIZE,
     NUM_OFDM_SYMBOLS,
+    CP_LENGTH,
     PILOT_SYMBOL_IDX,
+    NUM_BITS_PER_SYMBOL,
+    CODERATE,
+    BATCH_SIZE,
+    SAT_HEIGHT_M,
+    ELEVATION_ANGLE_DEG,
     SNR_THRESH_DB,
     SIGMOID_SLOPE,
     PROTOCOLS,
@@ -105,6 +120,45 @@ from topology_diagram import (
 
 
 # =============================================================================
+# PHY result cache
+# =============================================================================
+# The BER/BLER curves are deterministic for fixed config.  Caching them
+# saves the full PHY stage (typically 3-7 min) on repeated runs when no
+# PHY-related parameters have changed.
+
+def _phy_cache_path() -> str:
+    """Return cache file path based on a hash of all PHY-relevant config values."""
+    key = hashlib.md5(str({
+        "freq":   CARRIER_FREQ_HZ,
+        "scs":    SUBCARRIER_SPACING,
+        "fft":    FFT_SIZE,
+        "syms":   NUM_OFDM_SYMBOLS,
+        "cp":     CP_LENGTH,
+        "pilots": tuple(PILOT_SYMBOL_IDX),
+        "bps":    NUM_BITS_PER_SYMBOL,
+        "rate":   CODERATE,
+        "batch":  BATCH_SIZE,
+        "height": SAT_HEIGHT_M,
+        "elev":   ELEVATION_ANGLE_DEG,
+    }).encode()).hexdigest()[:10]
+    return f"{OUTPUT_DIR}/.phy_cache_{key}.pkl"
+
+
+def _load_phy_cache() -> tuple:
+    """Return (data, path). data is None on cache miss."""
+    path = _phy_cache_path()
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f), path
+    return None, path
+
+
+def _save_phy_cache(data: dict) -> None:
+    with open(_phy_cache_path(), "wb") as f:
+        pickle.dump(data, f)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -112,6 +166,8 @@ def main() -> None:
     print("=" * 70)
     print("  NTN Satellite Simulation")
     print("  Sionna 1.2.1 + OpenNTN (TR38.811) + Sionna RT + NS-3")
+    print(f"  Mitsuba variant : {mi.variant()}")
+    print(f"  TF threads      : {_n_cores} cores")
     print("=" * 70)
 
     # ── Part 1: PHY layer BER/BLER ────────────────────────────────────────────
@@ -119,38 +175,26 @@ def main() -> None:
     print("  Part 1 — PHY layer BER/BLER  (Sionna + OpenNTN)")
     print("─" * 70)
 
-    snr_range   = np.arange(0, 20.5, 0.5, dtype=float)  # 0.5 dB steps for sigmoid fitting
-    ber_results = {}
-    for sc in ["urban", "dense_urban", "suburban"]:
-        ber, bler       = run_sionna_ber(snr_range, sc)
-        ber_results[sc] = (ber, bler)
-        print(f"  [{sc}]  BER @ 10 dB = {ber[20]:.4f}  BLER @ 10 dB = {bler[20]:.4f}")
+    # 1 dB steps give 21 SNR points — sufficient resolution for sigmoid fitting
+    # and 2× faster than the original 0.5 dB grid (41 points).
+    snr_range   = np.arange(0, 21.0, 1.0, dtype=float)
 
-    # ── Sigmoid fitting: BER → PER (using "urban" scenario curve) ────────────
-    # Convert BER to PER:  PER = 1 - (1 - BER)^(codeword_bits)
-    # where codeword_bits is the number of information bits per LDPC codeword.
-    #
-    # The Sionna ResourceGrid has:
-    #   - NUM_OFDM_SYMBOLS total OFDM symbols per slot (= 14 at µ=0)
-    #   - len(PILOT_SYMBOL_IDX) pilot symbols (= 2, at indices 2 and 11)
-    #   - FFT_SIZE active subcarriers per OFDM symbol (no guard-band stripping
-    #     in Sionna's ResourceGrid by default)
-    #   - NUM_BITS_PER_SYMBOL bits per data symbol (= 2 for QPSK)
-    # Total coded bits per slot:
-    #   n = (NUM_OFDM_SYMBOLS - num_pilots) × FFT_SIZE × NUM_BITS_PER_SYMBOL
-    #     = (14 - 2) × 128 × 2 = 3072 bits
-    # Information bits:
-    #   k = n × CODERATE = 3072 × 0.5 = 1536 bits
-    # This matches the _n and _k computed in NTNOFDMModel.__init__() in ntn_phy.py
-    # (lines 134–135), which also uses rg.num_data_symbols × NUM_BITS_PER_SYMBOL.
-    #
-    # NOTE: Using FFT_SIZE × CODERATE × NUM_BITS_PER_SYMBOL = 128 (incorrect)
-    # would underestimate the codeword by 24×, giving a much shallower BER→PER
-    # waterfall and causing the fitted sigmoid slope to be too small.
-    num_pilot_syms = len(PILOT_SYMBOL_IDX)                             # = 2
-    num_data_syms  = NUM_OFDM_SYMBOLS - num_pilot_syms                 # = 12
-    codeword_bits  = num_data_syms * FFT_SIZE * NUM_BITS_PER_SYMBOL    # = 3072
+    cached_phy, cache_path = _load_phy_cache()
+    if cached_phy is not None:
+        ber_results = cached_phy
+        print(f"  [PHY cache hit]  Loaded from {cache_path}  (delete to re-run)")
+        for sc, (ber, bler) in ber_results.items():
+            print(f"  [{sc}]  BER @ 10 dB = {ber[20]:.4f}  BLER @ 10 dB = {bler[20]:.4f}")
+    else:
+        ber_results = {}
+        for sc in ["urban", "dense_urban", "suburban"]:
+            ber, bler       = run_sionna_ber(snr_range, sc)
+            ber_results[sc] = (ber, bler)
+            print(f"  [{sc}]  BER @ 10 dB = {ber[20]:.4f}  BLER @ 10 dB = {bler[20]:.4f}")
+        _save_phy_cache(ber_results)
+        print(f"  [PHY cache saved]  {cache_path}")
 
+    # ── Sigmoid fitting (using "urban" scenario BLER curve) ──────────────────
     # Fit sigmoid(snr, thresh, slope) = 1 / (1 + exp(slope*(snr - thresh)))
     # to the PER vs Eb/N0 curve, then pass the fitted params to NS-3.
     print("\n  Fitting BER→PER sigmoid to urban Sionna LDPC BER curve ...")
@@ -162,31 +206,54 @@ def main() -> None:
         def _sigmoid(snr, thresh, slope):
             return 1.0 / (1.0 + np.exp(slope * (snr - thresh)))
 
-        ber_urban, _ = ber_results["urban"]
-        per_urban = 1.0 - (1.0 - np.clip(ber_urban, 0.0, 1.0 - 1e-9)) ** codeword_bits
+        ber_urban, bler_urban = ber_results["urban"]
 
-        # Only fit over points where PER is in (0.01, 0.99) — the transition
-        # region carries the most information about the sigmoid shape.
-        mask = (per_urban > 0.01) & (per_urban < 0.99)
+        # Use BLER (block error rate) directly as the PER target.
+        # Sionna measures BLER = fraction of codewords with ≥1 bit error,
+        # which is exactly the packet error probability for one packet per
+        # codeword.  This is more reliable than the analytic BER→PER
+        # transformation  1-(1-BER)^n  which collapses the waterfall so
+        # steeply that almost no points land in the sigmoid transition zone.
+        per_fit = np.array(bler_urban, dtype=float)
+
+        # Enforce monotonic decrease (BLER should fall as Eb/N0 rises).
+        # Monte Carlo noise at low error counts can cause small bumps;
+        # cumulative-minimum from left to right clips them.
+        per_fit = np.minimum.accumulate(per_fit)
+
+        # Fit over the transition region: 0.001 < BLER < 0.999.
+        # The lower bound is relaxed vs the old 0.01 so that the low-BLER
+        # tail of the LDPC waterfall (which is resolved at BATCH_SIZE=512)
+        # contributes to the slope estimate.
+        mask = (per_fit > 0.001) & (per_fit < 0.999)
         if mask.sum() >= 2:
             popt, _ = curve_fit(
                 _sigmoid,
                 snr_range[mask],
-                per_urban[mask],
+                per_fit[mask],
                 p0=[SNR_THRESH_DB, SIGMOID_SLOPE],
-                bounds=([0.0, 0.01], [30.0, 5.0]),
+                bounds=([0.0, 0.01], [20.0, 10.0]),
                 maxfev=10000,
             )
             fitted_snr_thresh    = float(popt[0])
             fitted_sigmoid_slope = float(popt[1])
-            print(f"  Sigmoid fit (urban):  "
-                  f"snr_thresh={fitted_snr_thresh:.2f} dB  "
-                  f"slope={fitted_sigmoid_slope:.4f} /dB")
+
+            # Sanity-check: if the threshold hit a bound, the fit is
+            # degenerate — fall back to the physically-grounded defaults.
+            if not (0.5 < fitted_snr_thresh < 19.5):
+                print(f"  Warning: fitted snr_thresh={fitted_snr_thresh:.2f} dB "
+                      f"hit boundary — using config defaults.")
+                fitted_snr_thresh    = SNR_THRESH_DB
+                fitted_sigmoid_slope = SIGMOID_SLOPE
+            else:
+                print(f"  Sigmoid fit (urban):  "
+                      f"snr_thresh={fitted_snr_thresh:.2f} dB  "
+                      f"slope={fitted_sigmoid_slope:.4f} /dB")
             print(f"  Config defaults:      "
                   f"snr_thresh={SNR_THRESH_DB:.2f} dB  "
                   f"slope={SIGMOID_SLOPE:.4f} /dB")
         else:
-            print(f"  Warning: not enough PER transition points for fitting "
+            print(f"  Warning: not enough BLER transition points for fitting "
                   f"({mask.sum()} valid pts).  Using config defaults.")
     except Exception as exc:
         print(f"  Warning: sigmoid fitting failed ({exc}).  "
@@ -211,11 +278,8 @@ def main() -> None:
     print("\n" + "─" * 70)
     print("  Part 3 — NS-3 multi-protocol simulation")
     print(f"  Protocols: {[p['label'] for p in PROTOCOLS]}")
-    from config import USE_BASE_STATIONS, NUM_STATIONARY_CLIENTS, NUM_MOVING_CLIENTS
-    _topo = ("indirect: Phone→gNB→AccessSat→ISL→BenchmarkSat→GS→Server"
-             if USE_BASE_STATIONS
-             else "direct: Phone→AccessSat→ISL→BenchmarkSat→GS→Server")
-    print(f"  Topology : {_topo}")
+    from config import NUM_STATIONARY_CLIENTS, NUM_MOVING_CLIENTS
+    print("  Topology : direct: Phone→AccessSat→ISL→BenchmarkSat→GS→Server")
     print(f"  Clients  : {NUM_STATIONARY_CLIENTS} stationary + "
           f"{NUM_MOVING_CLIENTS} moving  "
           f"(total {NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS})")

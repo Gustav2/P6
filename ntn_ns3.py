@@ -117,7 +117,17 @@ Dependencies
 
 import math
 import random as _random_mod
+import sys
+import os
 import numpy as np
+
+# Ensure the NS-3 cppyy Python bindings directory is on sys.path.
+# The bindings are built in-tree at ns-3-dev/build/bindings/python/
+# and are not installed into the venv's site-packages.
+_NS3_BINDINGS = os.path.expanduser("~/ns-3-dev/build/bindings/python")
+if _NS3_BINDINGS not in sys.path:
+    sys.path.insert(0, _NS3_BINDINGS)
+
 from ns import ns   # NS-3 cppyy-based Python bindings
 
 # ---------------------------------------------------------------------------
@@ -146,18 +156,13 @@ from config import (
     TCP_TIMESTAMPS,
     PROTOCOLS,
     PHONE_EIRP_DBM,
-    GNB_EIRP_DBM,
-    GNB_PROCESSING_DELAY_MS,
     TERRESTRIAL_BACKHAUL_DELAY_MS,
-    GNB_DATARATE,
-    GNB_TERRESTRIAL_PER,
     SAT_RX_ANTENNA_GAIN_DB,
     NOISE_FLOOR_DBM,
     SNR_THRESH_DB,
     SIGMOID_SLOPE,
     RT_GAIN_P10_BLEND,
     # Multi-client topology
-    USE_BASE_STATIONS,
     NUM_STATIONARY_CLIENTS,
     NUM_MOVING_CLIENTS,
     CLIENT_AREA_RADIUS_M,
@@ -167,8 +172,6 @@ from config import (
     PEDESTRIAN_SPEED_MAX_MS,
     VEHICULAR_SPEED_MIN_MS,
     VEHICULAR_SPEED_MAX_MS,
-    GNB_POSITIONS,
-    NUM_GNB,
     DATA_VOLUME_MB,
     ISL_DATARATE,
     ISL_DELAY_MS,
@@ -223,51 +226,35 @@ def _fspl_db(height_m: float, elev_deg: float,
 
 def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
                         rt_gain_p10_db: float = None,
-                         rt_ref_gain_db: float = None,
-                         tx_eirp_dbm: float = None,
-                         snr_thresh_db: float = None,
+                        rt_ref_gain_db: float = None,
+                        snr_thresh_db: float = None,
                         sigmoid_slope: float = None) -> float:
     """
     Estimate packet error rate using a sigmoid link-budget model
     calibrated by the RT-derived mean path gain.
 
-    The Sionna RT proxy TX is placed only RT_SAT_SCENE_HEIGHT_M (~300 m)
-    above the scene, so the absolute mean_path_gain_db value reflects both
-    the short proxy free-space loss and urban multipath.  The *relative*
-    gain difference between satellites (due to elevation-dependent shadowing
-    and multipath) is physically meaningful; the absolute value is not
-    directly transferable to the real 550 km slant range.
+    Link budget (direct Phone→Satellite uplink):
+        SNR [dB] = PHONE_EIRP − FSPL_550km + urban_correction
+                   + SAT_RX_GAIN − NOISE_FLOOR
 
-    Link budget:
-        SNR [dB] = Tx_EIRP − FSPL_600km + urban_correction − Noise_floor
-
-    where urban_correction is derived by normalising the RT gain against the
-    best (highest-elevation) satellite so that the reference satellite
-    contributes 0 dB correction and lower-elevation satellites are penalised
-    by their relative RT gain deficit.
+    urban_correction normalises the RT gain against the best satellite so
+    that the reference contributes 0 dB and lower-elevation satellites are
+    penalised by their relative RT gain deficit.
 
     Parameters
     ----------
     fspl_db         : float  Free-space path loss over real 550 km slant [dB].
     rt_mean_gain_db : float  Mean |h| gain from Sionna RT for this satellite [dB].
+    rt_gain_p10_db  : float  10th-percentile gain (optional urban penalty).
     rt_ref_gain_db  : float  RT gain of the reference (best) satellite [dB].
                              When None, no urban correction is applied.
-    tx_eirp_dbm     : float  Transmitter EIRP [dBm].  When None, defaults to
-                             PHONE_EIRP_DBM (23 dBm) for backward compatibility.
-                             Use GNB_EIRP_DBM (43 dBm) for the indirect topology.
-    snr_thresh_db   : float  Sigmoid threshold [dB].  When None, uses
-                             SNR_THRESH_DB from config (initial estimate).
-                             Pass the value fitted to the Sionna LDPC BER curve.
-    sigmoid_slope   : float  Sigmoid slope [1/dB].  When None, uses
-                             SIGMOID_SLOPE from config (initial estimate).
-                             Pass the value fitted to the Sionna LDPC BER curve.
+    snr_thresh_db   : float  Sigmoid threshold [dB] (default: SNR_THRESH_DB).
+    sigmoid_slope   : float  Sigmoid slope [1/dB] (default: SIGMOID_SLOPE).
 
     Returns
     -------
     float  Packet error rate in [0, 1).
     """
-    if tx_eirp_dbm is None:
-        tx_eirp_dbm = PHONE_EIRP_DBM
     if snr_thresh_db is None:
         snr_thresh_db = SNR_THRESH_DB
     if sigmoid_slope is None:
@@ -295,7 +282,7 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
     #   SNR = TX_EIRP − FSPL + urban_correction + SAT_RX_GAIN − NOISE_FLOOR
     # SAT_RX_ANTENNA_GAIN_DB models the satellite's phased-array receive
     # aperture (~30 dBi at 3.5 GHz for a modern LEO NTN spot beam).
-    snr_db = (tx_eirp_dbm - fspl_db + urban_correction_db
+    snr_db = (PHONE_EIRP_DBM - fspl_db + urban_correction_db
               + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM)
     per    = 1.0 / (1.0 + math.exp(sigmoid_slope * (snr_db - snr_thresh_db)))
     return float(np.clip(per, 0.0, 0.99))
@@ -306,7 +293,6 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
 # =============================================================================
 
 def _compute_handover_schedule(channel_stats: list,
-                                tx_eirp_dbm: float = None,
                                 snr_thresh_db: float = None,
                                 sigmoid_slope: float = None,
                                 rng_seed: int = 42) -> list:
@@ -329,9 +315,6 @@ def _compute_handover_schedule(channel_stats: list,
     channel_stats : list[dict]
         RT channel statistics, one dict per satellite (output of
         rt_sim.run_ray_tracing()).
-    tx_eirp_dbm : float, optional
-        Transmitter EIRP passed through to _rt_calibrated_per().
-        Defaults to PHONE_EIRP_DBM when None.
     snr_thresh_db : float, optional
         Sigmoid threshold [dB].  Defaults to SNR_THRESH_DB when None.
         Pass the value fitted to the Sionna LDPC BER curve.
@@ -406,7 +389,7 @@ def _compute_handover_schedule(channel_stats: list,
         fspl   = _fspl_db(SAT_HEIGHT_M, max(elev_deg, 1.0))
         per    = _rt_calibrated_per(fspl, stat["mean_path_gain_db"],
                                     stat.get("mean_path_gain_p10_db"),
-                                    ref_gain_db, tx_eirp_dbm,
+                                    ref_gain_db,
                                     snr_thresh_db, sigmoid_slope)
         delay  = _one_way_delay_ms(SAT_HEIGHT_M, max(elev_deg, 1.0))
 
@@ -733,13 +716,9 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     label     = protocol_cfg.get("label", proto.upper())
     ns3_proto = "udp" if proto == "quic" else proto
 
-    # TX EIRP for the ground→satellite service link
-    tx_eirp   = GNB_EIRP_DBM if USE_BASE_STATIONS else PHONE_EIRP_DBM
-    topo_str  = "indirect (gNB)" if USE_BASE_STATIONS else "direct"
-
     num_clients = NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS
 
-    print(f"\n[NS-3]  {scenario.upper()}  topology={topo_str}  "
+    print(f"\n[NS-3]  {scenario.upper()}  topology=direct  "
           f"protocol={label}  clients={num_clients}")
 
     # ── TCP global config ─────────────────────────────────────────────────────
@@ -748,11 +727,11 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
 
     # ── Handover schedule ─────────────────────────────────────────────────────
     schedule = _compute_handover_schedule(
-        channel_stats, tx_eirp_dbm=tx_eirp,
+        channel_stats,
         snr_thresh_db=snr_thresh_db,
         sigmoid_slope=sigmoid_slope,
     )
-    print(f"  Handover schedule (EIRP={tx_eirp:.0f} dBm): {len(schedule)} slot(s)")
+    print(f"  Handover schedule (EIRP={PHONE_EIRP_DBM:.0f} dBm): {len(schedule)} slot(s)")
     for slot in schedule:
         gap_str = f"  gap={slot['interruption_ms']:.0f}ms" if slot["interruption_ms"] > 0 else ""
         print(f"    sat{slot['sat_id']}  {slot['t_start']:.1f}s–{slot['t_end']:.1f}s  "
@@ -781,24 +760,16 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     # =========================================================================
     # Node creation
     # =========================================================================
-    # Node layout (all in one NodeContainer for InternetStack):
-    #   [0 … num_clients-1]               : phone nodes
-    #   [num_clients … num_clients+NUM_GNB-1] : gNB nodes (if USE_BASE_STATIONS)
-    #   [base_idx]                         : benchmark satellite (Sat 0)
-    #   [base_idx+1 … base_idx+n_access]   : access satellites (Sat 1…N)
-    #   [base_idx+n_access+1]              : internet server
-    #
-    # n_access = number of access satellites = len(schedule) - 1 (Sat 0 is
-    # the benchmark; we need at least 1 access sat even if only 1 in schedule)
+    # Node layout:
+    #   [0 … num_clients-1]                    : phone nodes
+    #   [num_clients]                          : benchmark satellite (Sat 0)
+    #   [num_clients+1 … num_clients+n_access] : access satellites (Sat 1…N)
+    #   [num_clients+n_access+1]               : internet server
 
-    n_access_sats = max(1, len(schedule) - 1)  # access sats (not the benchmark)
-    n_gnbs        = NUM_GNB if USE_BASE_STATIONS else 0
+    n_access_sats = max(1, len(schedule) - 1)
 
-    # Index helpers
-    phone_idx   = lambda i: i                                  # 0..num_clients-1
-    gnb_idx     = lambda i: num_clients + i                    # 0..n_gnbs-1
-    bench_idx   = num_clients + n_gnbs                         # benchmark sat
-    access_idx  = lambda i: bench_idx + 1 + i                  # 0..n_access_sats-1
+    bench_idx   = num_clients
+    access_idx  = lambda i: bench_idx + 1 + i
     server_idx  = bench_idx + 1 + n_access_sats
     total_nodes = server_idx + 1
 
@@ -806,8 +777,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     nodes.Create(total_nodes)
     ns.InternetStackHelper().Install(nodes)
 
-    phones   = [nodes.Get(phone_idx(i)) for i in range(num_clients)]
-    gnbs     = [nodes.Get(gnb_idx(i))   for i in range(n_gnbs)]
+    phones   = [nodes.Get(i)            for i in range(num_clients)]
     bench    = nodes.Get(bench_idx)
     accesses = [nodes.Get(access_idx(i)) for i in range(n_access_sats)]
     server   = nodes.Get(server_idx)
@@ -898,89 +868,30 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         subnet_iter[0] += 1
         return f"10.{n // 256}.{n % 256}.0"
 
-    # ── Assign each phone to the nearest gNB (or directly to access sat 0) ───
-    # client_to_gnb[i] = gNB index for client i  (USE_BASE_STATIONS only)
-    client_to_gnb = []
-    if USE_BASE_STATIONS and n_gnbs > 0:
-        for i in range(num_clients):
-            px, py, _ = phone_positions[i]
-            dists = [
-                _math.hypot(px - GNB_POSITIONS[g][0], py - GNB_POSITIONS[g][1])
-                for g in range(n_gnbs)
-            ]
-            client_to_gnb.append(int(dists.index(min(dists))))
-    else:
-        client_to_gnb = [0] * num_clients
-
-    # ── gNB positions ─────────────────────────────────────────────────────────
-    for gi, (gx, gy) in enumerate(GNB_POSITIONS[:n_gnbs]):
-        gmob = gnbs[gi].GetObject[ns.ConstantPositionMobilityModel]()
-        gmob.SetPosition(ns.Vector(gx, gy, 30.0))
-
     # =========================================================================
     # Wiring up links
     # =========================================================================
 
-    # All phone↔gNB or phone↔access-sat error models stored per-client
-    # so handover callback can update each one.
-    em_svc_list   = []   # service-link error model per client/gNB
-    devs_svc_list = []   # service-link DeviceContainer per client/gNB
+    # Service-link error models stored per-client so handover callbacks can
+    # update all of them simultaneously.
+    em_svc_list   = []   # service-link RateErrorModel per phone
+    devs_svc_list = []   # service-link DeviceContainer per phone
 
-    # ── Phone ↔ gNB  (or direct Phone ↔ access-sat-0) ────────────────────────
-    if USE_BASE_STATIONS:
-        # Phone → gNB  (terrestrial, high data rate, low PER)
-        gnb_used = set(client_to_gnb)
-        p2p.SetDeviceAttribute("DataRate", ns.StringValue(GNB_DATARATE))
-        p2p.SetChannelAttribute("Delay",
-            ns.StringValue(f"{GNB_PROCESSING_DELAY_MS:.3f}ms"))
-        for i in range(num_clients):
-            devs_ug = p2p.Install(_nc2(phones[i], gnbs[client_to_gnb[i]]))
-            em_ug = ns.CreateObject[ns.RateErrorModel]()
-            em_ug.SetAttribute("ErrorRate", ns.DoubleValue(GNB_TERRESTRIAL_PER))
-            em_ug.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-            devs_ug.Get(1).SetAttribute("ReceiveErrorModel",
-                                        ns.PointerValue(em_ug))
-            ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
-                         ns.Ipv4Mask("255.255.255.0"))
-            ipv4.Assign(devs_ug)
-
-        # gNB → access satellite 0  (NTN hop, GNB EIRP)
-        # All gNBs share the same access sat (Sat 0 in schedule order →
-        # accesses[0]).  Each gNB gets its own P2P link; they all share
-        # the same error model so handover updates all simultaneously.
-        p2p.SetDeviceAttribute("DataRate", ns.StringValue("10Mbps"))
-        p2p.SetChannelAttribute("Delay",
-            ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
-        for gi in sorted(gnb_used):
-            devs_svc = p2p.Install(_nc2(gnbs[gi], accesses[0]))
-            em = ns.CreateObject[ns.RateErrorModel]()
-            em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
-            em.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-            devs_svc.Get(1).SetAttribute("ReceiveErrorModel",
-                                          ns.PointerValue(em))
-            em_svc_list.append(em)
-            devs_svc_list.append(devs_svc)
-            ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
-                         ns.Ipv4Mask("255.255.255.0"))
-            ipv4.Assign(devs_svc)
-
-    else:
-        # Direct: Phone → access satellite 0
-        p2p.SetDeviceAttribute("DataRate", ns.StringValue("10Mbps"))
-        p2p.SetChannelAttribute("Delay",
-            ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
-        for i in range(num_clients):
-            devs_svc = p2p.Install(_nc2(phones[i], accesses[0]))
-            em = ns.CreateObject[ns.RateErrorModel]()
-            em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
-            em.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-            devs_svc.Get(1).SetAttribute("ReceiveErrorModel",
-                                          ns.PointerValue(em))
-            em_svc_list.append(em)
-            devs_svc_list.append(devs_svc)
-            ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
-                         ns.Ipv4Mask("255.255.255.0"))
-            ipv4.Assign(devs_svc)
+    # ── Phone → access satellite 0 (direct NTN hop, 10 Mbps) ─────────────────
+    p2p.SetDeviceAttribute("DataRate", ns.StringValue("10Mbps"))
+    p2p.SetChannelAttribute("Delay",
+        ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
+    for i in range(num_clients):
+        devs_svc = p2p.Install(_nc2(phones[i], accesses[0]))
+        em = ns.CreateObject[ns.RateErrorModel]()
+        em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
+        em.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
+        devs_svc.Get(1).SetAttribute("ReceiveErrorModel", ns.PointerValue(em))
+        em_svc_list.append(em)
+        devs_svc_list.append(devs_svc)
+        ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
+                     ns.Ipv4Mask("255.255.255.0"))
+        ipv4.Assign(devs_svc)
 
     # ── Access satellite(s) → Benchmark satellite (ISL) ──────────────────────
     p2p.SetDeviceAttribute("DataRate", ns.StringValue(ISL_DATARATE))
@@ -1226,7 +1137,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         scenario        = scenario,
         protocol        = proto,
         label           = label,
-        topology        = topo_str,
+        topology        = "direct",
         elevation_deg   = first["elev_deg"],
         svc_delay_ms    = round(weighted_delay_ms, 2),
         svc_loss_pct    = round(first["per"] * 100.0, 2),
@@ -1316,10 +1227,8 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     if total_rx > 0:
         # Jain's fairness index: J = (Σx)² / (n · Σx²)
         n_flows = len(flow_tputs)
-        if n_flows > 0 and sum(x**2 for x in flow_tputs) > 0:
-            fairness = (sum(flow_tputs) ** 2) / (n_flows * sum(x**2 for x in flow_tputs))
-        else:
-            fairness = 0.0
+        sum_sq  = sum(x**2 for x in flow_tputs)
+        fairness = (sum(flow_tputs)**2 / (n_flows * sum_sq)) if (n_flows > 0 and sum_sq > 0) else 0.0
 
         result.update(
             tx_packets      = total_tx,
@@ -1333,13 +1242,29 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
 
     ns.Simulator.Destroy()
 
-    print(f"\n  Results ({label}, {topo_str}):")
+    print(f"\n  Results ({label}, direct):")
     for k, v in result.items():
         if k not in ("schedule", "profile_stats", "timeseries"):
             print(f"    {k:<24s}: {v}")
     print(f"    {'fairness_index':<24s}: {result['fairness_index']:.4f}")
 
     return result
+
+
+# =============================================================================
+# Parallel protocol runner helpers
+# =============================================================================
+
+def _ns3_parallel_worker(args: tuple) -> dict:
+    """
+    Top-level worker function for multiprocessing.Pool.
+
+    Must be at module level (not nested) so it can be pickled by the
+    spawn-context Pool.  Each worker runs in its own process with its
+    own NS-3 instance, so there is no shared global state to worry about.
+    """
+    scenario, pcfg, channel_stats, snr_thresh_db, sigmoid_slope = args
+    return run_ns3(scenario, pcfg, channel_stats, snr_thresh_db, sigmoid_slope)
 
 
 # =============================================================================
@@ -1382,36 +1307,45 @@ def run_ns3_both_topologies(channel_stats: list,
         The tuple structure is kept for backward compatibility with callers
         that unpack as:  direct_results, indirect_results = run_ns3_both_topologies(...)
     """
-    results             = []
-    bbr_result_for_quic = None
+    import multiprocessing as _mp
 
-    for pcfg in PROTOCOLS:
-        if pcfg["protocol"] == "quic":
-            continue   # defer until BBR is done
+    common_tcp = dict(
+        tcp_snd_buf    = TCP_SNDRCV_BUF_BYTES,
+        tcp_rcv_buf    = TCP_SNDRCV_BUF_BYTES,
+        tcp_sack       = TCP_SACK_ENABLED,
+        tcp_timestamps = TCP_TIMESTAMPS,
+    )
 
-        full_cfg = dict(
-            tcp_snd_buf    = TCP_SNDRCV_BUF_BYTES,
-            tcp_rcv_buf    = TCP_SNDRCV_BUF_BYTES,
-            tcp_sack       = TCP_SACK_ENABLED,
-            tcp_timestamps = TCP_TIMESTAMPS,
-            **pcfg,
-        )
-        r = run_ns3(scenario, full_cfg, channel_stats,
-                    snr_thresh_db=snr_thresh_db, sigmoid_slope=sigmoid_slope)
-        results.append(r)
+    # Build one args-tuple per non-QUIC protocol (QUIC is derived analytically).
+    non_quic_cfgs = [pcfg for pcfg in PROTOCOLS if pcfg["protocol"] != "quic"]
+    args_list = [
+        (scenario, {**common_tcp, **pcfg}, channel_stats, snr_thresh_db, sigmoid_slope)
+        for pcfg in non_quic_cfgs
+    ]
 
-        if pcfg.get("label") == "TCP BBR":
-            bbr_result_for_quic = r
+    # Each NS-3 run is single-threaded and independent; spawn one process per
+    # protocol so all protocols execute simultaneously.  spawn (not fork) is
+    # used for safety — it starts a clean Python interpreter that re-imports
+    # ntn_ns3 (and therefore NS-3) fresh, avoiding shared-library state issues.
+    #
+    # Stdout from parallel workers is interleaved; redirect to a file if you
+    # need clean per-protocol logs:  python main.py 2>&1 | tee run.log
+    n_workers = min(len(args_list), os.cpu_count() or 4)
+    print(f"\n  Spawning {n_workers} parallel NS-3 workers "
+          f"({len(args_list)} protocols) ...")
+    ctx = _mp.get_context("spawn")
+    with ctx.Pool(processes=n_workers) as pool:
+        results = list(pool.map(_ns3_parallel_worker, args_list))
 
-    # QUIC: analytical corrections on top of BBR baseline
-    if bbr_result_for_quic is not None:
+    # QUIC: analytical corrections on top of BBR baseline (main process only)
+    bbr_result = next((r for r in results if r.get("label") == "TCP BBR"), None)
+    if bbr_result is not None:
         quic_result = _apply_quic_corrections(
-            bbr_result_for_quic,
-            bbr_result_for_quic["schedule"],
+            bbr_result,
+            bbr_result["schedule"],
             link_rate_bps=10e6,   # 10 Mbps service link
         )
-        topo_str = "indirect (gNB)" if USE_BASE_STATIONS else "direct"
-        quic_result["topology"] = topo_str
+        quic_result["topology"] = "direct"
         results.append(quic_result)
     else:
         print("[QUIC]  No BBR result found — skipping QUIC.")

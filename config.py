@@ -57,7 +57,8 @@ SUBCARRIER_SPACING = 15e3
 OFDM subcarrier spacing [Hz].
 - 15 kHz = NR numerology µ=0, the baseline for FR1 sub-6 GHz deployments.
 - 3GPP TR 38.821 §6.1.2 notes that µ=1 (30 kHz) or µ=3 (120 kHz) may be
-  needed for LEO NTN to handle Doppler shifts of up to ±24 kHz at 3.5 GHz.
+  needed for LEO NTN because the satellite Doppler at 3.5 GHz reaches up to
+  ±88.8 kHz (v=7612 m/s, see SAT_ORBITAL_VELOCITY_MS) >> 15 kHz SCS.
   µ=0 is retained here as the reference numerology for the Munich urban scene.
 - One NR slot at µ=0 has duration T_slot = 1 ms (14 OFDM symbols).
 Source: [3GPP-38.300] §5.3.1, Table 4.1-1 in [3GPP-38.101-1].
@@ -108,10 +109,14 @@ LDPC channel code rate (k/n).
 Source: [3GPP-38.214] Table 5.1.3.1-2.
 """
 
-BATCH_SIZE = 64
+BATCH_SIZE = 512
 """
 Number of independent channel realisations evaluated per SNR point.
 - Higher values reduce Monte-Carlo variance but increase memory/time.
+- 512 keeps all 8 Jetson CPU cores busy via TF intra-op parallelism while
+  staying well within the 61 GB unified memory budget (~400 MB peak).
+- Original value was 64; 512 gives 8× better variance reduction per sweep,
+  which is important for reliable BER→PER sigmoid fitting.
 """
 
 # =============================================================================
@@ -154,9 +159,9 @@ Orbital velocity of a LEO satellite at SAT_HEIGHT_M [m/s].
     R_E = 6.3781×10⁶ m            (WGS84 equatorial radius)
     h   = 5.50×10⁵ m              (550 km altitude)
   → v = sqrt(3.986e14 / 6.928e6) = 7,612 m/s
-- Doppler shift at 3.5 GHz (worst case, overhead pass):
-    Δf_max = v/c × f = 7612 / 3×10⁸ × 3.5×10⁹ ≈ ±88 Hz per km of slant
-    Peak Δf ≈ ±24 kHz (when satellite is near the horizon).
+- Doppler shift at 3.5 GHz (worst case, near horizon where radial velocity peaks):
+    Δf_max = v/c × f = 7612 / 3×10⁸ × 3.5×10⁹ ≈ ±88.8 kHz (full radial pass)
+    Δf at zenith ≈ 0 (perpendicular to LOS); peak near horizon ≈ ±88.8 kHz.
 - Used in ntn_phy.py: ut_velocities is set to zero, NOT to this value.
   3GPP TR 38.821 §6.1.2 mandates that NTN UEs pre-compensate the satellite
   Doppler shift before the OFDM demodulator.  At 3.5 GHz, the max Doppler
@@ -324,6 +329,26 @@ RT_CAM_POSITION = [-170, -170, 140]
 RT_CAM_LOOK_AT = [50, 50, 0]
 """Look-at target [x, y, z] in metres for scene renders."""
 
+RT_RENDER_PATHS = True
+"""
+Render per-satellite path visualisation images during ray tracing.
+
+Set to False to skip all render_to_file calls inside _trace_satellite
+(one per satellite × num_samples rays each).  On LLVM JIT these renders
+are typically the slowest part of the RT stage — disabling them gives a
+significant speedup at the cost of not producing ntn_rt_paths_sat<N>.png.
+The radiomap render (ntn_rt_radiomap.png) is always produced regardless.
+"""
+
+RT_RENDER_NUM_SAMPLES = 64
+"""
+Path-tracing samples per pixel for RT scene renders.
+
+Lower values produce noisier images but render faster.
+64 gives visually acceptable quality and is 4× faster than the
+reference value of 256.  Applies to both path renders and the radiomap.
+"""
+
 
 
 # =============================================================================
@@ -420,63 +445,16 @@ Enable TCP Timestamps option (RFC 7323).
 """
 
 # =============================================================================
-# Antenna / EIRP parameters for direct vs indirect topology comparison
+# Antenna / EIRP parameters
 # =============================================================================
 
 PHONE_EIRP_DBM = 23.0
 """
-Phone (UE) uplink EIRP [dBm] for the direct Phone→Satellite path.
+Phone (UE) uplink EIRP [dBm] for the direct Phone→Satellite service link.
 - 23 dBm = 200 mW, the maximum transmit power for 5G NR UE Power Class 3,
   which covers the vast majority of handsets.
 - Omnidirectional handheld antenna; no beamforming gain assumed.
-- Produces higher PER on the NTN hop compared to a fixed gNB antenna.
 Source: [3GPP-38.101-1] §6.2.2, Table 6.2.2-1 (UE Power Class 3 = 23 dBm).
-"""
-
-GNB_EIRP_DBM = 43.0
-"""
-gNB uplink EIRP [dBm] for the indirect Phone→gNB→Satellite path.
-- 43 dBm = 20 W total radiated power.  A mid-size outdoor 5G gNB with a
-  64T64R antenna array delivers 43–48 dBm EIRP toward a satellite.
-  The 3GPP NTN reference gNB is specified at 38–43 dBm TX power + antenna
-  gain; 43 dBm represents the upper end of the macro-cell range.
-Source: [3GPP-38.821] §6.1, Table 6.1.1-1 (NTN gNB reference EIRP = 43 dBm).
-        [Nokia-5G] white paper §3 (outdoor macro gNB EIRP 43–48 dBm).
-"""
-
-GNB_PROCESSING_DELAY_MS = 3.5
-"""
-gNB one-way baseband processing delay [ms] added to the indirect
-topology's terrestrial-hop latency.
-
-This accounts for L1 (PDSCH/PUSCH decode) + L2 (RLC/PDCP reassembly) +
-scheduling pipeline delay at the gNB, measured from packet reception at
-the air interface to forwarding toward the NTN uplink.
-
-Derivation from 3GPP TS 38.133:
-  • N1 (UE PDSCH processing, µ=0): 8 OFDM symbols = 8/14 ms ≈ 0.571 ms
-  • N2 (gNB PUSCH processing, µ=0): 3 OFDM symbols = 3/14 ms ≈ 0.214 ms
-  These are *minimum* L1 pipeline budgets; actual gNB implementations
-  add scheduling wait time (up to 1 slot = 1 ms at µ=0) and L2/L3
-  processing (RLC SDU assembly, PDCP ciphering, GTP-U encapsulation).
-
-Measured values from deployed 5G gNBs (industry sources):
-  • Nokia AirScale gNB L1+L2 one-way latency: 1–4 ms (Nokia 5G KPI guide,
-    2021).
-  • Ericsson Radio System gNB PDCP-to-air latency: 2–5 ms (Ericsson
-    Technology Review, 5G NR latency analysis, 2017).
-  • 3GPP TR 38.913 §8.2.1 user-plane latency budget: gNB contribution
-    of (T_proc,1 + T_proc,2) = 4 OFDM symbols + scheduling delay ≈ 3 ms
-    for a typical µ=0, DL-heavy slot pattern.
-
-Adopted value: 3.5 ms (midpoint of the 2–5 ms range, consistent with
-  the 3GPP TR 38.913 user-plane latency breakdown for µ=0).
-
-Sources:
-  [3GPP-38.133] §7.6, Table 7.6.2.1-1 (N1/N2 processing time symbols).
-  3GPP TR 38.913 v16.0.0 §8.2.1 (user-plane latency budget, gNB = ~3 ms).
-  Ericsson Technology Review, "5G NR — The Next Generation Wireless
-    Access Technology" (2017), §3.3, Table 1.
 """
 
 TERRESTRIAL_BACKHAUL_DELAY_MS = 10.0
@@ -494,35 +472,6 @@ One-way latency of the Benchmark Satellite → Internet Server link [ms].
       fibre latency ≈ 5 µs/km for terrestrial routes.
     Akamai State of the Internet Q4 2022: regional CDN RTTs 15–30 ms imply
       one-way backhaul of 7–15 ms for metro distances.
-"""
-
-GNB_DATARATE = "150Mbps"
-"""
-Data rate of the Phone→gNB terrestrial radio link [NS-3 string].
-- Represents a 5G NR Uu interface in a local urban macro cell.
-- 3GPP TS 38.306 §4.1.2 defines the UE downlink peak data rate formula:
-    R = ν × Q × f × R_code × N_PRB × 12 / T_slot
-  For a Category 3 UE (4 layers, 256-QAM, 100 MHz n78):
-    DL peak ≈ 1.6 Gbps theoretical; with overhead ~1 Gbps.
-  UL peak for a typical UE (1 layer, 64-QAM, 100 MHz): ~150–200 Mbps.
-- 150 Mbps is a realistic single-UE uplink throughput for a mid-range
-  5G NR deployment (3GPP TR 38.913 §7.1 target: 50 Mbps UL per user).
-Source: [3GPP-38.306] §4.1.2 (peak data rate formula).
-        3GPP TR 38.913 v16.0.0 §7.1 (IMT-2020 UL edge rate 50 Mbps,
-          peak 10 Gbps DL / 10 Gbps UL at theoretical limits).
-"""
-
-GNB_TERRESTRIAL_PER = 0.001
-"""
-Packet error rate on the Phone→gNB terrestrial hop (residual after HARQ).
-- 3GPP TS 38.214 §5.1 sets the initial BLER target at 10% for the first
-  HARQ transmission.  After combining 2–4 HARQ retransmissions the
-  residual BLER (≈ undetected-error PER) drops to 10⁻³ to 10⁻⁴.
-- 0.001 (0.1 %) is the standard assumption for a well-margined terrestrial
-  5G NR link after HARQ and is negligible compared to the NTN hop PER
-  on the direct satellite path.
-Source: [3GPP-38.214] §5.1 (target BLER 10% before HARQ combining).
-        3GPP TR 38.913 §8.2 (residual BLER ≤ 10⁻³ after 4 HARQ rounds).
 """
 
 SAT_RX_ANTENNA_GAIN_DB = 30.0
@@ -653,24 +602,6 @@ positions in the urban scene.
 # Multi-client topology settings
 # =============================================================================
 
-USE_BASE_STATIONS = False
-"""
-Topology mode flag.
-
-  True  — Indirect:  Phone → gNB → AccessSat → ISL → BenchmarkSat → GS → Server
-           Each phone is assigned to the nearest gNB (from GNB_POSITIONS).
-           The gNB aggregates traffic before the NTN hop, improving link budget
-           by GNB_EIRP_DBM − PHONE_EIRP_DBM = 20 dB relative to direct mode.
-
-  False — Direct:    Phone → AccessSat → ISL → BenchmarkSat → GS → Server
-           Phones connect to the access satellite directly (no gNB hop).
-           Represents satellite-direct (SD) IoT / mobile terminal use case.
-
-In both modes the benchmark satellite (Sat 0, the highest-elevation satellite
-in the handover schedule) is always reachable via ISL from any access satellite,
-so throughput measurements remain consistent across handovers.
-"""
-
 NUM_STATIONARY_CLIENTS = 30
 """
 Number of stationary client (phone) nodes placed randomly inside a circle
@@ -739,37 +670,6 @@ VEHICULAR_SPEED_MIN_MS = 10.0
 VEHICULAR_SPEED_MAX_MS = 22.0
 """Maximum vehicular moving-client speed [m/s] (79 km/h urban arterial)."""
 
-WAYPOINT_SPEED_MIN_MS = PEDESTRIAN_SPEED_MIN_MS
-"""Backward-compatible alias for minimum moving-client speed [m/s]."""
-
-WAYPOINT_SPEED_MAX_MS = VEHICULAR_SPEED_MAX_MS
-"""Backward-compatible alias for maximum moving-client speed [m/s]."""
-
-# =============================================================================
-# Base station positions (used only when USE_BASE_STATIONS = True)
-# =============================================================================
-
-GNB_POSITIONS = [
-    (200.0, 150.0),
-    (500.0, 300.0),
-    (350.0, 600.0),
-]
-"""
-List of (x_m, y_m) positions [m] for the fixed gNB nodes in the NS-3
-simulation.  The z-coordinate is fixed at 30.0 m (rooftop installation).
-
-Each phone is assigned to the nearest gNB (minimum Euclidean distance
-at t=0 for stationary clients; at initial position for moving clients).
-
-Three gNBs are sufficient to provide at least one handover between cells
-for moving clients traversing CLIENT_AREA_RADIUS_M at WAYPOINT_SPEED_MAX_MS.
-
-Positions are expressed in NS-3 Cartesian coordinates (metres), with the
-coordinate origin at the centre of the deployment area.
-"""
-
-NUM_GNB = len(GNB_POSITIONS)
-"""Number of gNB nodes — derived from GNB_POSITIONS, do not set manually."""
 
 # =============================================================================
 # Data volume per flow

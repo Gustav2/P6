@@ -47,12 +47,18 @@ Returns
 import math
 import numpy as np
 
-# Force LLVM (CPU) Mitsuba variant BEFORE importing sionna.rt.
-# Without this, Sionna tries cuda_ad_mono_polarized first; on machines
-# without CUDA drivers the DrJIT GPU init crashes with a fatal GIL error.
+# All Mitsuba 3 CUDA variants require OptiX (libnvoptix.so.1).
+# Jetson Orin has CUDA but NOT OptiX — it is an embedded/integrated GPU that
+# lacks the dedicated RT hardware and driver library OptiX needs.
+# Detect OptiX availability at import time via ctypes; fall back to the LLVM
+# (multi-threaded CPU JIT) variant when OptiX is absent.
+import ctypes.util as _ctypes_util
 import mitsuba as mi
 if mi.variant() is None:
-    mi.set_variant("llvm_ad_mono_polarized")
+    if _ctypes_util.find_library("nvoptix"):
+        mi.set_variant("cuda_ad_mono_polarized")   # discrete RTX GPU with OptiX
+    else:
+        mi.set_variant("llvm_ad_mono_polarized")   # CPU JIT (Jetson Orin path)
 
 import sionna
 import sionna.rt
@@ -77,6 +83,8 @@ from config import (
     RT_SAT_INITIAL_ZENITH_DEG,
     RT_CAM_POSITION,
     RT_CAM_LOOK_AT,
+    RT_RENDER_PATHS,
+    RT_RENDER_NUM_SAMPLES,
     NUM_SATELLITES,
     SAT_SPACING_DEG,
     SAT_HANDOVER_ELEVATION_DEG,
@@ -107,8 +115,7 @@ def _sat_elevation_deg(sat_x: float, sat_y: float, sat_z: float,
     dx = sat_x - ue_x
     dy = sat_y - ue_y
     dz = sat_z - ue_z
-    horiz = math.sqrt(dx ** 2 + dy ** 2)
-    return math.degrees(math.atan2(dz, horiz))
+    return math.degrees(math.atan2(dz, math.hypot(dx, dy)))
 
 
 def _propagation_delay_ms(height_m: float, elev_deg: float) -> float:
@@ -187,7 +194,8 @@ def _satellite_positions(ue_pos: list, height_m: float,
 # =============================================================================
 
 def _extract_channel_stats(paths, sat_id: int,
-                             sat_pos: tuple, elev_deg: float) -> dict:
+                             sat_pos: tuple, elev_deg: float,
+                             rx_idx: int = 0) -> dict:
     """
     Compute scalar channel statistics from a Sionna RT Paths object.
 
@@ -201,26 +209,30 @@ def _extract_channel_stats(paths, sat_id: int,
     sat_id   : int              Satellite index (0-based).
     sat_pos  : (x, y, z)       Satellite proxy position [m].
     elev_deg : float            Elevation angle [deg].
+    rx_idx   : int              Receiver index to extract (default 0).
+                                With a single-scene multi-receiver setup the
+                                Paths tensors have shape
+                                [num_rx, num_rx_ant, num_tx, num_tx_ant, max_paths].
+                                Slicing by rx_idx isolates one UE's paths.
 
     Returns
     -------
     dict  Channel statistics (see module docstring for keys).
     """
-    tau_np  = np.array(paths.tau)            # [num_rx, …, num_paths]
-    a_re_np = np.array(paths.a[0])           # real part of channel coefficients
-    a_im_np = np.array(paths.a[1])           # imaginary part
-    valid_np = np.array(paths.valid).astype(bool)
+    # paths.a returns (real_tensor, imag_tensor), each shaped
+    # [num_rx, num_rx_ant, num_tx, num_tx_ant, max_paths].
+    # Slice receiver rx_idx and flatten the remaining antenna/tx dims.
+    tau_np   = np.array(paths.tau)[rx_idx].flatten()    # [max_paths]
+    a_re_np  = np.array(paths.a[0])[rx_idx].flatten()   # [max_paths]
+    a_im_np  = np.array(paths.a[1])[rx_idx].flatten()   # [max_paths]
+    valid_np = np.array(paths.valid)[rx_idx].flatten().astype(bool)  # [max_paths]
 
-    a_mag = np.sqrt(a_re_np ** 2 + a_im_np ** 2)  # |h|, linear
+    a_mag = np.hypot(a_re_np, a_im_np)  # |h|, linear
 
-    valid_flat = valid_np.flatten()
-    tau_flat   = tau_np.flatten()
-    a_flat     = a_mag.flatten()
+    valid_tau = tau_np[valid_np]
+    valid_a   = a_mag[valid_np]
 
-    valid_tau = tau_flat[valid_flat]
-    valid_a   = a_flat[valid_flat]
-
-    num_paths = int(valid_flat.sum())
+    num_paths = int(valid_np.sum())
 
     if num_paths == 0:
         # No paths resolved (e.g. satellite below horizon / blocked)
@@ -303,7 +315,7 @@ def _aggregate_sample_stats(sample_stats: list, sat_id: int, sat_pos: tuple) -> 
         mean_path_gain_db=round(float(np.mean(gains)), 2),
         mean_path_gain_p10_db=round(float(np.percentile(gains, 10)), 2),
         delay_spread_ns=round(float(np.mean(dss)), 2),
-        num_paths=int(round(float(np.mean([s["num_paths"] for s in sample_stats])))),
+        num_paths=int(round(float(np.mean([s["num_paths"] for s in valid])))),
         los_exists=bool(any(s.get("los_exists", False) for s in sample_stats)),
         sat_x_m=round(sat_pos[0], 1),
         sat_y_m=round(sat_pos[1], 1),
@@ -311,15 +323,18 @@ def _aggregate_sample_stats(sample_stats: list, sat_id: int, sat_pos: tuple) -> 
     )
 
 
-def _load_scene_with_ue(ue_pos: list, ue_name: str) -> tuple:
+def _load_scene_with_ues(ue_positions: list) -> tuple:
     """
-    Load the Munich scene, set the carrier frequency, and place the UE
-    receiver in the scene.
+    Load the Munich scene once and add ALL UE sample positions as receivers.
+
+    Using a single scene with N receivers is significantly faster than loading
+    N separate scenes because PathSolver traces rays for all receivers in a
+    single GPU/CPU kernel launch, sharing geometry intersection work.
 
     Returns
     -------
-    scene  : sionna.rt.Scene
-    rx_ue  : sionna.rt.Receiver  (the UE)
+    scene     : sionna.rt.Scene
+    receivers : list[sionna.rt.Receiver]  (one per UE position, in order)
     """
     scene = load_scene(sionna.rt.scene.munich, merge_shapes=True)
     scene.frequency = RT_SCENE_FREQ_HZ
@@ -348,11 +363,13 @@ def _load_scene_with_ue(ue_pos: list, ue_name: str) -> tuple:
         polarization="cross",
     )
 
-    # UE (phone) — service link receiver
-    rx_ue = Receiver(name=ue_name, position=ue_pos, display_radius=3)
-    scene.add(rx_ue)
+    receivers = []
+    for idx, ue_pos in enumerate(ue_positions):
+        rx = Receiver(name=f"ue{idx}", position=ue_pos, display_radius=3)
+        scene.add(rx)
+        receivers.append(rx)
 
-    return scene, rx_ue
+    return scene, receivers
 
 
 def _make_camera() -> Camera:
@@ -364,72 +381,87 @@ def _make_camera() -> Camera:
 # Per-satellite ray tracing
 # =============================================================================
 
-def _trace_satellite(scene, sat_id: int, sat_pos: tuple, ue_pos: list,
-                     elev_deg: float, render_paths: bool = False) -> tuple:
+def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
+                     ue_positions: list,
+                     render_paths: bool = False) -> tuple:
     """
-    Add the satellite proxy transmitter to the scene, run PathSolver for
-    the UE receiver, render a paths image, then remove the TX.
+    Add the satellite proxy transmitter to the shared scene, run ONE
+    PathSolver call that covers all UE receivers simultaneously, then
+    remove the TX.
+
+    Using a shared scene with multiple receivers is the key performance
+    optimisation: instead of N_ue separate PathSolver calls (one scene each),
+    we make a single call whose GPU/LLVM kernel traverses the BVH once for
+    all (TX, RX) pairs.  With N_ue=4 this reduces PathSolver calls from
+    4 × num_sats to 1 × num_sats — a 4× speedup for the RT stage.
 
     Parameters
     ----------
-    scene    : sionna.rt.Scene  (must already contain the "ue" receiver)
-    sat_id   : int
-    sat_pos  : (x, y, z)  Proxy transmitter position [m].
-    elev_deg : float       UE elevation angle [deg] for logging.
+    scene        : sionna.rt.Scene  Contains all UE receivers (ue0…ueN).
+    sat_id       : int
+    sat_pos      : (x, y, z)  Proxy transmitter position [m].
+    ue_positions : list of [x,y,z]  UE positions in scene order (ue0, ue1, …).
 
     Returns
     -------
-    paths : sionna.rt.Paths
-    stats : dict  Service-link channel statistics.
+    paths       : sionna.rt.Paths
+    sample_stats: list[dict]  Per-UE-receiver channel statistics.
     """
     tx_name = f"sat{sat_id}"
+    # Steer satellite beam towards the primary (first) UE position.
+    # With all UEs within ~200 m of each other and the proxy TX at 300 m,
+    # the boresight difference is < 5° for all UE positions — negligible.
     tx = Transmitter(
-        name     = tx_name,
-        position = sat_pos,
-        look_at  = ue_pos,   # Beam steered towards the UE
-        velocity = (0.0, 0.0, 0.0),  # Static within this snapshot
-        power_dbm = RT_TX_POWER_DBM, # from config.RT_TX_POWER_DBM
+        name      = tx_name,
+        position  = sat_pos,
+        look_at   = ue_positions[0],
+        velocity  = (0.0, 0.0, 0.0),
+        power_dbm = RT_TX_POWER_DBM,
         display_radius = 5,
     )
     scene.add(tx)
 
-    # Path computation — UE receiver is in the scene.
+    # Single PathSolver call — paths for all UE receivers at once.
     solver = PathSolver()
     paths  = solver(
-        scene              = scene,
-        max_depth          = RT_MAX_DEPTH,
-        los                = True,
+        scene               = scene,
+        max_depth           = RT_MAX_DEPTH,
+        los                 = True,
         specular_reflection = True,
         diffuse_reflection  = False,
-        refraction         = True,
-        synthetic_array    = False,
-        seed               = 42 + sat_id,   # Different seed per satellite
+        refraction          = True,
+        synthetic_array     = False,
+        seed                = 42 + sat_id,
     )
 
-    # Render and save paths image for this satellite
-    if render_paths:
+    # Render paths image using receiver 0 (primary UE).
+    # Controlled by RT_RENDER_PATHS; set False in config to skip and save time.
+    if render_paths and RT_RENDER_PATHS:
         cam      = _make_camera()
         out_file = f"output/ntn_rt_paths_sat{sat_id}.png"
         try:
             scene.render_to_file(
-                camera     = cam,
-                filename   = out_file,
-                paths      = paths,
-                clip_at    = RT_SAT_SCENE_HEIGHT_M + 50,
-                resolution = (1280, 720),
-                num_samples = 256,
+                camera      = cam,
+                filename    = out_file,
+                paths       = paths,
+                clip_at     = RT_SAT_SCENE_HEIGHT_M + 50,
+                resolution  = (1280, 720),
+                num_samples = RT_RENDER_NUM_SAMPLES,
             )
             print(f"    [Render] {out_file}")
         except Exception as e:
             print(f"    [Render] Skipped {out_file}: {e}")
 
-    # Service-link stats (sat → UE)
-    stats = _extract_channel_stats(paths, sat_id, sat_pos, elev_deg)
+    # Extract per-UE stats by slicing the rx_idx dimension of the Paths tensors.
+    sample_stats = []
+    for rx_idx, ue_pos in enumerate(ue_positions):
+        elev_i = _sat_elevation_deg(*sat_pos, *ue_pos)
+        st = _extract_channel_stats(paths, sat_id, sat_pos, elev_i,
+                                    rx_idx=rx_idx)
+        sample_stats.append(st)
 
-    # Remove this satellite before adding the next one
     scene.remove(tx_name)
-
-    return paths, stats
+    return paths, sample_stats
 
 
 # =============================================================================
@@ -459,7 +491,7 @@ def _compute_and_save_radiomap(scene) -> None:
             rm_metric  = "path_gain",
             rm_db_scale = True,
             resolution  = (1280, 720),
-            num_samples = 256,
+            num_samples = RT_RENDER_NUM_SAMPLES,
         )
         print("  [Render] output/ntn_rt_radiomap.png")
     except Exception as e:
@@ -497,8 +529,9 @@ def run_ray_tracing() -> list:
         NS-3 link budget uses RT-informed channel parameters.
     """
     print("\n[Sionna RT]  5G-NTN Munich scene — satellite constellation pass")
+    print(f"  Mitsuba variant: {mi.variant()}")
     print(f"  Frequency      : {RT_SCENE_FREQ_HZ/1e9:.2f} GHz")
-    print(f"  UE samples     : {len(RT_UE_SAMPLE_POSITIONS)} points")
+    print(f"  UE samples     : {len(RT_UE_SAMPLE_POSITIONS)} points (multi-RX single scene)")
     print(f"  Primary UE     : {RT_UE_POSITION} m")
     print(f"  Proxy altitude : {RT_SAT_SCENE_HEIGHT_M} m")
     print(f"  Satellites     : {NUM_SATELLITES}  "
@@ -514,12 +547,14 @@ def run_ray_tracing() -> list:
         initial_zenith_deg = RT_SAT_INITIAL_ZENITH_DEG,
     )
 
-    # ── Load one scene per sampled UE position ────────────────────────────────
+    # ── Load ONE scene with all UE receivers ──────────────────────────────────
+    # Previously the code loaded N separate scenes (one per UE) and called
+    # PathSolver N times per satellite.  Loading a single shared scene and
+    # adding all UE positions as named receivers (ue0…ueN) lets PathSolver
+    # trace all (TX, RX) pairs in a single GPU kernel launch, cutting the
+    # number of solver calls from N_ue × N_sats → 1 × N_sats.
     ue_samples = RT_UE_SAMPLE_POSITIONS if RT_UE_SAMPLE_POSITIONS else [RT_UE_POSITION]
-    scenes = []
-    for idx, ue_pos in enumerate(ue_samples):
-        scene_i, _ = _load_scene_with_ue(ue_pos, f"ue{idx}")
-        scenes.append((ue_pos, scene_i))
+    scene, _receivers = _load_scene_with_ues(ue_samples)
 
     all_stats = []
 
@@ -530,18 +565,14 @@ def run_ray_tracing() -> list:
               f"pos=({sat_pos[0]:6.1f}, {sat_pos[1]:5.1f}, {sat_pos[2]:.0f}) m  "
               f"{'[visible]' if visible else '[below horizon threshold]'}")
 
-        sample_stats = []
-        for idx, (ue_pos, scene_i) in enumerate(scenes):
-            elev_i = _sat_elevation_deg(*sat_pos, *ue_pos)
-            _, st_i = _trace_satellite(
-                scene_i,
-                sat_id,
-                sat_pos,
-                ue_pos,
-                elev_i,
-                render_paths=(idx == 0),
-            )
-            sample_stats.append(st_i)
+        # One PathSolver call → sample_stats list (one dict per UE receiver)
+        _, sample_stats = _trace_satellite(
+            scene,
+            sat_id,
+            sat_pos,
+            ue_samples,
+            render_paths=True,   # always render from primary UE (rx0)
+        )
 
         stats = _aggregate_sample_stats(sample_stats, sat_id, sat_pos)
         all_stats.append(stats)
@@ -552,15 +583,10 @@ def run_ray_tracing() -> list:
               f"ds={stats['delay_spread_ns']:.1f} ns")
 
     # ── Composite radio map: add all visible sats back simultaneously ─────────
-    elev_angles = [
-        _sat_elevation_deg(*pos, *RT_UE_POSITION)
-        for pos in sat_positions
-    ]
-
-    primary_scene = scenes[0][1]
     visible_sats = [
-        (i, pos) for i, (pos, e) in enumerate(zip(sat_positions, elev_angles))
-        if e >= SAT_HANDOVER_ELEVATION_DEG
+        (s["sat_id"], sat_positions[s["sat_id"]])
+        for s in all_stats
+        if s["elevation_deg"] >= SAT_HANDOVER_ELEVATION_DEG
     ]
     for sat_id, sat_pos in visible_sats:
         tx = Transmitter(
@@ -569,9 +595,9 @@ def run_ray_tracing() -> list:
             look_at   = RT_UE_POSITION,
             power_dbm = RT_TX_POWER_DBM,
         )
-        primary_scene.add(tx)
+        scene.add(tx)
 
-    _compute_and_save_radiomap(primary_scene)
+    _compute_and_save_radiomap(scene)
 
     print(f"\n  Ray tracing complete.  {len(all_stats)} satellite snapshots computed.\n")
     return all_stats
