@@ -87,6 +87,7 @@ from config import (
     NUM_BITS_PER_SYMBOL,
     CODERATE,
     BATCH_SIZE,
+    PHY_SCENARIOS,
     SAT_HEIGHT_M,
     ELEVATION_ANGLE_DEG,
     SNR_THRESH_DB,
@@ -101,6 +102,8 @@ from config import (
     VEHICULAR_SPEED_MIN_MS,
     VEHICULAR_SPEED_MAX_MS,
     RT_UE_SAMPLE_POSITIONS,
+    SERVICE_LINK_RATE_MBPS,
+    BACKHAUL_DELAY_MS,
 )
 from sim.phy           import run_sionna_ber
 from sim.ray_tracing   import run_ray_tracing
@@ -194,7 +197,7 @@ def main() -> None:
         timing["PHY (cached)"] = time.perf_counter() - t0
     else:
         ber_results = {}
-        for sc in ["urban", "dense_urban", "suburban"]:
+        for sc in PHY_SCENARIOS:
             ber, bler       = run_sionna_ber(snr_range, sc)
             ber_results[sc] = (ber, bler)
             print(f"  [{sc}]  BER @ 10 dB = {ber[20]:.4f}  BLER @ 10 dB = {bler[20]:.4f}")
@@ -202,10 +205,11 @@ def main() -> None:
         print(f"  [PHY cache saved]  {cache_path}")
         timing["PHY (Sionna)"] = time.perf_counter() - t0
 
-    # ── Sigmoid fitting (using "urban" scenario BLER curve) ──────────────────
+    # ── Sigmoid fitting (uses the first scenario in PHY_SCENARIOS) ───────────
     # Fit sigmoid(snr, thresh, slope) = 1 / (1 + exp(slope*(snr - thresh)))
     # to the PER vs Eb/N0 curve, then pass the fitted params to NS-3.
-    print("\n  Fitting BER→PER sigmoid to urban Sionna LDPC BER curve ...")
+    fit_scenario = "urban" if "urban" in ber_results else PHY_SCENARIOS[0]
+    print(f"\n  Fitting BER→PER sigmoid to {fit_scenario} Sionna LDPC BER curve ...")
     fitted_snr_thresh    = SNR_THRESH_DB
     fitted_sigmoid_slope = SIGMOID_SLOPE
     try:
@@ -214,7 +218,7 @@ def main() -> None:
         def _sigmoid(snr, thresh, slope):
             return 1.0 / (1.0 + np.exp(slope * (snr - thresh)))
 
-        ber_urban, bler_urban = ber_results["urban"]
+        ber_urban, bler_urban = ber_results[fit_scenario]
 
         # Use BLER (block error rate) directly as the PER target.
         # Sionna measures BLER = fraction of codewords with ≥1 bit error,
@@ -254,7 +258,7 @@ def main() -> None:
                 fitted_snr_thresh    = SNR_THRESH_DB
                 fitted_sigmoid_slope = SIGMOID_SLOPE
             else:
-                print(f"  Sigmoid fit (urban):  "
+                print(f"  Sigmoid fit ({fit_scenario}):  "
                       f"snr_thresh={fitted_snr_thresh:.2f} dB  "
                       f"slope={fitted_sigmoid_slope:.4f} /dB")
             print(f"  Config defaults:      "
@@ -289,7 +293,8 @@ def main() -> None:
     print("  Part 3 — NS-3 multi-protocol simulation")
     print(f"  Protocols: {[p['label'] for p in PROTOCOLS]}")
     from config import NUM_STATIONARY_CLIENTS, NUM_MOVING_CLIENTS
-    print("  Topology : direct: Phone→Satellite→Server")
+    print(f"  Topology : shared-beam Phone↔Satellite (CSMA {SERVICE_LINK_RATE_MBPS:.0f} Mbps) "
+          f"→ Server (backhaul {BACKHAUL_DELAY_MS:.0f} ms)")
     print(f"  Clients  : {NUM_STATIONARY_CLIENTS} stationary + "
           f"{NUM_MOVING_CLIENTS} moving  "
           f"(total {NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS})")

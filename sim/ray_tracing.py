@@ -71,6 +71,7 @@ from sionna.rt import (
 )
 
 from config import (
+    RT_SCENE_NAME,
     RT_SCENE_FREQ_HZ,
     RT_MAX_DEPTH,
     RT_SAMPLES_PER_TX,
@@ -414,7 +415,11 @@ def _load_scene_with_ues(ue_positions: list) -> tuple:
     scene     : sionna.rt.Scene
     receivers : list[sionna.rt.Receiver]  (one per UE position, in order)
     """
-    scene = load_scene(sionna.rt.scene.munich, merge_shapes=True)
+    # Resolve RT_SCENE_NAME → either a built-in Sionna scene attribute or a
+    # custom Mitsuba XML path.  This lets users swap urban environments by
+    # changing one config line (e.g. "munich" → "etoile" or a custom scene).
+    scene_ref = getattr(sionna.rt.scene, RT_SCENE_NAME, RT_SCENE_NAME)
+    scene = load_scene(scene_ref, merge_shapes=True)
     scene.frequency = RT_SCENE_FREQ_HZ
 
     # Satellite TX array: single-element with TR38.901 pattern,
@@ -608,7 +613,7 @@ def run_ray_tracing() -> list:
         This list is passed directly to ntn_ns3.run_ns3() so that the
         NS-3 link budget uses RT-informed channel parameters.
     """
-    print("\n[Sionna RT]  5G-NTN Munich scene — satellite constellation pass")
+    print(f"\n[Sionna RT]  5G-NTN '{RT_SCENE_NAME}' scene — satellite constellation pass")
     print(f"  Mitsuba variant: {mi.variant()}")
     print(f"  Frequency      : {RT_SCENE_FREQ_HZ/1e9:.2f} GHz")
     print(f"  UE samples     : {len(RT_UE_SAMPLE_POSITIONS)} points (multi-RX single scene)")

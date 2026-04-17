@@ -4,6 +4,17 @@ config/ray_tracing.py — Ray tracing (Sionna RT) parameters
 
 from config.phy import CARRIER_FREQ_HZ
 
+RT_SCENE_NAME = "munich"
+"""
+Sionna RT built-in scene used for ray tracing.
+
+- Must be the attribute name of a scene exposed by ``sionna.rt.scene``
+  (e.g. "munich", "etoile", "florence", "simple_street_canyon").
+- Swap this to change the urban environment without touching sim/ray_tracing.py.
+- Custom Mitsuba XML scenes can be loaded by pointing this at the file path
+  instead of a built-in name; the loader falls back to ``load_scene(path)``.
+"""
+
 RT_SCENE_FREQ_HZ = CARRIER_FREQ_HZ
 """
 Carrier frequency used inside the Sionna RT scene [Hz].

@@ -155,6 +155,8 @@ from config import (
     VEHICULAR_SPEED_MAX_MS,
     DATA_VOLUME_MB,
     SAT_SERVER_DATARATE,
+    SERVICE_LINK_RATE_MBPS,
+    BACKHAUL_DELAY_MS,
     # Beam management
     HANDOVER_INTERRUPTION_MS_MIN,
     HANDOVER_INTERRUPTION_MS_MAX,
@@ -567,7 +569,7 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
         return result
 
     if link_rate_bps is None:
-        link_rate_bps = 10e6     # 10 Mbps service link
+        link_rate_bps = SERVICE_LINK_RATE_MBPS * 1e6
 
     # RFC 9000 §9.3 post-handover recovery RTT counts
     TCP_RECOVERY_RTTS  = 9    # TCP slow-start + SYN from scratch
@@ -633,9 +635,14 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
     loss_reduction_factor = math.exp(-0.8 * mean_rtt_s / REF_ONE_WAY_DELAY_S) * max(mean_per, 1e-6)
     loss_reduction_factor = min(loss_reduction_factor, 0.99)   # cap at 99%
 
-    # ── Apply corrections ─────────────────────────────────────────────────────
-    result["throughput_kbps"] = round(
-        bbr_result["throughput_kbps"] + delta_kbps, 2)
+    # ── Apply corrections (capped by physical beam capacity) ──────────────────
+    # QUIC is a transport-layer optimisation — it cannot exceed the shared
+    # service-link rate, so cap the additive correction at link_rate_bps even
+    # when TCP BBR is severely starved by congestion (otherwise the formula
+    # can yield unphysical throughputs).
+    raw_tput_kbps = bbr_result["throughput_kbps"] + delta_kbps
+    link_ceiling_kbps = link_rate_bps / 1e3
+    result["throughput_kbps"] = round(min(raw_tput_kbps, link_ceiling_kbps), 2)
     result["mean_delay_ms"]   = round(
         max(1.0, bbr_result["mean_delay_ms"] - latency_reduction_ms), 2)
     result["loss_pct"] = round(
@@ -746,25 +753,28 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         sat_id=0, interruption_ms=0.0,
     )
     print(f"  Service link delay (weighted-mean): {weighted_delay_ms:.2f} ms")
-    print(f"  Sat→Server:  rate={SAT_SERVER_DATARATE}  delay=1 ms")
+    print(f"  Sat→Server:  rate={SAT_SERVER_DATARATE}  delay={BACKHAUL_DELAY_MS:.0f} ms")
 
     # =========================================================================
     # Node creation
     # =========================================================================
     # Node layout:
     #   [0 … num_clients-1] : phone nodes
-    #   [num_clients]        : satellite (highest-elevation)
-    #   [num_clients+1]      : internet server
+    #   [num_clients]        : beam gateway (aggregation point for the beam)
+    #   [num_clients+1]      : satellite (highest-elevation)
+    #   [num_clients+2]      : internet server
 
-    sat_idx    = num_clients
-    server_idx = num_clients + 1
-    total_nodes = num_clients + 2
+    beam_gw_idx = num_clients
+    sat_idx     = num_clients + 1
+    server_idx  = num_clients + 2
+    total_nodes = num_clients + 3
 
     nodes = ns.NodeContainer()
     nodes.Create(total_nodes)
     ns.InternetStackHelper().Install(nodes)
 
     phones  = [nodes.Get(i) for i in range(num_clients)]
+    beam_gw = nodes.Get(beam_gw_idx)
     sat     = nodes.Get(sat_idx)
     server  = nodes.Get(server_idx)
 
@@ -851,30 +861,48 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     # Wiring up links
     # =========================================================================
 
-    # Service-link error models stored per-client so handover callbacks can
-    # update all of them simultaneously.
-    em_svc_list   = []   # service-link RateErrorModel per phone
-    devs_svc_list = []   # service-link DeviceContainer per phone
-
-    # ── Phone → satellite (direct NTN hop, 10 Mbps) ───────────────────────────
-    p2p.SetDeviceAttribute("DataRate", ns.StringValue("10Mbps"))
-    p2p.SetChannelAttribute("Delay",
-        ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
-    for i in range(num_clients):
-        devs_svc = p2p.Install(_nc2(phones[i], sat))
-        em = ns.CreateObject[ns.RateErrorModel]()
-        em.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
-        em.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
-        devs_svc.Get(1).SetAttribute("ReceiveErrorModel", ns.PointerValue(em))
-        em_svc_list.append(em)
-        devs_svc_list.append(devs_svc)
+    # ── Phone → beam gateway (per-UE access, no contention) ──────────────────
+    # Each phone has its own p2p to the aggregation gateway at a high rate so
+    # that the access link is never the bottleneck.  This stands in for the
+    # OFDMA/scheduled allocation within one spot beam: individual UEs don't
+    # contend for the air interface (the satellite schedules them).
+    access_p2p = ns.PointToPointHelper()
+    access_p2p.SetDeviceAttribute("DataRate", ns.StringValue("1Gbps"))
+    access_p2p.SetChannelAttribute("Delay",    ns.StringValue("0.01ms"))
+    for ph in phones:
+        devs_acc = access_p2p.Install(_nc2(ph, beam_gw))
         ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
                      ns.Ipv4Mask("255.255.255.0"))
-        ipv4.Assign(devs_svc)
+        ipv4.Assign(devs_acc)
 
-    # ── Satellite → Internet Server (lossless direct link) ────────────────────
+    # ── Beam gateway → satellite shared service link (true bottleneck) ───────
+    # A single p2p at SERVICE_LINK_RATE_MBPS models the aggregate capacity of
+    # one LEO spot beam: all UE flows funnel through this queue, so the
+    # aggregate cannot exceed the beam rate and TCP congestion/queuing dynamics
+    # are exercised at the correct bandwidth.  A RateErrorModel on the
+    # satellite's RX device applies the RT-calibrated PER uniformly — all UEs
+    # within a ~500 m cell see the same fading to a 550 km LEO satellite.
+    svc_p2p = ns.PointToPointHelper()
+    svc_p2p.SetDeviceAttribute("DataRate",
+        ns.StringValue(f"{SERVICE_LINK_RATE_MBPS}Mbps"))
+    svc_p2p.SetChannelAttribute("Delay",
+        ns.StringValue(f"{weighted_delay_ms:.3f}ms"))
+    devs_svc = svc_p2p.Install(_nc2(beam_gw, sat))
+
+    em_svc = ns.CreateObject[ns.RateErrorModel]()
+    em_svc.SetAttribute("ErrorRate", ns.DoubleValue(first["per"]))
+    em_svc.SetAttribute("ErrorUnit", ns.StringValue("ERROR_UNIT_PACKET"))
+    # Satellite is device index 1 on this p2p — apply fading to its RX.
+    devs_svc.Get(1).SetAttribute(
+        "ReceiveErrorModel", ns.PointerValue(em_svc))
+
+    ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
+                 ns.Ipv4Mask("255.255.255.0"))
+    ipv4.Assign(devs_svc)
+
+    # ── Satellite → Internet Server (backhaul: feeder + gateway + transit) ────
     p2p.SetDeviceAttribute("DataRate",  ns.StringValue(SAT_SERVER_DATARATE))
-    p2p.SetChannelAttribute("Delay",    ns.StringValue("1ms"))
+    p2p.SetChannelAttribute("Delay",    ns.StringValue(f"{BACKHAUL_DELAY_MS}ms"))
     devs_srv = p2p.Install(_nc2(sat, server))
     ipv4.SetBase(ns.Ipv4Address(_next_subnet()), ns.Ipv4Mask("255.255.255.0"))
     iface_srv = ipv4.Assign(devs_srv)
@@ -907,9 +935,8 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         print(f"  [t={t_now:.2f}s] Handover blackout → sat{slot['sat_id']}  "
               f"gap={slot['interruption_ms']:.0f} ms  "
               f"elev={slot['elev_deg']:.1f}°")
-        # Set all service-link error models to 1.0 (full drop)
-        for em in em_svc_list:
-            em.SetAttribute("ErrorRate", ns.DoubleValue(1.0))
+        # Single shared beam → one error model covers all UEs
+        em_svc.SetAttribute("ErrorRate", ns.DoubleValue(1.0))
         # Schedule the restore event after the gap
         ev = ns.cppyy.gbl.pythonMakeEvent(_handover_restore)
         ns.Simulator.Schedule(ns.Seconds(gap_s), ev)
@@ -919,8 +946,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         if not handover_queue:
             return
         slot = handover_queue.popleft()
-        for em in em_svc_list:
-            em.SetAttribute("ErrorRate", ns.DoubleValue(slot["per"]))
+        em_svc.SetAttribute("ErrorRate", ns.DoubleValue(slot["per"]))
         handover_count[0] += 1
         print(f"  [t={ns.Simulator.Now().GetSeconds():.2f}s] "
               f"Handover restored → sat{slot['sat_id']}  "
@@ -1302,7 +1328,7 @@ def run_ns3_both_topologies(channel_stats: list,
         quic_result = _apply_quic_corrections(
             bbr_result,
             bbr_result["schedule"],
-            link_rate_bps=10e6,   # 10 Mbps service link
+            link_rate_bps=SERVICE_LINK_RATE_MBPS * 1e6,
         )
         quic_result["topology"] = "direct"
         results.append(quic_result)

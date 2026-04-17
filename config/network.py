@@ -125,21 +125,53 @@ Source: [3GPP-38.821] §6.1, Table 6.1.1-1 (minimum reference 30 dBi).
 """
 
 # =============================================================================
-# Satellite → Internet Server link parameters
+# Service-link (phone ↔ satellite) shared-beam parameters
+# =============================================================================
+
+SERVICE_LINK_RATE_MBPS = 20.0
+"""
+Aggregate shared service-link (phone → satellite) beam capacity [Mbps].
+
+- All UEs in the simulated cell share this capacity via a CSMA bus in NS-3,
+  mimicking the shared radio resource of a single LEO spot beam.
+- 20 Mbps is the realistic per-beam uplink capacity for one S-band (2 GHz)
+  NR-NTN spot beam with 20 MHz bandwidth at 16QAM r=0.5 (per 3GPP TR 38.821
+  §6.1.1 link budget tables).  It matches Starlink DTC FCC filings for
+  S-band direct-to-phone spot beams (5–40 Mbps per beam, 20 Mbps typical).
+- This is the realistic bottleneck for the 50-UE urban deployment — the
+  beam is shared, not per-UE, so aggregate throughput cannot exceed this.
+- Lower this to 10 Mbps to model worst-case QPSK r=0.5 cell-edge;
+  raise to 40 Mbps for best-case zenith 64QAM.
+Source: [3GPP-38.821] §6.1.1, Table 6.1.1-1; SpaceX FCC DTC filings.
+"""
+
+# =============================================================================
+# Satellite → Internet Server (backhaul) link parameters
 # =============================================================================
 
 SAT_SERVER_DATARATE = "1Gbps"
 """
-Data rate of the satellite → Internet Server direct link [NS-3 string].
+Data rate of the satellite → Internet Server backhaul link [NS-3 string].
 
-The satellite connects directly to the internet server; there are no
-ISL or ground-station hops in the simulated topology.  This link
-represents the satellite's direct IP peering into the public internet
-backbone (e.g. via a cloud PoP).
+- 1 Gbps represents a high-capacity feeder / trunk link that is never the
+  bottleneck; the service-link beam is the limiting hop.
+- Applies to the sat → server point-to-point channel only.
+"""
 
-- 1 Gbps is achievable via high-throughput satellite transponders.
-- This link should never be the bottleneck; the service link (10 Mbps)
-  is the limiting hop.
+BACKHAUL_DELAY_MS = 15.0
+"""
+Satellite → Internet Server one-way backhaul delay [ms].
+
+- Represents the gateway (ground-station) hop plus Internet transit from the
+  gateway PoP to the application server.
+- 15 ms is consistent with measured Starlink ground-segment latency:
+    * Sat → gateway feeder link (Ka/Ku): ~2–3 ms one-way
+    * Gateway PoP → major Internet backbone: ~5–10 ms (continental)
+    * ISP edge → application server: ~3–5 ms
+  Total service-link (≈5 ms) + backhaul (15 ms) + return path gives
+  ~40–50 ms RTT end-to-end, matching Sander et al. IMC 2022 measurements.
+Source: Sander et al. "Measuring the Performance of Satellite Broadband"
+        IMC 2022; Starlink FCC ex parte filings on gateway architecture.
 """
 
 # =============================================================================
@@ -402,7 +434,7 @@ Source: 3GPP TR 38.821 §6.2.2; 3GPP TS 38.321 §5.17 (BFD max 200 ms).
 TRAFFIC_PROFILES = {
     "streaming": {
         "app_type":   "udp_cbr",
-        "data_rate":  "2.5Mbps",
+        "data_rate":  "1.5Mbps",
         "packet_size": 1316,
         "duty":        1.0,
     },
@@ -443,8 +475,9 @@ Each profile is a dict with:
                1.0 = always on.  0.1 = 10% on-time (IoT burst pattern).
 
 Profile characteristics:
-  streaming — 2.5 Mbps UDP CBR, 1316-byte packets (always on).
-              Models downlink-heavy adaptive video streaming.
+  streaming — 1.5 Mbps UDP CBR, 1316-byte packets (always on).
+              Models 480p adaptive video streaming — realistic for S-band DTC
+              where per-UE bandwidth is constrained (ETSI TR 103 559 §5).
   gaming    — 120 kbps UDP CBR, 200-byte packets (always on).
             Models interactive gaming traffic: small, frequent datagrams.
   texting   — 30 kbps UDP CBR, 120-byte packets, 15% duty cycle.
@@ -459,32 +492,40 @@ Source for traffic characterisation:
   3GPP TR 38.913 §7.1 (IMT-2020 usage scenarios: eMBB, URLLC, mMTC).
 """
 
-CLIENT_PROFILES = (
-    ["streaming"] * 10 +
-    ["gaming"]   * 10 +
-    ["texting"]  * 10 +
-    ["voice"]    * 10 +
-    ["bulk"]     * 10
-)
+TRAFFIC_PROFILE_COUNTS = {
+    "streaming": 10,
+    "gaming":    10,
+    "texting":   10,
+    "voice":     10,
+    "bulk":      10,
+}
 """
-Traffic profile assignment for each of the
-(NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS) = 50 clients.
+Per-profile client counts.  Must sum to NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS.
 
-Distribution (equal split):
-  10 × streaming (indices  0–9)
-  10 × gaming    (indices 10–19)
-  10 × texting   (indices 20–29)
-  10 × voice     (indices 30–39)
-  10 × bulk      (indices 40–49)
+To change traffic mix (e.g. heavy streaming + light bulk), just edit the
+counts — CLIENT_PROFILES below is derived automatically.  Add a new profile
+by adding an entry to TRAFFIC_PROFILES *and* to this dict.
+"""
+
+CLIENT_PROFILES = [
+    name
+    for name, count in TRAFFIC_PROFILE_COUNTS.items()
+    for _ in range(count)
+]
+"""
+Traffic profile assignment per client, derived from TRAFFIC_PROFILE_COUNTS.
 
 The first NUM_STATIONARY_CLIENTS entries are assigned to stationary clients;
 the remaining NUM_MOVING_CLIENTS entries are assigned to moving clients.
-Profiles are intentionally mixed between stationary and moving clients so
-that mobility effects are visible across all traffic types.
-
-To change the distribution, edit this list directly.  len(CLIENT_PROFILES)
-must equal NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS.
+len(CLIENT_PROFILES) must equal NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS.
 """
+
+_expected_total = NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS
+if len(CLIENT_PROFILES) != _expected_total:
+    raise ValueError(
+        f"TRAFFIC_PROFILE_COUNTS sums to {len(CLIENT_PROFILES)} clients, "
+        f"expected {_expected_total} (NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS)."
+    )
 
 # =============================================================================
 # Time-series collection

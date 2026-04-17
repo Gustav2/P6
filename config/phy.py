@@ -76,6 +76,18 @@ LDPC channel code rate (k/n).
 Source: [3GPP-38.214] Table 5.1.3.1-2.
 """
 
+PHY_SCENARIOS = ["urban", "dense_urban", "suburban"]
+"""
+NTN channel scenarios to sweep in the Sionna + OpenNTN BER/BLER simulation.
+
+- Each entry must be one of "urban", "dense_urban", "suburban"
+  (OpenNTN TR38.811 supported scenarios).
+- The PHY sigmoid is fitted to the first scenario's BLER curve; other
+  scenarios are used for visual comparison only.
+- Reduce to a single entry (e.g. ["urban"]) to speed up the PHY stage
+  when iterating on NS-3 / RT changes.
+"""
+
 BATCH_SIZE = 512
 """
 Number of independent channel realisations evaluated per SNR point.
