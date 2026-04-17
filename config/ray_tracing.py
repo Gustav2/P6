@@ -83,22 +83,20 @@ in the ray-tracing snapshot.
   walls are illuminated at a glancing angle, enabling reflections.
 """
 
-RT_SAT_SCENE_HEIGHT_M = 1000.0
+RT_SAT_SCENE_HEIGHT_M = 550_000.0
 """
-Height [m] at which the satellite transmitters are placed *within the
-Sionna RT scene* for ray tracing.
-- The actual orbital altitude (550 km) is far outside the scene bounds
-  (~100 m tall buildings).  This parameter places a proxy transmitter
-  high above the scene to produce near-vertical incidence angles that
-  are representative of a satellite link.
+Height [m] at which the satellite transmitters are placed within the
+Sionna RT scene for ray tracing — set to the true LEO orbital altitude.
+
+- K-factor in real NTN links is driven by material reflection coefficients
+  (~10–15 dB loss per building reflection), not by path-length differences.
+  At 550 km the direct and reflected rays travel nearly the same distance,
+  but building façade reflections still lose 10–15 dB from material absorption.
+  Sionna RT models these material properties correctly, so simulating at the
+  true altitude lets the physics emerge naturally.
 - The true free-space path loss over 550 km is applied analytically in
-  the NS-3 link budget; only the urban multipath statistics (delay
-  spread, shadow fading) are extracted from RT.
-- 1000 m places the proxy well above Munich buildings (~30–100 m tall)
-  so reflections from nearby façades carry a meaningful path-length
-  penalty vs the direct ray — otherwise near-field reflections rival
-  the LoS power and Rician K collapses toward 0 dB (vs the 9–15 dB band
-  expected from 3GPP TR 38.811 Table 6.7.2-3).
+  the NS-3 link budget; only the urban multipath statistics (delay spread,
+  K-factor, shadow fading) are extracted from RT.
 """
 
 RT_TX_POWER_DBM = 44.0

@@ -45,6 +45,7 @@ All PNG output files are written to the output/ subdirectory.
 """
 
 import hashlib
+import math
 import os
 import pickle
 import time
@@ -283,10 +284,13 @@ def main() -> None:
 
     print(f"\n  Channel stats ({len(channel_stats)} satellites):")
     for s in channel_stats:
+        k = s.get("k_factor_db", float("nan"))
+        k_str = f"{k:.1f} dB" if not math.isnan(k) else "NLoS"
         print(f"    sat{s['sat_id']}  elev={s['elevation_deg']:.1f}°  "
               f"paths={s['num_paths']}  "
               f"mean_gain={s['mean_path_gain_db']:.1f} dB  "
-              f"delay_spread={s['delay_spread_ns']:.1f} ns")
+              f"delay_spread={s['delay_spread_ns']:.1f} ns  "
+              f"K={k_str}")
 
     # ── Part 3: Network simulation per protocol ───────────────────────────────
     print("\n" + "─" * 70)
