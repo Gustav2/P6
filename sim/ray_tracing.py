@@ -308,29 +308,30 @@ def _extract_channel_stats(paths, sat_id: int,
         np.sqrt((power_weights * (valid_tau - mean_tau) ** 2).sum()) * 1e9
     )
 
-    # LoS test by geometry: the earliest RT arrival must match the
-    # free-space delay between UE and proxy TX (within ~5 ns tolerance for
-    # numeric / propagation-model jitter).  This is a stricter, physically
-    # grounded criterion than the old amplitude heuristic — a weak diffracted
-    # ray arriving first would otherwise be mis-classified as LoS and give
-    # spurious K-factor values.
-    earliest_idx = int(np.argmin(valid_tau))
-    geom_dist_m  = float(np.linalg.norm(
+    # LoS detection by geometry: identify any path whose delay matches the
+    # UE↔proxy free-space delay (within ~5 ns tolerance to absorb numerical
+    # and propagation-model jitter).  Pure-amplitude heuristics mis-classify
+    # weak diffracted first arrivals as LoS and yield spurious K values.
+    geom_dist_m   = float(np.linalg.norm(
         np.asarray(sat_pos, dtype=float) - np.asarray(ue_pos, dtype=float)))
-    geom_tau_s   = geom_dist_m / 3e8
-    los_exists   = bool(abs(float(valid_tau[earliest_idx]) - geom_tau_s) < 5e-9)
+    geom_tau_s    = geom_dist_m / 3e8
+    los_mask      = np.abs(valid_tau - geom_tau_s) < 5e-9
+    los_exists    = bool(los_mask.any())
 
-    # Rician K-factor (3GPP definition): ratio of dominant (LoS) path power to
-    # the sum of diffuse (non-dominant) path powers.  Using the strongest path
-    # — not the earliest — makes K robust to weak first-arrival rays and aligns
-    # with the TR 38.811 "K = P_specular / P_diffuse" convention.  Only defined
-    # when a geometric LoS exists; NaN otherwise (NLoS → Rayleigh, no K).
-    dominant_idx      = int(np.argmax(valid_a))
-    dom_power_lin     = float(valid_a[dominant_idx] ** 2)
-    total_power_lin   = float(np.sum(valid_a ** 2))
-    scatter_power_lin = total_power_lin - dom_power_lin
-    if los_exists and scatter_power_lin > 1e-60:
-        k_factor_db = round(float(10.0 * np.log10(dom_power_lin / scatter_power_lin)), 2)
+    # Rician K-factor per TR 38.811 convention:
+    #   K = P_specular (LoS) / P_diffuse (all non-LoS multipath).
+    # The specular term is the *geometric* LoS path power — not the strongest
+    # arrival — because in dense urban, reflected rays from nearby buildings
+    # can be stronger than the direct ray, yet K is defined relative to LoS.
+    if los_exists:
+        los_power_lin     = float(np.sum(valid_a[los_mask] ** 2))
+        diffuse_power_lin = float(np.sum(valid_a[~los_mask] ** 2))
+        if diffuse_power_lin > 1e-60:
+            k_factor_db = round(
+                float(10.0 * np.log10(los_power_lin / diffuse_power_lin)), 2)
+        else:
+            # Pure-LoS, no scatter → infinite K; cap at a sensible ceiling.
+            k_factor_db = 30.0
     else:
         k_factor_db = float("nan")
 
