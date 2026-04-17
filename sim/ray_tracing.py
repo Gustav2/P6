@@ -308,21 +308,29 @@ def _extract_channel_stats(paths, sat_id: int,
         np.sqrt((power_weights * (valid_tau - mean_tau) ** 2).sum()) * 1e9
     )
 
-    # LoS exists if the earliest-arriving (minimum-delay) path has a gain
-    # within 6 dB of the strongest path.  This heuristic is necessary because
-    # Sionna RT does not expose path-type flags (LoS vs NLoS) on the Paths
-    # object in this version.  6 dB ↔ amplitude ratio of 0.5 (power ratio 0.25).
+    # LoS test by geometry: the earliest RT arrival must match the
+    # free-space delay between UE and proxy TX (within ~5 ns tolerance for
+    # numeric / propagation-model jitter).  This is a stricter, physically
+    # grounded criterion than the old amplitude heuristic — a weak diffracted
+    # ray arriving first would otherwise be mis-classified as LoS and give
+    # spurious K-factor values.
     earliest_idx = int(np.argmin(valid_tau))
-    los_exists   = bool(valid_a[earliest_idx] >= 0.5 * valid_a.max())
+    geom_dist_m  = float(np.linalg.norm(
+        np.asarray(sat_pos, dtype=float) - np.asarray(ue_pos, dtype=float)))
+    geom_tau_s   = geom_dist_m / 3e8
+    los_exists   = bool(abs(float(valid_tau[earliest_idx]) - geom_tau_s) < 5e-9)
 
-    # Rician K-factor: ratio of LOS path power to total scattered power (linear).
-    # K = P_LOS / P_scatter = |a_LOS|² / (Σ|a_k|² − |a_LOS|²)
-    # Returns NaN if no LOS or no scatter paths present (degenerate cases).
-    los_power_lin     = float(valid_a[earliest_idx] ** 2)
+    # Rician K-factor (3GPP definition): ratio of dominant (LoS) path power to
+    # the sum of diffuse (non-dominant) path powers.  Using the strongest path
+    # — not the earliest — makes K robust to weak first-arrival rays and aligns
+    # with the TR 38.811 "K = P_specular / P_diffuse" convention.  Only defined
+    # when a geometric LoS exists; NaN otherwise (NLoS → Rayleigh, no K).
+    dominant_idx      = int(np.argmax(valid_a))
+    dom_power_lin     = float(valid_a[dominant_idx] ** 2)
     total_power_lin   = float(np.sum(valid_a ** 2))
-    scatter_power_lin = total_power_lin - los_power_lin
+    scatter_power_lin = total_power_lin - dom_power_lin
     if los_exists and scatter_power_lin > 1e-60:
-        k_factor_db = round(float(10.0 * np.log10(los_power_lin / scatter_power_lin)), 2)
+        k_factor_db = round(float(10.0 * np.log10(dom_power_lin / scatter_power_lin)), 2)
     else:
         k_factor_db = float("nan")
 
@@ -369,6 +377,15 @@ def _aggregate_sample_stats(sample_stats: list, sat_id: int, sat_pos: tuple) -> 
     dss   = np.array([s["delay_spread_ns"]   for s in valid], dtype=float)
     elevs = np.array([s["elevation_deg"]     for s in sample_stats], dtype=float)
 
+    # Delay spread is log-normal distributed (3GPP TR 38.811): aggregate with
+    # geometric mean so that a single sample with a large canyon-resonant DS
+    # doesn't dominate the per-satellite summary.
+    dss_positive = dss[dss > 0]
+    if len(dss_positive) > 0:
+        ds_geo_mean_ns = float(np.exp(np.mean(np.log(dss_positive))))
+    else:
+        ds_geo_mean_ns = 0.0
+
     # Normalised gains: raw RT gain + proxy FSPL → shadow fading only.
     # Filter out NaN (from samples with 0 paths) before aggregating.
     norm_gains = np.array([s.get("normalized_gain_db", float("nan")) for s in valid], dtype=float)
@@ -392,7 +409,7 @@ def _aggregate_sample_stats(sample_stats: list, sat_id: int, sat_pos: tuple) -> 
         mean_path_gain_p10_db = round(float(np.percentile(gains, 10)), 2),
         normalized_gain_db    = agg_normalized_gain_db,
         normalized_p10_db     = agg_normalized_p10_db,
-        delay_spread_ns       = round(float(np.mean(dss)), 2),
+        delay_spread_ns       = round(ds_geo_mean_ns, 2),
         num_paths             = int(round(float(np.mean([s["num_paths"] for s in valid])))),
         los_exists            = bool(any(s.get("los_exists", False) for s in sample_stats)),
         k_factor_db           = k_factor_db_agg,

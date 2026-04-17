@@ -322,7 +322,8 @@ def draw_channel_validation(channel_stats: list,
     freq_ghz = CARRIER_FREQ_HZ / 1e9
     fig.suptitle(
         f"Channel Validation — 5G-NTN LEO 550 km  |  {freq_ghz:.1f} GHz n255  |  Urban (Munich)\n"
-        "RT = Sionna RT (this simulation)    3GPP = TR 38.811 Table 6.7.2-3 reference",
+        "RT = single Sionna RT realization (Munich scene, 300 m proxy)    "
+        "3GPP = TR 38.811 Table 6.7.2-3 statistical reference (mean ±1σ)",
         fontsize=10,
     )
 
@@ -364,15 +365,23 @@ def draw_channel_validation(channel_stats: list,
     if k_mask.any():
         ax2.scatter(rt_elevs[k_mask], rt_k[k_mask],
                     color="#d62728", zorder=5, s=60,
-                    label="RT computed (this sim.)")
+                    label="RT — LoS samples (this sim.)")
         for e, k in zip(rt_elevs[k_mask], rt_k[k_mask]):
             ax2.annotate(f"{e:.0f}°", (e, k),
                          textcoords="offset points", xytext=(4, 3),
                          fontsize=7, color="#d62728")
+    # Annotate NLoS satellites on the x-axis at y=0 so they are not lost.
+    nlos_elevs = rt_elevs[~k_mask]
+    if len(nlos_elevs) > 0:
+        ax2.scatter(nlos_elevs, np.zeros_like(nlos_elevs),
+                    marker="x", color="#666", s=50, zorder=4,
+                    label="RT — NLoS (K undefined)")
 
     ax2.set_xlabel("Elevation angle [°]", fontsize=9)
     ax2.set_ylabel("Rician K-factor [dB]", fontsize=9)
     ax2.set_title("Rician K-Factor\nvs Elevation (Urban NTN LOS)", fontsize=9)
+    # Clip to a sensible display range so outliers don't stretch the axis.
+    ax2.set_ylim(-5, 25)
     ax2.legend(fontsize=7.5, loc="lower right")
     ax2.grid(alpha=0.3)
 
@@ -396,6 +405,8 @@ def draw_channel_validation(channel_stats: list,
     ax3.set_xlabel("Elevation angle [°]", fontsize=9)
     ax3.set_ylabel("RMS delay spread [ns]", fontsize=9)
     ax3.set_title("RMS Delay Spread\nvs Elevation (Urban NTN LOS)", fontsize=9)
+    # Clip to a sensible log range so canyon-resonant outliers don't dominate.
+    ax3.set_ylim(1, 1e3)
     ax3.legend(fontsize=7.5, loc="upper right")
     ax3.grid(alpha=0.3, which="both")
 
