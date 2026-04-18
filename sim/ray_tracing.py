@@ -871,3 +871,60 @@ def run_ray_tracing() -> list:
 
     print(f"\n  Ray tracing complete.  {len(all_stats)} satellite snapshots computed.\n")
     return all_stats
+
+
+# =============================================================================
+# Nadir top-down background render for the mobility video
+# =============================================================================
+
+def render_scene_background(out: str = "output/.mobility_scene_bg.png",
+                             half_extent_m: float = 600.0,
+                             resolution: tuple = (1280, 1280)) -> str:
+    """
+    Render a cached top-down (nadir) view of the Munich scene, used as a
+    static backdrop for the client-mobility video.
+
+    The camera is placed directly above the scene origin at a height that
+    makes the field of view cover ~2 * half_extent_m.  We reuse the built-in
+    Sionna Camera FOV default (60°) and derive the altitude from
+    tan(FOV/2) = half_extent / altitude  →  altitude = half_extent / tan(30°).
+    A tiny x-offset avoids the singularity in look_at when the camera is
+    exactly on the look_at z-axis.
+
+    Cached: if the output file already exists, returns immediately without
+    re-rendering (matches the PHY cache pattern in main.py).
+
+    Parameters
+    ----------
+    out           : str    Output PNG path.
+    half_extent_m : float  Half-width of the rendered area in metres.
+    resolution    : tuple  (W, H) pixels.
+
+    Returns
+    -------
+    str  Path of the rendered/cached PNG.
+    """
+    import os as _os
+    if _os.path.exists(out):
+        print(f"  [MobilityBg] Using cached {out}")
+        return out
+
+    altitude_m = half_extent_m / math.tan(math.radians(30.0))
+    cam = Camera(position=[1e-3, 0.0, altitude_m], look_at=[0.0, 0.0, 0.0])
+
+    scene_ref = getattr(sionna.rt.scene, RT_SCENE_NAME, RT_SCENE_NAME)
+    scene = load_scene(scene_ref, merge_shapes=True)
+    scene.frequency = RT_SCENE_FREQ_HZ
+
+    try:
+        scene.render_to_file(
+            camera      = cam,
+            filename    = out,
+            resolution  = resolution,
+            num_samples = 64,
+        )
+        print(f"  [MobilityBg] Rendered -> {out}  "
+              f"(±{half_extent_m:.0f} m, {resolution[0]}x{resolution[1]})")
+    except Exception as e:
+        print(f"  [MobilityBg] Skipped: {e}")
+    return out

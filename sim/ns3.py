@@ -809,7 +809,8 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
 
 def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
             snr_thresh_db: float = None,
-            sigmoid_slope: float = None) -> dict:
+            sigmoid_slope: float = None,
+            sample_positions: bool = False) -> dict:
     """
     Run one full NS-3 5G-NTN simulation with:
       - NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS client phones
@@ -1231,6 +1232,37 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     ev_ts = ns.cppyy.gbl.pythonMakeEvent(_ts_probe)
     ns.Simulator.Schedule(ns.Seconds(TIMESERIES_BUCKET_S), ev_ts)
 
+    # =========================================================================
+    # Mobility position-trace probe (Phase A — optional)
+    # =========================================================================
+    # When sample_positions is True, sample every phone's (x,y,z) and the
+    # satellite's (x,y,z) every MOBILITY_SAMPLE_DT_S seconds.  Stored in
+    # result["position_trace"] for the mobility-video renderer.  Only the
+    # first NS-3 worker runs this probe (all workers share the same
+    # Random(42) mobility seed, so one trace is representative).
+    MOBILITY_SAMPLE_DT_S = 0.1
+    pos_t_list     = []
+    pos_phone_list = []   # list of [(x,y,z), ...] per timestep
+    pos_sat_list   = []   # list of (x,y,z) per timestep
+
+    if sample_positions:
+        def _pos_probe():
+            t = ns.Simulator.Now().GetSeconds()
+            pos_t_list.append(round(t, 3))
+            frame = []
+            for ph in phones:
+                p = ph.GetObject[ns.MobilityModel]().GetPosition()
+                frame.append((round(p.x, 2), round(p.y, 2), round(p.z, 2)))
+            pos_phone_list.append(frame)
+            sp = sat.GetObject[ns.MobilityModel]().GetPosition()
+            pos_sat_list.append((round(sp.x, 2), round(sp.y, 2), round(sp.z, 2)))
+            if t + MOBILITY_SAMPLE_DT_S <= SIM_DURATION_S + 1e-6:
+                ev = ns.cppyy.gbl.pythonMakeEvent(_pos_probe)
+                ns.Simulator.Schedule(ns.Seconds(MOBILITY_SAMPLE_DT_S), ev)
+
+        ev_pos = ns.cppyy.gbl.pythonMakeEvent(_pos_probe)
+        ns.Simulator.Schedule(ns.Seconds(0.0), ev_pos)
+
     # ── FlowMonitor ───────────────────────────────────────────────────────────
     fm_helper = ns.FlowMonitorHelper()
     endpoint_nc = ns.NodeContainer()
@@ -1257,6 +1289,21 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         "handover_times":   list(handover_times),
     }
 
+    # Position trace (Phase A — only when sample_positions=True)
+    position_trace = None
+    if sample_positions and pos_t_list:
+        position_trace = {
+            "t_s":       pos_t_list,
+            "phones":    pos_phone_list,
+            "satellite": pos_sat_list,
+            "dt_s":      MOBILITY_SAMPLE_DT_S,
+            "num_stationary": NUM_STATIONARY_CLIENTS,
+            "num_pedestrian": NUM_PEDESTRIAN_MOVING_CLIENTS,
+            "num_vehicular":  NUM_VEHICULAR_MOVING_CLIENTS,
+        }
+        print(f"  [Mobility]  Sampled {len(pos_t_list)} frames "
+              f"({1.0/MOBILITY_SAMPLE_DT_S:.0f} Hz, {SIM_DURATION_S:.1f} s)")
+
     # ── Collect FlowMonitor statistics ────────────────────────────────────────
     stats      = monitor.GetFlowStats()
     classifier = fm_helper.GetClassifier()
@@ -1281,6 +1328,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         profile_stats   = {p: {"tx": 0, "rx": 0, "rx_bytes": 0, "delay_sum": 0.0}
                            for p in TRAFFIC_PROFILES},
         timeseries      = timeseries,
+        position_trace  = position_trace,
     )
 
     active_s = SIM_DURATION_S - 1.0   # exclude 1 s warm-up
@@ -1527,8 +1575,9 @@ def _ns3_parallel_worker(args: tuple) -> dict:
     spawn-context Pool.  Each worker runs in its own process with its
     own NS-3 instance, so there is no shared global state to worry about.
     """
-    scenario, pcfg, channel_stats, snr_thresh_db, sigmoid_slope = args
-    return run_ns3(scenario, pcfg, channel_stats, snr_thresh_db, sigmoid_slope)
+    scenario, pcfg, channel_stats, snr_thresh_db, sigmoid_slope, sample_positions = args
+    return run_ns3(scenario, pcfg, channel_stats, snr_thresh_db, sigmoid_slope,
+                   sample_positions=sample_positions)
 
 
 # =============================================================================
@@ -1581,10 +1630,14 @@ def run_ns3_both_topologies(channel_stats: list,
     )
 
     # Build one args-tuple per non-QUIC protocol (QUIC is derived analytically).
+    # Only the first worker samples mobility positions — the rest share the
+    # same Random(42) seed so one trace is representative, and avoiding the
+    # per-frame list appends in the other workers saves memory.
     non_quic_cfgs = [pcfg for pcfg in PROTOCOLS if pcfg["protocol"] != "quic"]
     args_list = [
-        (scenario, {**common_tcp, **pcfg}, channel_stats, snr_thresh_db, sigmoid_slope)
-        for pcfg in non_quic_cfgs
+        (scenario, {**common_tcp, **pcfg}, channel_stats,
+         snr_thresh_db, sigmoid_slope, (i == 0))
+        for i, pcfg in enumerate(non_quic_cfgs)
     ]
 
     # Each NS-3 run is single-threaded and independent; spawn one process per

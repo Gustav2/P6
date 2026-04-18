@@ -107,7 +107,7 @@ from config import (
     BACKHAUL_DELAY_MS,
 )
 from sim.phy           import run_sionna_ber
-from sim.ray_tracing   import run_ray_tracing
+from sim.ray_tracing   import run_ray_tracing, render_scene_background
 from sim.ns3           import run_ns3_both_topologies
 from plots import (
     draw_ber_bler,
@@ -125,6 +125,7 @@ from plots import (
     draw_cwnd_dynamics,
     draw_validation_summary,
     draw_timing_breakdown,
+    render_mobility_video,
 )
 
 
@@ -283,6 +284,11 @@ def main() -> None:
 
     t0 = time.perf_counter()
     channel_stats = run_ray_tracing()
+    # Cached nadir render used as the backdrop for the mobility video.
+    # Runs in the same RT TF/Mitsuba session so we don't pay another
+    # scene-load cost.  No-op when the cache file already exists.
+    render_scene_background(out="output/.mobility_scene_bg.png",
+                            half_extent_m=600.0)
     timing["RT (Sionna RT)"] = time.perf_counter() - t0
 
     print(f"\n  Channel stats ({len(channel_stats)} satellites):")
@@ -371,6 +377,26 @@ def main() -> None:
     draw_validation_summary(direct_results, channel_stats, ber_results,
                              out="output/ntn_validation_summary.png")
     print("  [14/14] output/ntn_validation_summary.png")
+
+    # Mobility video: find the result dict that actually carries the
+    # position trace (the first non-QUIC worker records it; QUIC is derived
+    # from BBR via deep-copy which preserves the field).
+    trace_source = next((r for r in direct_results
+                         if r.get("position_trace")), None)
+    if trace_source is not None:
+        render_mobility_video(
+            position_trace    = trace_source["position_trace"],
+            channel_stats     = channel_stats,
+            handover_schedule = trace_source.get("schedule", []),
+            bg_image_path     = "output/.mobility_scene_bg.png",
+            out               = "output/ntn_mobility.mp4",
+            fps               = 10,
+            half_extent_m     = 600.0,
+        )
+        print("  [+]   output/ntn_mobility.mp4")
+    else:
+        print("  [Mobility]  No position trace found — video skipped.")
+
     timing["Plotting"] = time.perf_counter() - t0
     timing["Total"] = time.perf_counter() - t_start
 
