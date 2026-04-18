@@ -536,7 +536,7 @@ def _aggregate_sample_stats(sample_stats: list, sat_id: int, sat_pos: tuple) -> 
 
     gains = np.array([s["mean_path_gain_db"] for s in valid], dtype=float)
     dss   = np.array([s["delay_spread_ns"]   for s in valid], dtype=float)
-    elevs = np.array([s["elevation_deg"]     for s in sample_stats], dtype=float)
+    elevs = np.array([s["elevation_deg"]     for s in valid], dtype=float)
 
     # Delay spread is log-normal distributed (3GPP TR 38.811): aggregate with
     # geometric mean so that a single sample with a large canyon-resonant DS
@@ -572,7 +572,7 @@ def _aggregate_sample_stats(sample_stats: list, sat_id: int, sat_pos: tuple) -> 
         normalized_p10_db     = agg_normalized_p10_db,
         delay_spread_ns       = round(ds_geo_mean_ns, 2),
         num_paths             = int(round(float(np.mean([s["num_paths"] for s in valid])))),
-        los_exists            = bool(any(s.get("los_exists", False) for s in sample_stats)),
+        los_exists            = bool(any(s.get("los_exists", False) for s in valid)),
         k_factor_db           = k_factor_db_agg,
         sat_x_m               = round(sat_pos[0], 1),
         sat_y_m               = round(sat_pos[1], 1),

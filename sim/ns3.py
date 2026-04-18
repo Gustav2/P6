@@ -1024,11 +1024,19 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     access_p2p = ns.PointToPointHelper()
     access_p2p.SetDeviceAttribute("DataRate", ns.StringValue("1Gbps"))
     access_p2p.SetChannelAttribute("Delay",    ns.StringValue("0.01ms"))
-    for ph in phones:
+    # Map each phone's source IP (as 32-bit integer via Ipv4Address::Get)
+    # to its traffic profile so FlowMonitor records can be bucketed into
+    # profile_stats by the actual sender, not by round-robin over profile
+    # names (which scrambled profiles with 50× different bitrates).
+    ip_to_profile = {}
+    for ci, ph in enumerate(phones):
         devs_acc = access_p2p.Install(_nc2(ph, beam_gw))
         ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
                      ns.Ipv4Mask("255.255.255.0"))
-        ipv4.Assign(devs_acc)
+        ifaces_acc = ipv4.Assign(devs_acc)
+        # Device index 0 is the phone side of the p2p.
+        pname = CLIENT_PROFILES[ci] if ci < len(CLIENT_PROFILES) else "bulk"
+        ip_to_profile[int(ifaces_acc.GetAddress(0).Get())] = pname
 
     # ── Beam gateway → satellite shared service link (true bottleneck) ───────
     # A single p2p at SERVICE_LINK_RATE_MBPS models the aggregate capacity of
@@ -1354,12 +1362,10 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     rx_bytes   = 0
     flow_tputs = []   # per-flow throughput for Jain's fairness
 
-    # Map flow source port range to client index for profile tagging.
-    # NS-3 FlowMonitor provides source/dest address but not the client index
-    # directly.  We use a simpler approach: tag by IP protocol number.
-    # UDP flows → distributed over UDP CBR profile names in proportion.
-    # TCP flows → bulk profile.
-    udp_flow_count = 0
+    # Profile tagging: FlowMonitor gives us the flow's source IPv4 address
+    # via the classifier, and ip_to_profile (built when the access links
+    # were wired) maps each phone's IP to its assigned traffic profile.
+    # TCP flows → bulk (the TCP run only emits bulk applications).
     tcp_flow_count = 0
 
     for pair in stats:
@@ -1386,8 +1392,9 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         rx_bytes   += b
         flow_tputs.append(flow_tput)
 
-        # Profile tagging: TCP flows → bulk; UDP flows → cycle through
-        # configured UDP profile names in rough proportion.
+        # Profile tagging: TCP flows → bulk; UDP flows → profile bucket
+        # determined by the flow's source IPv4 address (set when the
+        # client was given its traffic profile during access-link wiring).
         if ip_proto == 6:
             tcp_flow_count += 1
             ps = result["profile_stats"]["bulk"]
@@ -1396,15 +1403,10 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
             ps["rx_bytes"] += b
             ps["delay_sum"] += d_s
         else:
-            # Assign UDP flows to all configured UDP profiles in round-robin
-            udp_profiles = [
-                pname for pname, pdef in TRAFFIC_PROFILES.items()
-                if pdef.get("app_type") == "udp_cbr"
-            ]
-            if not udp_profiles:
-                udp_profiles = ["streaming"]
-            pname = udp_profiles[udp_flow_count % len(udp_profiles)]
-            udp_flow_count += 1
+            src_key = int(finfo.sourceAddress.Get())
+            pname = ip_to_profile.get(src_key, "bulk")
+            if pname not in result["profile_stats"]:
+                pname = "bulk"
             ps = result["profile_stats"][pname]
             ps["tx"] += tx_n
             ps["rx"] += rx_n

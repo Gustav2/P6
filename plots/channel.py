@@ -57,8 +57,12 @@ def draw_link_budget_waterfall(channel_stats: list,
     from config import (PHONE_EIRP_DBM,
                         SAT_HEIGHT_M, CARRIER_FREQ_HZ,
                         SAT_RX_ANTENNA_GAIN_DB,
-                        NOISE_FLOOR_DBM, SNR_THRESH_DB)
-    from sim.ns3 import _fspl_db as _ns3_fspl_db, _rt_calibrated_per
+                        NOISE_FLOOR_DBM, SNR_THRESH_DB,
+                        ATMO_GASEOUS_DB)
+    from sim.ns3 import (_fspl_db as _ns3_fspl_db,
+                         _itu_p618_rain_fade_db,
+                         _itu_p618_scintillation_db,
+                         _rt_calibrated_per)
 
     import math as _math
     # Sort by elevation descending
@@ -73,7 +77,14 @@ def draw_link_budget_waterfall(channel_stats: list,
 
     # Build budget stages for each sat
     def _budget(stat, eirp_dbm):
-        fspl       = _ns3_fspl_db(SAT_HEIGHT_M, max(stat["elevation_deg"], 1.0))
+        elev_deg   = max(stat["elevation_deg"], 1.0)
+        fspl       = _ns3_fspl_db(SAT_HEIGHT_M, elev_deg)
+        # Atmospheric loss (ITU-R P.676 gaseous + P.618 rain + scintillation)
+        # applied with the same formula as sim/ns3.py:_rt_calibrated_per so
+        # the waterfall's final SNR matches the value that actually drives PER.
+        atm_loss = (ATMO_GASEOUS_DB
+                    + _itu_p618_rain_fade_db(elev_deg)
+                    + _itu_p618_scintillation_db(elev_deg))
         norm_gain  = stat.get("normalized_gain_db", float("nan"))
         if _math.isnan(norm_gain):
             urban = -10.0
@@ -81,10 +92,12 @@ def draw_link_budget_waterfall(channel_stats: list,
             urban = float(np.clip(norm_gain - ref_gain, -12.0, 12.0))
         else:
             urban = 0.0
-        snr = eirp_dbm - fspl + urban + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM
+        snr = (eirp_dbm - fspl - atm_loss + urban
+               + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM)
         per = _rt_calibrated_per(fspl, norm_gain, stat.get("normalized_p10_db"),
-                                 ref_gain, None, None)
-        return dict(eirp=eirp_dbm, fspl=fspl, urban=urban,
+                                 ref_gain, None, None,
+                                 elev_deg=stat["elevation_deg"])
+        return dict(eirp=eirp_dbm, fspl=fspl, atm=atm_loss, urban=urban,
                     noise=NOISE_FLOOR_DBM, snr=snr, thresh=SNR_THRESH_DB,
                     margin=snr - SNR_THRESH_DB, per=per)
 
@@ -97,7 +110,7 @@ def draw_link_budget_waterfall(channel_stats: list,
     freq_ghz = CARRIER_FREQ_HZ / 1e9
     fig.suptitle(
         "Link Budget Waterfall — Per Satellite\n"
-        f"TX EIRP → FSPL → Urban correction → SNR → Margin vs threshold  "
+        f"TX EIRP → FSPL → Atm loss → Urban correction → SNR → Margin vs threshold  "
         f"({freq_ghz:.1f} GHz n255, LEO {SAT_HEIGHT_M/1e3:.0f} km, Phone EIRP {PHONE_EIRP_DBM:.0f} dBm)",
         fontsize=10,
     )
@@ -105,6 +118,7 @@ def draw_link_budget_waterfall(channel_stats: list,
     stage_colors = {
         "TX EIRP":        "#4CAF50",
         "−FSPL":          "#F44336",
+        "−Atm loss":      "#6D4C41",
         "Urban corr.":    "#FF9800",
         "−Noise floor":   "#2196F3",
         "SNR":            "#9C27B0",
@@ -116,6 +130,7 @@ def draw_link_budget_waterfall(channel_stats: list,
         stages = [
             ("TX EIRP",     budget["eirp"],               True),
             ("−FSPL",       -budget["fspl"],              False),
+            ("−Atm loss",   -budget["atm"],               False),
             ("Urban corr.", budget["urban"],               budget["urban"] >= 0),
             ("−Noise floor", -budget["noise"],             True),
         ]
