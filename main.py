@@ -51,7 +51,9 @@ import pickle
 import time
 import numpy as np
 
-OUTPUT_DIR = "output"
+OUTPUT_DIR = ("output/empirical"
+              if os.environ.get("SIM_SCENARIO", "").strip().lower() == "empirical"
+              else "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 import matplotlib
 matplotlib.use("Agg")
@@ -105,6 +107,7 @@ from config import (
     RT_UE_SAMPLE_POSITIONS,
     SERVICE_LINK_RATE_MBPS,
     BACKHAUL_DELAY_MS,
+    SIM_SCENARIO,
 )
 from sim.phy           import run_sionna_ber
 from sim.ray_tracing   import run_ray_tracing, render_scene_background
@@ -124,6 +127,7 @@ from plots import (
     draw_cross_layer_correlation,
     draw_cwnd_dynamics,
     draw_validation_summary,
+    draw_empirical_validation,
     draw_timing_breakdown,
     render_mobility_video,
 )
@@ -151,7 +155,9 @@ def _phy_cache_path() -> str:
         "height": SAT_HEIGHT_M,
         "elev":   ELEVATION_ANGLE_DEG,
     }).encode()).hexdigest()[:10]
-    return f"{OUTPUT_DIR}/.phy_cache_{key}.pkl"
+    # PHY output is identical across scenarios (SIM_SCENARIO only affects
+    # NS-3), so keep this cache at the shared top-level output/ dir.
+    return f"output/.phy_cache_{key}.pkl"
 
 
 def _load_phy_cache() -> tuple:
@@ -178,6 +184,8 @@ def main() -> None:
     print("  Sionna 1.2.1 + OpenNTN (TR38.811) + Sionna RT + NS-3")
     print(f"  Mitsuba variant : {mi.variant()}")
     print(f"  TF threads      : {_n_cores} cores")
+    print(f"  Scenario        : {SIM_SCENARIO}  "
+          f"(outputs -> {OUTPUT_DIR}/)")
     print("=" * 70)
 
     t_start = time.perf_counter()
@@ -334,49 +342,53 @@ def main() -> None:
     print("─" * 70)
 
     t0 = time.perf_counter()
-    draw_ber_bler(ber_results, snr_range=snr_range, out="output/ntn_ber_bler.png")
-    print("  [1/10] output/ntn_ber_bler.png")
+    draw_ber_bler(ber_results, snr_range=snr_range, out=f"{OUTPUT_DIR}/ntn_ber_bler.png")
+    print(f"  [1/15] {OUTPUT_DIR}/ntn_ber_bler.png")
 
-    draw_protocol_comparison(direct_results, out="output/ntn_protocol_comparison.png")
-    print("  [2/10] output/ntn_protocol_comparison.png")
+    draw_protocol_comparison(direct_results, out=f"{OUTPUT_DIR}/ntn_protocol_comparison.png")
+    print(f"  [2/15] {OUTPUT_DIR}/ntn_protocol_comparison.png")
 
-    draw_link_budget_waterfall(channel_stats, out="output/ntn_link_budget_waterfall.png")
-    print("  [3/10] output/ntn_link_budget_waterfall.png")
+    draw_link_budget_waterfall(channel_stats, out=f"{OUTPUT_DIR}/ntn_link_budget_waterfall.png")
+    print(f"  [3/15] {OUTPUT_DIR}/ntn_link_budget_waterfall.png")
 
-    draw_snr_vs_elevation(channel_stats, out="output/ntn_snr_vs_elevation.png")
-    print("  [4/10] output/ntn_snr_vs_elevation.png")
+    draw_snr_vs_elevation(channel_stats, out=f"{OUTPUT_DIR}/ntn_snr_vs_elevation.png")
+    print(f"  [4/15] {OUTPUT_DIR}/ntn_snr_vs_elevation.png")
 
-    draw_latency_breakdown(direct_results, out="output/ntn_latency_breakdown.png")
-    print("  [5/10] output/ntn_latency_breakdown.png")
+    draw_latency_breakdown(direct_results, out=f"{OUTPUT_DIR}/ntn_latency_breakdown.png")
+    print(f"  [5/15] {OUTPUT_DIR}/ntn_latency_breakdown.png")
 
-    draw_handover_impact(direct_results, out="output/ntn_handover_impact.png")
-    print("  [6/10] output/ntn_handover_impact.png")
+    draw_handover_impact(direct_results, out=f"{OUTPUT_DIR}/ntn_handover_impact.png")
+    print(f"  [6/15] {OUTPUT_DIR}/ntn_handover_impact.png")
 
-    draw_handover_schedule(direct_results, out="output/ntn_handover_schedule.png")
-    print("  [7/10] output/ntn_handover_schedule.png")
+    draw_handover_schedule(direct_results, out=f"{OUTPUT_DIR}/ntn_handover_schedule.png")
+    print(f"  [7/15] {OUTPUT_DIR}/ntn_handover_schedule.png")
 
-    draw_timeseries(direct_results, out="output/ntn_timeseries.png")
-    print("  [8/10] output/ntn_timeseries.png")
+    draw_timeseries(direct_results, out=f"{OUTPUT_DIR}/ntn_timeseries.png")
+    print(f"  [8/15] {OUTPUT_DIR}/ntn_timeseries.png")
 
-    draw_fairness(direct_results, out="output/ntn_fairness.png")
-    print("  [9/10] output/ntn_fairness.png")
+    draw_fairness(direct_results, out=f"{OUTPUT_DIR}/ntn_fairness.png")
+    print(f"  [9/15] {OUTPUT_DIR}/ntn_fairness.png")
 
-    draw_profile_breakdown(direct_results, out="output/ntn_profile_breakdown.png")
-    print("  [10/10] output/ntn_profile_breakdown.png")
+    draw_profile_breakdown(direct_results, out=f"{OUTPUT_DIR}/ntn_profile_breakdown.png")
+    print(f"  [10/15] {OUTPUT_DIR}/ntn_profile_breakdown.png")
 
-    draw_channel_validation(channel_stats, out="output/ntn_channel_validation.png")
-    print("  [11/14] output/ntn_channel_validation.png")
+    draw_channel_validation(channel_stats, out=f"{OUTPUT_DIR}/ntn_channel_validation.png")
+    print(f"  [11/15] {OUTPUT_DIR}/ntn_channel_validation.png")
 
     draw_cross_layer_correlation(channel_stats, direct_results,
-                                  out="output/ntn_cross_layer.png")
-    print("  [12/14] output/ntn_cross_layer.png")
+                                  out=f"{OUTPUT_DIR}/ntn_cross_layer.png")
+    print(f"  [12/15] {OUTPUT_DIR}/ntn_cross_layer.png")
 
-    draw_cwnd_dynamics(direct_results, out="output/ntn_cwnd_dynamics.png")
-    print("  [13/14] output/ntn_cwnd_dynamics.png")
+    draw_cwnd_dynamics(direct_results, out=f"{OUTPUT_DIR}/ntn_cwnd_dynamics.png")
+    print(f"  [13/15] {OUTPUT_DIR}/ntn_cwnd_dynamics.png")
 
     draw_validation_summary(direct_results, channel_stats, ber_results,
-                             out="output/ntn_validation_summary.png")
-    print("  [14/14] output/ntn_validation_summary.png")
+                             out=f"{OUTPUT_DIR}/ntn_validation_summary.png")
+    print(f"  [14/15] {OUTPUT_DIR}/ntn_validation_summary.png")
+
+    draw_empirical_validation(direct_results, channel_stats,
+                               out=f"{OUTPUT_DIR}/ntn_empirical_validation.png")
+    print(f"  [15/15] {OUTPUT_DIR}/ntn_empirical_validation.png")
 
     # Mobility video: find the result dict that actually carries the
     # position trace (the first non-QUIC worker records it; QUIC is derived
@@ -389,19 +401,19 @@ def main() -> None:
             channel_stats     = channel_stats,
             handover_schedule = trace_source.get("schedule", []),
             bg_image_path     = "output/.mobility_scene_bg.png",
-            out               = "output/ntn_mobility.mp4",
+            out               = f"{OUTPUT_DIR}/ntn_mobility.mp4",
             fps               = 10,
             half_extent_m     = 600.0,
         )
-        print("  [+]   output/ntn_mobility.mp4")
+        print(f"  [+]   {OUTPUT_DIR}/ntn_mobility.mp4")
     else:
         print("  [Mobility]  No position trace found — video skipped.")
 
     timing["Plotting"] = time.perf_counter() - t0
     timing["Total"] = time.perf_counter() - t_start
 
-    draw_timing_breakdown(timing, mi.variant(), out="output/ntn_timing.png")
-    print("  [+]   output/ntn_timing.png")
+    draw_timing_breakdown(timing, mi.variant(), out=f"{OUTPUT_DIR}/ntn_timing.png")
+    print(f"  [+]   {OUTPUT_DIR}/ntn_timing.png")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)

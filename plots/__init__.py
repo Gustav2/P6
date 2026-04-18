@@ -22,5 +22,6 @@ from plots.network import (
 )
 from plots.handover import draw_handover_impact, draw_handover_schedule, draw_timeseries
 from plots.summary import draw_validation_summary
+from plots.empirical_validation import draw_empirical_validation
 from plots.timing import draw_timing_breakdown
 from plots.mobility import render_mobility_video

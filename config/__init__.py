@@ -8,3 +8,4 @@ from config.phy import *
 from config.satellite import *
 from config.ray_tracing import *
 from config.network import *
+from config.empirical_refs import EMPIRICAL_REFS, get_ref

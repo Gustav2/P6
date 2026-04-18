@@ -2,6 +2,33 @@
 config/network.py — NS-3 / protocols / clients / traffic parameters
 """
 
+import os
+
+# =============================================================================
+# Scenario selector
+# =============================================================================
+#
+# The simulation supports two calibrated scenarios, selected via the
+# ``SIM_SCENARIO`` environment variable:
+#
+#   "contended" (default) — 50 clients in one beam, mixed traffic profiles.
+#                           The realistic urban stress test for the thesis.
+#   "empirical"           — 3 bulk clients, 100 Mbps beam (Sander IMC 2022
+#                           single-user Ka-band envelope).  Used to match
+#                           published measurement conditions so the
+#                           empirical-validation plots can compare apples
+#                           to apples.
+#
+# Nothing else is gated on this flag — the PHY, RT, channel, and handover
+# models run identically in both modes.  Only client count, traffic mix,
+# and service-link capacity differ.
+SIM_SCENARIO = os.environ.get("SIM_SCENARIO", "contended").strip().lower()
+if SIM_SCENARIO not in ("contended", "empirical"):
+    raise ValueError(
+        f"SIM_SCENARIO={SIM_SCENARIO!r} not recognised; "
+        "expected 'contended' or 'empirical'"
+    )
+
 # =============================================================================
 # NS-3 network simulation parameters
 # =============================================================================
@@ -568,6 +595,25 @@ if len(CLIENT_PROFILES) != _expected_total:
         f"TRAFFIC_PROFILE_COUNTS sums to {len(CLIENT_PROFILES)} clients, "
         f"expected {_expected_total} (NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS)."
     )
+
+
+# =============================================================================
+# Empirical-scenario overrides
+# =============================================================================
+# When SIM_SCENARIO="empirical", replace the contended-urban deployment
+# with a lightly-loaded cell matching the measurement conditions of
+# Sander et al. IMC 2022 (single-user Ka-band envelope, ~100 Mbps beam).
+# We reuse the constant names above; only these values change.
+if SIM_SCENARIO == "empirical":
+    NUM_STATIONARY_CLIENTS        = 2
+    NUM_MOVING_CLIENTS            = 1
+    NUM_PEDESTRIAN_MOVING_CLIENTS = 1
+    NUM_VEHICULAR_MOVING_CLIENTS  = 0
+    SERVICE_LINK_RATE_MBPS        = 100.0
+    TRAFFIC_PROFILE_COUNTS        = {"bulk": 3}
+    CLIENT_PROFILES               = ["bulk", "bulk", "bulk"]
+    # No need to re-validate the sum — NUM_STATIONARY_CLIENTS +
+    # NUM_MOVING_CLIENTS = 3 and len(CLIENT_PROFILES) = 3 by construction.
 
 # =============================================================================
 # Time-series collection

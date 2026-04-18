@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from config import (
     SERVICE_LINK_RATE_MBPS,
     HANDOVER_INTERRUPTION_MS_MAX,
+    EMPIRICAL_REFS,
 )
 
 
@@ -131,101 +132,150 @@ def draw_validation_summary(ns3_results: list,
             return "N/A"
         return f"{v:.{prec}f}{unit}"
 
+    # ── Helper: empirical reference check ────────────────────────────────────
+    # Returns (emp_display_str, emp_pass_or_None).  ``emp_pass=None`` means
+    # no published measurement exists → status cell shows "—".
+    def _emp(measured, ref_entry, unit=""):
+        if ref_entry is None or not ref_entry:
+            return ("N/A", None)
+        if measured is None or (isinstance(measured, float)
+                                and math.isnan(measured)):
+            return (f"{ref_entry['value']:.2f}{unit}", False)
+        v   = float(ref_entry["value"])
+        tol = float(ref_entry.get("tol_pct", 0.25)) * max(abs(v), 1e-9)
+        ok  = abs(measured - v) <= tol
+        return (f"{v:.2f}{unit} ±{tol:.2f}", bool(ok))
+
+    # Round-trip approximation for comparison with Sander's RTT CDF.
+    rtt_est_ms = (2.0 * median_latency_ms
+                  if not math.isnan(median_latency_ms) else float("nan"))
+
+    # Rows now carry:
+    #   (name, measured_str, std_target_str, std_source, std_pass,
+    #    emp_ref_str,     emp_pass_or_None)
+    emp_lat  = _emp(rtt_est_ms, EMPIRICAL_REFS["latency"]["rtt_median_ms"],  " ms")
+    emp_loss = _emp(median_loss_pct,  EMPIRICAL_REFS["loss"]["median_pct"],  " %")
+    emp_ho   = _emp(worst_ho_success * 100.0,
+                    EMPIRICAL_REFS["handover"]["success_rate_pct"],          " %")
+    emp_r    = _emp(abs(r_k_per) if not math.isnan(r_k_per) else float("nan"),
+                    EMPIRICAL_REFS["channel"]["cross_layer_r_k_per"],        "")
+
     rows = [
         ("Throughput efficiency",
          f"{tput_efficiency_pct:.0f}% of {shannon_ceiling_mbps:.0f} Mbps",
          "> 90% of beam capacity",
          "3GPP TR 38.821 §6.1.1",
-         tput_efficiency_pct > 90.0),
+         tput_efficiency_pct > 90.0,
+         "N/A", None),
 
-        ("Mean latency",
-         _fmt(median_latency_ms, " ms", 1),
+        ("Mean latency (2× one-way)",
+         f"{_fmt(median_latency_ms, ' ms', 1)}  (RTT≈{_fmt(rtt_est_ms, ' ms', 1)})",
          "< 100 ms (LEO p95 budget)",
          "ITU-R P.618 / Sander et al. IMC 2022",
-         (not math.isnan(median_latency_ms)) and median_latency_ms < 100.0),
+         (not math.isnan(median_latency_ms)) and median_latency_ms < 100.0,
+         emp_lat[0], emp_lat[1]),
 
         ("Packet loss",
          _fmt(median_loss_pct, " %", 2),
          "< 3% (VoIP class)",
          "ITU-T G.107 / RFC 3393",
-         (not math.isnan(median_loss_pct)) and median_loss_pct < 3.0),
+         (not math.isnan(median_loss_pct)) and median_loss_pct < 3.0,
+         emp_loss[0], emp_loss[1]),
 
         ("Jain's fairness",
          _fmt(median_fairness, "", 3),
          "> 0.9",
          "Jain, Chiu & Hawe (1984)",
-         (not math.isnan(median_fairness)) and median_fairness > 0.9),
+         (not math.isnan(median_fairness)) and median_fairness > 0.9,
+         "N/A", None),
 
         ("Handover success rate",
          _fmt(worst_ho_success * 100.0, " %", 1),
          f"> 95% (within {HANDOVER_INTERRUPTION_MS_MAX:.0f} ms budget)",
          "3GPP TS 38.300 §10.1.2.3",
-         worst_ho_success >= 0.95),
+         worst_ho_success >= 0.95,
+         emp_ho[0], emp_ho[1]),
 
         ("Streaming rebuffering",
          _fmt(worst_rebuffer, " %", 2),
          "< 5%",
          "ETSI TR 103 559 §5",
-         worst_rebuffer < 5.0),
+         worst_rebuffer < 5.0,
+         "N/A", None),
 
         ("Video PSNR (per-client)",
          _fmt(worst_psnr, " dB", 2),
          "> 30 dB",
          "Empirical H.264 CBR map",
-         worst_psnr > 30.0),
+         worst_psnr > 30.0,
+         "N/A", None),
 
         ("Gaming E2E latency",
          _fmt(worst_gaming_latency, " ms", 1),
          "< 50 ms",
          "3GPP TR 22.261 §7.1 (URLLC)",
-         (not math.isnan(worst_gaming_latency)) and worst_gaming_latency < 50.0),
+         (not math.isnan(worst_gaming_latency)) and worst_gaming_latency < 50.0,
+         "N/A", None),
 
         ("VoIP MOS",
          _fmt(worst_mos, "", 3),
          "> 3.5",
          "ITU-T G.107 E-model",
-         worst_mos > 3.5),
+         worst_mos > 3.5,
+         "N/A", None),
 
         ("Protocol overhead",
          _fmt(max_overhead, " %", 2),
          "< 10%",
          "IETF RFC 791 / 9293 header sizes",
-         max_overhead < 10.0),
+         max_overhead < 10.0,
+         "N/A", None),
 
         ("Cross-layer correlation R",
          _fmt(r_k_per, "", 2),
          "|R| > 0.8 (K-factor ↔ PER)",
          "Sander et al. IMC 2022 cross-layer",
-         (not math.isnan(r_k_per)) and abs(r_k_per) > 0.8),
+         (not math.isnan(r_k_per)) and abs(r_k_per) > 0.8,
+         emp_r[0], emp_r[1]),
 
         ("BLER deviation vs TR 38.811",
          _fmt(bler_dev_db, " dB", 2),
          "< 2 dB RMS",
          "3GPP TR 38.811 §7.3",
-         (not math.isnan(bler_dev_db)) and bler_dev_db < 2.0),
+         (not math.isnan(bler_dev_db)) and bler_dev_db < 2.0,
+         "N/A", None),
     ]
 
     # ── Render table figure ────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(13, 1.0 + 0.45 * len(rows)))
+    fig, ax = plt.subplots(figsize=(16, 1.0 + 0.48 * len(rows)))
     fig.patch.set_facecolor("#f8f9fa")
     ax.set_facecolor("#f8f9fa")
     ax.axis("off")
 
-    col_labels = ["KPI", "Measured", "Target", "Standard", "Status"]
-    table_data = []
+    col_labels = ["KPI", "Measured", "Standards target", "Standard",
+                  "Std.", "Measured reality", "Emp."]
+    table_data  = []
     cell_colors = []
-    for (name, measured, target, source, passed) in rows:
-        status = "PASS" if passed else "FAIL"
-        table_data.append([name, measured, target, source, status])
-        row_bg = "#e8f5e9" if passed else "#fdecea"
-        cell_colors.append([row_bg] * 5)
+    for (name, measured, target, source, std_pass, emp_str, emp_pass) in rows:
+        std_status = "PASS" if std_pass else "FAIL"
+        if emp_pass is None:
+            emp_status = "—"
+        else:
+            emp_status = "PASS" if emp_pass else "FAIL"
+        table_data.append([name, measured, target, source,
+                           std_status, emp_str, emp_status])
+        # Row background: green only when BOTH checks pass (or empirical is N/A
+        # and the standards check passes); red otherwise.
+        both_ok = std_pass and (emp_pass is True or emp_pass is None)
+        row_bg = "#e8f5e9" if both_ok else "#fdecea"
+        cell_colors.append([row_bg] * len(col_labels))
 
     tbl = ax.table(cellText=table_data,
                    colLabels=col_labels,
                    cellColours=cell_colors,
                    loc="center",
                    cellLoc="left",
-                   colWidths=[0.22, 0.17, 0.22, 0.29, 0.10])
+                   colWidths=[0.17, 0.16, 0.18, 0.22, 0.06, 0.14, 0.06])
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(9)
     tbl.scale(1.0, 1.5)
@@ -236,24 +286,40 @@ def draw_validation_summary(ns3_results: list,
         header_cell.set_facecolor("#1f77b4")
         header_cell.set_text_props(color="white", weight="bold")
 
-    # Status column: bold pass/fail
-    for row_idx, (*_, passed) in enumerate(rows, start=1):
-        status_cell = tbl[row_idx, 4]
-        status_cell.set_text_props(
+    # Status cells: bold coloured PASS/FAIL
+    for row_idx, (*_, _measured, _target, _source,
+                   std_pass, _emp_str, emp_pass) in enumerate(rows, start=1):
+        # Standards column (col 4)
+        std_cell = tbl[row_idx, 4]
+        std_cell.set_text_props(
             weight="bold",
-            color="#1b5e20" if passed else "#b71c1c",
+            color="#1b5e20" if std_pass else "#b71c1c",
         )
+        # Empirical column (col 6)
+        emp_cell = tbl[row_idx, 6]
+        if emp_pass is None:
+            emp_cell.set_text_props(color="#888", weight="normal")
+        else:
+            emp_cell.set_text_props(
+                weight="bold",
+                color="#1b5e20" if emp_pass else "#b71c1c",
+            )
 
-    pass_count = sum(1 for r in rows if r[-1])
-    total      = len(rows)
+    std_pass_count = sum(1 for r in rows if r[4])
+    emp_rows       = [r for r in rows if r[6] is not None]
+    emp_pass_count = sum(1 for r in emp_rows if r[6])
+    total          = len(rows)
     header_text = (
         "NTN Simulation Validation Summary — "
-        f"{pass_count}/{total} KPIs pass standards targets"
+        f"{std_pass_count}/{total} KPIs pass standards targets   |   "
+        f"{emp_pass_count}/{len(emp_rows)} pass published measurements"
     )
     fig.suptitle(header_text, fontsize=12, weight="bold")
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(out, dpi=150, bbox_inches="tight")
-    print(f"[ValidationSummary]  Saved -> {out}  ({pass_count}/{total} pass)")
+    print(f"[ValidationSummary]  Saved -> {out}  "
+          f"(standards {std_pass_count}/{total}, "
+          f"empirical {emp_pass_count}/{len(emp_rows)})")
     plt.close()
     return out
