@@ -932,22 +932,13 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         r      = radius * _math.sqrt(_rng.uniform(0, 1))
         return r * _math.cos(angle), r * _math.sin(angle), z
 
-    static_mob = ns.MobilityHelper()
-    static_mob.SetMobilityModel("ns3::ConstantPositionMobilityModel")
-    static_mob.Install(nodes)   # default all nodes to static first
-
-    # Place stationary phones at fixed random positions
-    phone_positions = []
-    for i in range(num_clients):
-        px, py, pz = _random_pos_in_circle(CLIENT_AREA_RADIUS_M)
-        phone_positions.append((px, py, pz))
-        mob = phones[i].GetObject[ns.ConstantPositionMobilityModel]()
-        mob.SetPosition(ns.Vector(px, py, pz))
-
-    # Override moving phones with RandomWaypointMobilityModel
-    # NS-3 RandomWaypointMobilityModel has three attributes: Speed, Pause,
-    # PositionAllocator.  There is no "Bounds" attribute — bounds are enforced
-    # entirely via RandomRectanglePositionAllocator (X and Y random variables).
+    # Each NS-3 Node may hold only ONE MobilityModel in its aggregation.
+    # Object::DoGetObject returns the FIRST aggregated object whose TypeId
+    # (or any parent TypeId) matches the requested type.  If we install
+    # ConstantPositionMobilityModel on every node and then AggregateObject a
+    # second MobilityModel (RWP on moving phones, ConstantVelocity on sat),
+    # later GetObject<MobilityModel>() calls return the static one — so
+    # positions never update.  Install exactly one mobility model per node.
     if NUM_PEDESTRIAN_MOVING_CLIENTS + NUM_VEHICULAR_MOVING_CLIENTS != NUM_MOVING_CLIENTS:
         raise ValueError(
             "NUM_PEDESTRIAN_MOVING_CLIENTS + NUM_VEHICULAR_MOVING_CLIENTS "
@@ -955,7 +946,6 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         )
 
     moving_start = NUM_STATIONARY_CLIENTS
-    moving_end = NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS
     pedestrian_end = moving_start + NUM_PEDESTRIAN_MOVING_CLIENTS
 
     def _speed_bounds_for_client(client_idx: int) -> tuple:
@@ -963,8 +953,32 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
             return PEDESTRIAN_SPEED_MIN_MS, PEDESTRIAN_SPEED_MAX_MS
         return VEHICULAR_SPEED_MIN_MS, VEHICULAR_SPEED_MAX_MS
 
+    # Container of nodes that stay put (stationary phones + infrastructure).
+    static_nc = ns.NodeContainer()
+    for i in range(NUM_STATIONARY_CLIENTS):
+        static_nc.Add(phones[i])
+    static_nc.Add(beam_gw)
+    static_nc.Add(server)
+
+    static_mob = ns.MobilityHelper()
+    static_mob.SetMobilityModel("ns3::ConstantPositionMobilityModel")
+    static_mob.Install(static_nc)
+
+    # Place stationary phones at random positions within the service area.
+    phone_positions = [None] * num_clients
+    for i in range(NUM_STATIONARY_CLIENTS):
+        px, py, pz = _random_pos_in_circle(CLIENT_AREA_RADIUS_M)
+        phone_positions[i] = (px, py, pz)
+        phones[i].GetObject[ns.ConstantPositionMobilityModel]().SetPosition(
+            ns.Vector(px, py, pz))
+
+    # Moving phones: install RandomWaypointMobilityModel as the SOLE mobility
+    # model on each node.  The NS-3 RandomWaypointMobilityModel has three
+    # attributes: Speed, Pause, PositionAllocator.  Bounds are enforced via
+    # the RandomRectanglePositionAllocator (X and Y random variables).
     for i in range(NUM_STATIONARY_CLIENTS, num_clients):
-        px, py, pz = phone_positions[i]
+        px, py, pz = _random_pos_in_circle(CLIENT_AREA_RADIUS_M)
+        phone_positions[i] = (px, py, pz)
         rwp_mob = ns.CreateObject[ns.RandomWaypointMobilityModel]()
         r = CLIENT_AREA_RADIUS_M
         vmin, vmax = _speed_bounds_for_client(i)
@@ -983,7 +997,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         phones[i].AggregateObject(rwp_mob)
         rwp_mob.SetPosition(ns.Vector(px, py, pz))
 
-    # ── Satellite mobility ─────────────────────────────────────────────────────
+    # Satellite: ConstantVelocityMobilityModel as the SOLE mobility model.
     sat_mob = ns.CreateObject[ns.ConstantVelocityMobilityModel]()
     sat.AggregateObject(sat_mob)
     sat_mob.SetPosition(ns.Vector(0.0, 0.0, SAT_HEIGHT_M))
