@@ -415,3 +415,136 @@ def draw_channel_validation(channel_stats: list,
     print(f"[ChannelValidation]  Saved -> {out}")
     plt.close()
     return out
+
+
+# =============================================================================
+# 4. Cross-layer correlation (PHY K-factor ↔ NS-3 loss/latency)
+# =============================================================================
+
+def draw_cross_layer_correlation(channel_stats: list, ns3_results: list,
+                                  out: str = "output/ntn_cross_layer.png") -> str:
+    """
+    Per-satellite cross-layer correlation between the PHY-level K-factor and
+    the NS-3 service-link PER / slot delay.
+
+    For each satellite in the handover schedule we pair:
+      * K-factor [dB] (sampled by the TR 38.811 stochastic channel model)
+      * Slot PER [%]  (RT-calibrated packet error rate from the link budget)
+      * Slot delay [ms] (one-way propagation delay at the slot elevation)
+
+    Pearson R² is computed between K-factor and both PER and delay.  A strong
+    negative correlation (R² > 0.64 ≈ |R| > 0.8) is expected: higher K-factor
+    means more direct-path energy and therefore lower PER.
+    """
+    if not ns3_results:
+        print("[CrossLayer]  No NS-3 results — skipping.")
+        return out
+
+    # Pull the first result's schedule (all protocols share one schedule)
+    schedule = ns3_results[0].get("schedule", [])
+    if not schedule:
+        print("[CrossLayer]  Empty schedule — skipping.")
+        return out
+
+    sat_to_k = {s["sat_id"]: s.get("k_factor_db", float("nan"))
+                for s in channel_stats}
+
+    pairs = []
+    for slot in schedule:
+        sid    = slot["sat_id"]
+        k_db   = sat_to_k.get(sid, float("nan"))
+        per    = slot.get("per", 0.0)
+        delay  = slot.get("delay_ms", 0.0)
+        elev   = slot.get("elev_deg", 0.0)
+        if not math.isnan(k_db):
+            pairs.append((elev, k_db, per, delay, sid))
+
+    if len(pairs) < 2:
+        print(f"[CrossLayer]  Not enough LoS samples ({len(pairs)}) — skipping.")
+        return out
+
+    elev_arr  = np.array([p[0] for p in pairs])
+    k_arr     = np.array([p[1] for p in pairs])
+    per_arr   = np.array([p[2] for p in pairs]) * 100.0   # to %
+    delay_arr = np.array([p[3] for p in pairs])
+    sid_arr   = [p[4] for p in pairs]
+
+    def _pearson_r(x, y):
+        if len(x) < 2 or np.std(x) == 0 or np.std(y) == 0:
+            return 0.0
+        return float(np.corrcoef(x, y)[0, 1])
+
+    r_k_per   = _pearson_r(k_arr, per_arr)
+    r_k_delay = _pearson_r(k_arr, delay_arr)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    fig.patch.set_facecolor("#f8f9fa")
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#f8f9fa")
+
+    fig.suptitle(
+        "Cross-Layer Correlation — PHY K-factor vs NS-3 service-link KPIs\n"
+        "(Per-satellite samples from TR 38.811 channel × RT link budget)",
+        fontsize=10,
+    )
+
+    # ── Panel 1: K-factor vs slot PER ─────────────────────────────────────────
+    ax1.scatter(k_arr, per_arr, c=elev_arr, cmap="viridis", s=80,
+                edgecolor="#222", lw=0.6)
+    for xi, yi, sid in zip(k_arr, per_arr, sid_arr):
+        ax1.annotate(f"sat{sid}", (xi, yi), textcoords="offset points",
+                     xytext=(5, 4), fontsize=7)
+
+    if len(pairs) >= 2:
+        fit = np.polyfit(k_arr, per_arr, 1)
+        xs = np.linspace(k_arr.min() - 0.5, k_arr.max() + 0.5, 50)
+        ax1.plot(xs, fit[0] * xs + fit[1], "--", color="#d62728", lw=1.4,
+                 label=f"linear fit (R={r_k_per:+.2f}, R²={r_k_per**2:.2f})")
+
+    status_per = "PASS" if abs(r_k_per) >= 0.8 else "CHECK"
+    ax1.text(0.03, 0.95, f"[{status_per}]  target |R|>0.8",
+             transform=ax1.transAxes, fontsize=8,
+             bbox=dict(facecolor="white", alpha=0.85, edgecolor="#888",
+                       boxstyle="round,pad=0.25"))
+    ax1.set_xlabel("K-factor [dB]", fontsize=9)
+    ax1.set_ylabel("Slot PER [%]", fontsize=9)
+    ax1.set_title("K-factor ↔ Packet error rate", fontsize=9)
+    ax1.grid(alpha=0.3)
+    ax1.legend(fontsize=8, loc="upper right")
+
+    # ── Panel 2: K-factor vs slot one-way delay ───────────────────────────────
+    ax2.scatter(k_arr, delay_arr, c=elev_arr, cmap="viridis", s=80,
+                edgecolor="#222", lw=0.6)
+    for xi, yi, sid in zip(k_arr, delay_arr, sid_arr):
+        ax2.annotate(f"sat{sid}", (xi, yi), textcoords="offset points",
+                     xytext=(5, 4), fontsize=7)
+
+    if len(pairs) >= 2:
+        fit2 = np.polyfit(k_arr, delay_arr, 1)
+        xs2  = np.linspace(k_arr.min() - 0.5, k_arr.max() + 0.5, 50)
+        ax2.plot(xs2, fit2[0] * xs2 + fit2[1], "--", color="#d62728", lw=1.4,
+                 label=f"linear fit (R={r_k_delay:+.2f}, R²={r_k_delay**2:.2f})")
+
+    status_delay = "PASS" if abs(r_k_delay) >= 0.8 else "CHECK"
+    ax2.text(0.03, 0.95, f"[{status_delay}]  target |R|>0.8",
+             transform=ax2.transAxes, fontsize=8,
+             bbox=dict(facecolor="white", alpha=0.85, edgecolor="#888",
+                       boxstyle="round,pad=0.25"))
+    ax2.set_xlabel("K-factor [dB]", fontsize=9)
+    ax2.set_ylabel("Slot one-way delay [ms]", fontsize=9)
+    ax2.set_title("K-factor ↔ Slot propagation delay", fontsize=9)
+    ax2.grid(alpha=0.3)
+    ax2.legend(fontsize=8, loc="upper right")
+
+    sm = plt.cm.ScalarMappable(cmap="viridis",
+                                norm=plt.Normalize(vmin=elev_arr.min(),
+                                                    vmax=elev_arr.max()))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=[ax1, ax2], shrink=0.85, pad=0.02)
+    cbar.set_label("Elevation [°]", fontsize=9)
+
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"[CrossLayer]  Saved -> {out}  "
+          f"(R_K↔PER={r_k_per:+.2f}, R_K↔delay={r_k_delay:+.2f})")
+    plt.close()
+    return out

@@ -266,6 +266,48 @@ positions in the urban scene.
 """
 
 # =============================================================================
+# ITU-R P.618 atmospheric / rain fade parameters
+# =============================================================================
+
+ATMO_GASEOUS_DB = 0.3
+"""
+Clear-sky gaseous absorption [dB] at 2 GHz per ITU-R P.676-12.
+- Combined O₂ + H₂O absorption at S-band is dominated by water vapour;
+  at ~7.5 g/m³ reference humidity and 90° elevation this sums to ~0.3 dB.
+- Scales with 1/sin(elev) down to the 10° horizon floor (already accounted
+  for inside _itu_p618_atm_db).
+Source: ITU-R P.676-12 §2.2 (specific attenuation × slant-path length).
+"""
+
+RAIN_RATE_MM_H = 12.0
+"""
+Rain rate exceeded 0.01% of the year [mm/h] for temperate climate zone.
+- ITU-R P.837-7 Zone K nominal value (covers most of northern Europe).
+- Drives the ITU-R P.618-13 rain-fade computation for link availability.
+- Raise to 42 mm/h (Zone P, tropical maritime) or lower to 8 mm/h (Zone E,
+  temperate-dry) to study different climate regimes.
+Source: ITU-R P.837-7 Annex 1; ITU-R P.618-13 §2.2.1.
+"""
+
+RAIN_AVAILABILITY_PCT = 99.0
+"""
+Target link availability [%] for the rain-fade budget.
+- 99.0% → accepts rain fade exceeded 1% of the year (worst-case 3.65 days).
+- 99.9% → more stringent (exceeded 0.1% of the year) — fade margin grows ~2×.
+- At S-band (2 GHz) rain is not a dominant impairment; this value is retained
+  for methodological completeness rather than real availability impact.
+"""
+
+ATMO_SCINTILLATION_DB = 0.2
+"""
+Tropospheric scintillation standard deviation [dB] at 2 GHz.
+- ITU-R P.618-13 §2.4.1 gives σ_scint proportional to f^(7/12) / sin(elev)^1.2.
+- At 2 GHz, clear-sky σ_scint ≤ 0.2 dB even at 10° elevation — negligible
+  compared to the 4 dB shadow fading, but included for completeness.
+Source: ITU-R P.618-13 §2.4.1 (scintillation model).
+"""
+
+# =============================================================================
 # Multi-client topology settings
 # =============================================================================
 

@@ -121,6 +121,9 @@ from plots import (
     draw_fairness,
     draw_profile_breakdown,
     draw_channel_validation,
+    draw_cross_layer_correlation,
+    draw_cwnd_dynamics,
+    draw_validation_summary,
     draw_timing_breakdown,
 )
 
@@ -356,7 +359,18 @@ def main() -> None:
     print("  [10/10] output/ntn_profile_breakdown.png")
 
     draw_channel_validation(channel_stats, out="output/ntn_channel_validation.png")
-    print("  [11/11] output/ntn_channel_validation.png")
+    print("  [11/14] output/ntn_channel_validation.png")
+
+    draw_cross_layer_correlation(channel_stats, direct_results,
+                                  out="output/ntn_cross_layer.png")
+    print("  [12/14] output/ntn_cross_layer.png")
+
+    draw_cwnd_dynamics(direct_results, out="output/ntn_cwnd_dynamics.png")
+    print("  [13/14] output/ntn_cwnd_dynamics.png")
+
+    draw_validation_summary(direct_results, channel_stats, ber_results,
+                             out="output/ntn_validation_summary.png")
+    print("  [14/14] output/ntn_validation_summary.png")
     timing["Plotting"] = time.perf_counter() - t0
     timing["Total"] = time.perf_counter() - t_start
 
@@ -403,6 +417,23 @@ def main() -> None:
               f"  {r.get('jitter_ms', 0.0):>12.2f}"
               f"  {r.get('fairness_index', 0.0):>9.4f}"
               f"  {r.get('handovers', 0):>10}")
+
+    # ── Application-layer KPI table ───────────────────────────────────────────
+    print()
+    print(f"  {'Protocol':<16}  {'HO success':>10}  {'Rebuffer %':>11}"
+          f"  {'PSNR dB':>9}  {'Gaming ms':>10}  {'MOS':>6}"
+          f"  {'Overhead %':>11}")
+    print("  " + "─" * 85)
+    for r in direct_results:
+        g_lat = r.get("gaming_latency_ms")
+        g_lat_s = f"{g_lat:.1f}" if g_lat is not None else "N/A"
+        print(f"  {r['label']:<16}"
+              f"  {r.get('handover_success_rate', 1.0)*100:>9.1f}%"
+              f"  {r.get('rebuffer_ratio_pct', 0.0):>11.2f}"
+              f"  {r.get('stream_psnr_db', 0.0):>9.2f}"
+              f"  {g_lat_s:>10}"
+              f"  {r.get('voice_mos', 0.0):>6.2f}"
+              f"  {r.get('protocol_overhead_pct', 0.0):>11.2f}")
 
 
 if __name__ == "__main__":

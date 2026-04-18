@@ -143,6 +143,10 @@ from config import (
     SNR_THRESH_DB,
     SIGMOID_SLOPE,
     RT_GAIN_P10_BLEND,
+    ATMO_GASEOUS_DB,
+    RAIN_RATE_MM_H,
+    RAIN_AVAILABILITY_PCT,
+    ATMO_SCINTILLATION_DB,
     # Multi-client topology
     NUM_STATIONARY_CLIENTS,
     NUM_MOVING_CLIENTS,
@@ -166,6 +170,53 @@ from config import (
     # Time-series
     TIMESERIES_BUCKET_S,
 )
+
+
+# =============================================================================
+# Application-layer KPI helpers (ITU-T G.107 / empirical mappings)
+# =============================================================================
+
+def _g107_mos(latency_ms: float, loss_pct: float,
+              codec_ie: float = 0.0, codec_bpl: float = 25.1) -> float:
+    """
+    ITU-T G.107 E-model simplified R-factor → MOS mapping.
+
+    Default codec equipment impairments (I_e, B_pl) correspond to G.711
+    PCM with packet-loss robustness factor B_pl = 25.1.
+
+    Returns MOS clamped to [1.0, 4.5] (G.107 anchors MOS_max ≈ 4.5 for
+    G.711-quality speech).
+    """
+    R_0 = 93.2
+    T   = max(float(latency_ms), 0.0)
+    # Delay impairment I_d (Eq. 7-11a/b of G.107):
+    Id = 0.024 * T
+    if T > 177.3:
+        Id += 0.11 * (T - 177.3)
+    # Equipment impairment under random packet loss:
+    Ppl = max(min(float(loss_pct), 99.9), 0.0)
+    Ie_eff = codec_ie + (95.0 - codec_ie) * Ppl / (Ppl + codec_bpl)
+
+    R = R_0 - Id - Ie_eff
+    if R < 0.0:
+        mos = 1.0
+    elif R > 100.0:
+        mos = 4.5
+    else:
+        mos = 1.0 + 0.035 * R + 7e-6 * R * (R - 60.0) * (100.0 - R)
+    return float(max(1.0, min(mos, 4.5)))
+
+
+def _video_psnr_db(mean_bitrate_kbps: float) -> float:
+    """
+    Empirical H.264 CBR bitrate → PSNR mapping for 480p–720p video.
+
+    PSNR ≈ 10 + 10·log10(bitrate_kbps), saturating at 48 dB for very high
+    bitrates (visual-quality ceiling).
+    """
+    if mean_bitrate_kbps <= 0.0:
+        return 0.0
+    return float(min(10.0 + 10.0 * math.log10(mean_bitrate_kbps), 48.0))
 
 
 # =============================================================================
@@ -204,11 +255,78 @@ def _fspl_db(height_m: float, elev_deg: float,
     return 20.0 * math.log10(4.0 * math.pi * d * fc_hz / 3e8)
 
 
+def _itu_p618_rain_fade_db(elev_deg: float,
+                           freq_hz: float = CARRIER_FREQ_HZ,
+                           rain_rate_mm_h: float = None,
+                           availability_pct: float = None) -> float:
+    """
+    ITU-R P.618-13 §2.2.1 rain attenuation [dB] on a LEO slant path.
+
+    Simplified model for availability ≥ 99%:
+
+      γ_R = k · R^α                                [dB/km, specific attenuation]
+      L_s = (h_R − h_s) / sin(elev)                [km, slant-path length]
+      r   = 1 / (1 + L_s · cos(elev) / L_0)        [horizontal reduction factor]
+      A_0.01 = γ_R · L_s · r                       [dB at 0.01% exceedance]
+      A_p  = A_0.01 · (p/0.01)^(-(0.655 + 0.033·ln(p) − 0.045·ln(A_0.01)))
+
+    where p = (100 − availability_pct). At 2 GHz the (k, α) coefficients
+    (ITU-R P.838-3) are small (k ≈ 2.7e-5, α ≈ 1.22), so S-band rain fade
+    is typically well under 1 dB even at moderate rain rates.
+    """
+    if rain_rate_mm_h is None:
+        rain_rate_mm_h = RAIN_RATE_MM_H
+    if availability_pct is None:
+        availability_pct = RAIN_AVAILABILITY_PCT
+
+    if elev_deg <= 0.0 or rain_rate_mm_h <= 0.0:
+        return 0.0
+
+    f_ghz = freq_hz / 1e9
+    # ITU-R P.838-3 (k, α) coefficients for vertical polarization at 2 GHz.
+    # Log-log interpolation between the 1 GHz and 4 GHz tabulated points.
+    k = 10.0 ** (-4.88 + 1.93 * math.log10(f_ghz))
+    alpha = 0.94 + 0.16 * math.log10(f_ghz)
+    gamma_R = k * (rain_rate_mm_h ** alpha)
+
+    h_R = 3.0    # km, 0°C isotherm height (ITU-R P.839-4 temperate latitude)
+    h_s = 0.03   # km, station height (street level)
+    e_rad = math.radians(max(elev_deg, 5.0))
+    L_s = (h_R - h_s) / math.sin(e_rad)
+
+    L_0 = 35.0 * math.exp(-0.015 * rain_rate_mm_h)
+    r = 1.0 / (1.0 + (L_s * math.cos(e_rad) / L_0))
+
+    A_001 = gamma_R * L_s * r
+
+    p = max(100.0 - availability_pct, 1e-3)
+    if p >= 0.01 and A_001 > 0.0:
+        exp_factor = -(0.655 + 0.033 * math.log(p) - 0.045 * math.log(A_001))
+        A_p = A_001 * (p / 0.01) ** exp_factor
+    else:
+        A_p = A_001
+
+    return float(max(A_p, 0.0))
+
+
+def _itu_p618_scintillation_db(elev_deg: float) -> float:
+    """
+    ITU-R P.618-13 §2.4.1 tropospheric scintillation fade [dB].
+
+    Proportional to 1/sin(elev)^1.2; returns the configured σ at zenith,
+    scaled to the given elevation. Never dominates at S-band but included
+    as a completeness check against ITU-R P.618.
+    """
+    e_rad = math.radians(max(elev_deg, 5.0))
+    return float(ATMO_SCINTILLATION_DB / (math.sin(e_rad) ** 1.2))
+
+
 def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
                         rt_gain_p10_db: float = None,
                         rt_ref_gain_db: float = None,
                         snr_thresh_db: float = None,
-                        sigmoid_slope: float = None) -> float:
+                        sigmoid_slope: float = None,
+                        elev_deg: float = None) -> float:
     """
     Estimate packet error rate using a sigmoid link-budget model
     calibrated by the RT-derived mean path gain.
@@ -273,10 +391,20 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
         urban_correction_db = 0.0
 
     # Full uplink budget:
-    #   SNR = TX_EIRP − FSPL + urban_correction + SAT_RX_GAIN − NOISE_FLOOR
+    #   SNR = TX_EIRP − FSPL − atm_gaseous − rain_fade − scintillation
+    #         + urban_correction + SAT_RX_GAIN − NOISE_FLOOR
     # SAT_RX_ANTENNA_GAIN_DB models the satellite's phased-array receive
     # aperture (34 dBi at 2 GHz for a modern LEO NTN spot beam).
-    snr_db = (PHONE_EIRP_DBM - fspl_db + urban_correction_db
+    # Atmospheric terms (ITU-R P.618/P.676) are applied only when elev_deg
+    # is provided, to preserve backward compatibility with callers that
+    # cannot supply geometry (e.g. per-flow plot helpers).
+    atm_loss_db = 0.0
+    if elev_deg is not None:
+        atm_loss_db = (ATMO_GASEOUS_DB
+                       + _itu_p618_rain_fade_db(elev_deg)
+                       + _itu_p618_scintillation_db(elev_deg))
+
+    snr_db = (PHONE_EIRP_DBM - fspl_db - atm_loss_db + urban_correction_db
               + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM)
     per    = 1.0 / (1.0 + math.exp(sigmoid_slope * (snr_db - snr_thresh_db)))
     return float(np.clip(per, 0.0, 0.99))
@@ -392,8 +520,13 @@ def _compute_handover_schedule(channel_stats: list,
                                     stat.get("normalized_gain_db", float("nan")),
                                     stat.get("normalized_p10_db"),
                                     ref_gain_db,
-                                    snr_thresh_db, sigmoid_slope)
+                                    snr_thresh_db, sigmoid_slope,
+                                    elev_deg=max(elev_deg, 1.0))
         delay  = _one_way_delay_ms(SAT_HEIGHT_M, max(elev_deg, 1.0))
+
+        # Capture atmospheric / rain / scintillation components for reporting
+        rain_db  = _itu_p618_rain_fade_db(max(elev_deg, 1.0))
+        scint_db = _itu_p618_scintillation_db(max(elev_deg, 1.0))
 
         # Beam interruption gap: zero for the first slot (no incoming HO),
         # random draw for subsequent slots per 3GPP TS 38.300 §10.1.2.3.
@@ -411,6 +544,9 @@ def _compute_handover_schedule(channel_stats: list,
             per            = round(per, 4),
             delay_ms       = round(delay, 2),
             interruption_ms = round(gap_ms, 1),
+            rain_fade_db   = round(rain_db, 3),
+            scint_db       = round(scint_db, 3),
+            atm_gaseous_db = round(ATMO_GASEOUS_DB, 2),
         ))
 
     return schedule
@@ -735,8 +871,12 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     print(f"  Handover schedule (EIRP={PHONE_EIRP_DBM:.0f} dBm): {len(schedule)} slot(s)")
     for slot in schedule:
         gap_str = f"  gap={slot['interruption_ms']:.0f}ms" if slot["interruption_ms"] > 0 else ""
+        atm_total = (slot.get("atm_gaseous_db", 0.0)
+                     + slot.get("rain_fade_db", 0.0)
+                     + slot.get("scint_db", 0.0))
         print(f"    sat{slot['sat_id']}  {slot['t_start']:.1f}s–{slot['t_end']:.1f}s  "
               f"elev={slot['elev_deg']:.1f}°  delay={slot['delay_ms']:.1f} ms  "
+              f"atm={atm_total:.2f}dB  "
               f"PER={slot['per']:.3f}{gap_str}")
 
     # Weighted-mean service-link delay (P2P channel delay is immutable)
@@ -1224,6 +1364,145 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
             throughput_kbps = round(rx_bytes * 8.0 / active_s / 1e3, 2),
             fairness_index  = round(fairness, 4),
         )
+
+    # ── Protocol overhead (L3/L4 header bytes vs payload bytes) ───────────────
+    # FlowMonitor's rxBytes is the IP-payload byte count (UDP or TCP).
+    # The L3/L4 wire overhead per packet is:
+    #   UDP:  20 (IPv4) + 8  (UDP) = 28 bytes / packet
+    #   TCP:  20 (IPv4) + 20 (TCP) = 40 bytes / packet (no options)
+    UDP_HEADER_BYTES = 28
+    TCP_HEADER_BYTES = 40
+    overhead_hdr_bytes  = UDP_HEADER_BYTES if ns3_proto != "tcp" else TCP_HEADER_BYTES
+    total_hdr_bytes     = total_rx * overhead_hdr_bytes
+    total_wire_bytes    = rx_bytes + total_hdr_bytes
+    protocol_overhead_pct = (100.0 * total_hdr_bytes / total_wire_bytes
+                              if total_wire_bytes > 0 else 0.0)
+    result["protocol_overhead_pct"] = round(protocol_overhead_pct, 2)
+
+    # ── Cwnd dynamics proxy (RFC 5681 BDP-derived) ────────────────────────────
+    # Direct NS-3 cwnd tracing requires per-socket callbacks that are brittle
+    # across cppyy versions.  Instead we derive an effective in-flight window
+    # from the per-second throughput time-series using Little's law:
+    #   cwnd_eff_bytes = throughput_bps × RTT_s
+    # This is exact for a link that is neither queue- nor loss-limited (BDP).
+    # Under loss or RTO events the time-series already captures the dip, so
+    # the proxy cwnd trace faithfully reflects TCP recovery dynamics.
+    mean_rtt_s_ts = max((result.get("mean_delay_ms", weighted_delay_ms) * 2.0) / 1e3,
+                        1e-3)
+    cwnd_eff_bytes = [
+        int(kbps * 1e3 * mean_rtt_s_ts / 8.0)
+        for kbps in ts_throughput_kbps
+    ]
+    result["timeseries"]["cwnd_eff_bytes"] = cwnd_eff_bytes
+    result["timeseries"]["rtt_s"]          = round(mean_rtt_s_ts, 4)
+
+    # ── Application-layer derived KPIs ────────────────────────────────────────
+    # Rebuffering ratio: fraction of simulation seconds where aggregate
+    # streaming throughput fell below 80% of the required target (sum of
+    # all streaming clients' CBR bitrate).  Computed from the per-second
+    # time-series already collected at TIMESERIES_BUCKET_S resolution.
+    from config import TRAFFIC_PROFILE_COUNTS as _TPC
+    streaming_clients = _TPC.get("streaming", 0)
+    streaming_profile = TRAFFIC_PROFILES.get("streaming", {})
+    streaming_bitrate_str = streaming_profile.get("data_rate", "0kbps")
+
+    def _parse_bitrate_kbps(spec):
+        if not spec:
+            return 0.0
+        s = str(spec).strip().lower()
+        try:
+            if s.endswith("gbps"): return float(s[:-4]) * 1e6
+            if s.endswith("mbps"): return float(s[:-4]) * 1e3
+            if s.endswith("kbps"): return float(s[:-4])
+            if s.endswith("bps"):  return float(s[:-3]) / 1e3
+        except ValueError:
+            pass
+        return 0.0
+
+    streaming_per_client_kbps = _parse_bitrate_kbps(streaming_bitrate_str)
+    streaming_target_kbps = streaming_per_client_kbps * streaming_clients
+
+    rebuffer_threshold_kbps = 0.8 * streaming_target_kbps
+    rebuffer_seconds = 0
+    observed_seconds = 0
+    for tt, kbps in zip(ts_t_list, ts_throughput_kbps):
+        if tt < 2.0:   # skip warm-up probe (app starts at t=1s)
+            continue
+        observed_seconds += 1
+        if streaming_target_kbps > 0.0 and kbps < rebuffer_threshold_kbps:
+            rebuffer_seconds += 1
+    rebuffer_ratio = (rebuffer_seconds / observed_seconds
+                      if observed_seconds > 0 else 0.0)
+
+    # Video PSNR (streaming profile RX throughput → empirical PSNR map)
+    stream_rx_bytes = result["profile_stats"]["streaming"]["rx_bytes"]
+    stream_bitrate_kbps = stream_rx_bytes * 8.0 / active_s / 1e3
+    per_client_stream_kbps = (stream_bitrate_kbps / streaming_clients
+                               if streaming_clients > 0 else 0.0)
+    stream_psnr_db = _video_psnr_db(per_client_stream_kbps)
+
+    # Gaming threshold pass/fail (E2E latency < 50 ms AND loss < 1%)
+    gaming_stats  = result["profile_stats"].get("gaming", {})
+    gaming_rx     = gaming_stats.get("rx", 0)
+    gaming_tx     = gaming_stats.get("tx", 0)
+    gaming_delay  = gaming_stats.get("delay_sum", 0.0)
+    gaming_latency_ms = (gaming_delay / gaming_rx * 1e3
+                         if gaming_rx > 0 else float("inf"))
+    gaming_loss_pct   = (100.0 * (1 - gaming_rx / max(gaming_tx, 1))
+                         if gaming_tx > 0 else 100.0)
+    gaming_pass = (gaming_latency_ms < 50.0 and gaming_loss_pct < 1.0)
+
+    # VoIP MOS (ITU-T G.107 E-model)
+    voice_stats   = result["profile_stats"].get("voice", {})
+    voice_rx      = voice_stats.get("rx", 0)
+    voice_tx      = voice_stats.get("tx", 0)
+    voice_delay   = voice_stats.get("delay_sum", 0.0)
+    voice_latency_ms = (voice_delay / voice_rx * 1e3
+                        if voice_rx > 0 else 0.0)
+    voice_loss_pct   = (100.0 * (1 - voice_rx / max(voice_tx, 1))
+                        if voice_tx > 0 else 0.0)
+    voice_mos = _g107_mos(voice_latency_ms, voice_loss_pct)
+
+    result.update(
+        rebuffer_ratio_pct   = round(100.0 * rebuffer_ratio, 2),
+        rebuffer_seconds     = rebuffer_seconds,
+        stream_psnr_db       = round(stream_psnr_db, 2),
+        gaming_latency_ms    = round(gaming_latency_ms, 2)
+                                if math.isfinite(gaming_latency_ms) else None,
+        gaming_loss_pct      = round(gaming_loss_pct, 2),
+        gaming_pass          = bool(gaming_pass),
+        voice_mos            = round(voice_mos, 3),
+        voice_latency_ms     = round(voice_latency_ms, 2),
+        voice_loss_pct       = round(voice_loss_pct, 2),
+    )
+
+    # ── Handover success rate (3GPP TS 38.300 §10.1.2.3) ──────────────────────
+    # A handover is deemed successful when data transfer resumes after the
+    # scheduled blackout window — i.e., at least one per-second probe shows
+    # non-zero throughput within HANDOVER_RECOVERY_WINDOW_S of the gap end.
+    # A probe returning 0 kbps in every subsequent second indicates the UE
+    # failed to reattach to the target beam within the recovery budget.
+    ho_success = 0
+    ho_total   = 0
+    HANDOVER_RECOVERY_WINDOW_S = HANDOVER_INTERRUPTION_MS_MAX / 1000.0 + 1.0
+    ts_t   = timeseries["t_s"]
+    ts_bps = timeseries["throughput_kbps"]
+    for (t_blk_start, t_blk_end) in handover_times:
+        ho_total += 1
+        recovered = False
+        for tt, kbps in zip(ts_t, ts_bps):
+            if t_blk_end <= tt <= t_blk_end + HANDOVER_RECOVERY_WINDOW_S:
+                if kbps > 0.0:
+                    recovered = True
+                    break
+        if recovered:
+            ho_success += 1
+
+    result["handover_events"]       = ho_total
+    result["handover_successes"]    = ho_success
+    result["handover_success_rate"] = (
+        round(ho_success / ho_total, 4) if ho_total > 0 else 1.0
+    )
 
     ns.Simulator.Destroy()
 

@@ -457,3 +457,63 @@ def draw_profile_breakdown(ns3_results: list,
     print(f"[ProfileBreakdown]  Saved -> {out}")
     plt.close()
     return out
+
+
+# =============================================================================
+# Congestion-window dynamics (RFC 5681 recovery trace)
+# =============================================================================
+
+def draw_cwnd_dynamics(ns3_results: list,
+                        out: str = "output/ntn_cwnd_dynamics.png") -> str:
+    """
+    Per-protocol effective in-flight window trace derived from the per-second
+    throughput time-series via Little's law (cwnd_eff = throughput × RTT).
+
+    Visualises congestion-window recovery after each handover blackout,
+    providing a model-independent view of RFC 5681 / BBR behaviour without
+    hooking into NS-3 internals.
+    """
+    if not ns3_results:
+        print("[Cwnd]  No results — skipping.")
+        return out
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    fig.patch.set_facecolor("#f8f9fa")
+    ax.set_facecolor("#f8f9fa")
+
+    any_trace = False
+    for idx, r in enumerate(ns3_results):
+        ts = r.get("timeseries", {})
+        t_s = ts.get("t_s", [])
+        cwnd_bytes = ts.get("cwnd_eff_bytes", [])
+        if not t_s or not cwnd_bytes:
+            continue
+        any_trace = True
+        label = r["label"]
+        color = PROTO_COLORS.get(label, _FALLBACK_COLORS[idx % len(_FALLBACK_COLORS)])
+        cwnd_kb = [b / 1024.0 for b in cwnd_bytes]
+        ax.plot(t_s, cwnd_kb, color=color, lw=1.6, label=label, alpha=0.9)
+
+        # Overlay handover blackouts as shaded regions
+        for (t0, t1) in ts.get("handover_times", []):
+            ax.axvspan(t0, t1, color="#666", alpha=0.08)
+
+    if not any_trace:
+        print("[Cwnd]  timeseries missing cwnd_eff_bytes — skipping.")
+        plt.close()
+        return out
+
+    ax.set_xlabel("Simulation time [s]", fontsize=10)
+    ax.set_ylabel("Effective in-flight window [kB]  (throughput × RTT)", fontsize=10)
+    ax.set_title(
+        "Congestion-Window Dynamics (RFC 5681 proxy) — shaded = handover blackout",
+        fontsize=10,
+    )
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=9, loc="upper right")
+
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"[Cwnd]  Saved -> {out}")
+    plt.close()
+    return out
