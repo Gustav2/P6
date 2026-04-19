@@ -31,20 +31,6 @@ per traced path.
 - 5 is a good trade-off for urban canyons.
 """
 
-RT_SAMPLES_PER_TX = 10 ** 6
-"""
-Number of rays launched per transmitter for the radio map solver.
-- More samples reduce noise in the coverage map but increase runtime.
-- 1 million is the Sionna RT documentation default.
-"""
-
-RT_CELL_SIZE = [1, 1]
-"""
-Radio map grid cell size [m, m] (x, y).
-- Finer cells (e.g. [0.5, 0.5]) give higher-resolution coverage maps
-  but increase memory usage proportionally to 1/cell_area.
-"""
-
 RT_UE_POSITION = [50.0, 80.0, 1.5]
 """
 Representative default UE (phone) position [x, y, z] in metres within
@@ -113,28 +99,3 @@ Proxy satellite transmitter power [dBm] used in Sionna RT scenes.
 Source: [3GPP-38.821] §6.1, Table 6.1.1-1 (LEO sat downlink EIRP range).
 """
 
-RT_CAM_POSITION = [-170, -170, 140]
-"""Camera position [x, y, z] in metres for scene renders."""
-
-RT_CAM_LOOK_AT = [50, 50, 0]
-"""Look-at target [x, y, z] in metres for scene renders."""
-
-RT_RENDER_PATHS = True
-"""
-Render per-satellite path visualisation images during ray tracing.
-
-Set to False to skip all render_to_file calls inside _trace_satellite
-(one per satellite × num_samples rays each).  On LLVM JIT these renders
-are typically the slowest part of the RT stage — disabling them gives a
-significant speedup at the cost of not producing ntn_rt_paths_sat<N>.png.
-The radiomap render (ntn_rt_radiomap.png) is always produced regardless.
-"""
-
-RT_RENDER_NUM_SAMPLES = 64
-"""
-Path-tracing samples per pixel for RT scene renders.
-
-Lower values produce noisier images but render faster.
-64 gives visually acceptable quality and is 4× faster than the
-reference value of 256.  Applies to both path renders and the radiomap.
-"""

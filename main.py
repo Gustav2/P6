@@ -40,8 +40,6 @@ All PNG output files are written to the output/ subdirectory.
   output/ntn_handover_impact.png        — Per-slot throughput bars
   output/ntn_protocol_radar.png         — 5-axis radar chart
   output/ntn_results.png                — 3-panel combined results summary
-  output/ntn_rt_paths_sat<N>.png        — Ray traced paths per satellite
-  output/ntn_rt_radiomap.png            — Composite radio map
 """
 
 import hashlib
@@ -444,8 +442,6 @@ def main() -> None:
     print("    output/ntn_profile_breakdown.png      — throughput/loss by traffic profile")
     print("    output/ntn_channel_validation.png     — FSPL / Rician K / delay spread vs 3GPP")
     print("    output/ntn_timing.png                 — stage-by-stage runtime breakdown")
-    print("    output/ntn_rt_paths_sat<N>.png        — RT paths per satellite")
-    print("    output/ntn_rt_radiomap.png            — composite radio map")
     print("=" * 70)
 
     print()

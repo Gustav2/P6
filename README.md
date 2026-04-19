@@ -69,8 +69,6 @@ All figures are written to `output/`.
 | `ntn_profile_breakdown.png` | Throughput / loss by traffic profile |
 | `ntn_channel_validation.png` | FSPL, Rician K-factor, delay spread vs 3GPP TR 38.811 |
 | `ntn_timing.png` | Wall-clock runtime per pipeline stage |
-| `ntn_rt_paths_sat*.png` | Sionna RT ray paths per satellite |
-| `ntn_rt_radiomap.png` | Composite radio coverage map |
 
 ## Configuration
 
@@ -87,7 +85,6 @@ Key knobs:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `RT_RENDER_PATHS` | `True` | Set `False` to skip per-satellite renders and save time |
 | `RT_MAX_DEPTH` | `5` | Max ray reflections per path |
 | `SIM_DURATION_S` | `60.0` | NS-3 simulation duration [s] |
 | `NUM_PEDESTRIAN_MOVING_CLIENTS` | `10` | Pedestrian moving clients |

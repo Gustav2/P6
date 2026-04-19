@@ -22,11 +22,6 @@ and per-satellite channel statistics are returned.
 Multiple representative receivers are sampled in the scene:
   - UEs at RT_UE_SAMPLE_POSITIONS  — service link (sat → UE)
 
-Outputs
--------
-  output/ntn_rt_paths_sat<N>.png   — scene render with paths for satellite N
-  output/ntn_rt_radiomap.png       — composite radio map (all satellites)
-
 Returns
 -------
   channel_stats : list[dict]
@@ -68,7 +63,6 @@ from sionna.rt import (
     Receiver,
     Camera,
     PathSolver,
-    RadioMapSolver,
 )
 from sionna.rt.antenna_pattern import (
     PolarizedAntennaPattern,
@@ -251,16 +245,10 @@ from config import (
     RT_SCENE_NAME,
     RT_SCENE_FREQ_HZ,
     RT_MAX_DEPTH,
-    RT_SAMPLES_PER_TX,
-    RT_CELL_SIZE,
     RT_UE_POSITION,
     RT_UE_SAMPLE_POSITIONS,
     RT_SAT_SCENE_HEIGHT_M,
     RT_SAT_INITIAL_ZENITH_DEG,
-    RT_CAM_POSITION,
-    RT_CAM_LOOK_AT,
-    RT_RENDER_PATHS,
-    RT_RENDER_NUM_SAMPLES,
     NUM_SATELLITES,
     SAT_SPACING_DEG,
     SAT_HANDOVER_ELEVATION_DEG,
@@ -635,18 +623,12 @@ def _load_scene_with_ues(ue_positions: list) -> tuple:
     return scene, receivers
 
 
-def _make_camera() -> Camera:
-    """Overhead camera for scene renders."""
-    return Camera(position=RT_CAM_POSITION, look_at=RT_CAM_LOOK_AT)
-
-
 # =============================================================================
 # Per-satellite ray tracing
 # =============================================================================
 
 def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
-                     ue_positions: list,
-                     render_paths: bool = False) -> tuple:
+                     ue_positions: list) -> tuple:
     """
     Add the satellite proxy transmitter to the shared scene, run ONE
     PathSolver call that covers all UE receivers simultaneously, then
@@ -697,24 +679,6 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
         seed                = 42 + sat_id,
     )
 
-    # Render paths image using receiver 0 (primary UE).
-    # Controlled by RT_RENDER_PATHS; set False in config to skip and save time.
-    if render_paths and RT_RENDER_PATHS:
-        cam      = _make_camera()
-        out_file = f"output/ntn_rt_paths_sat{sat_id}.png"
-        try:
-            scene.render_to_file(
-                camera      = cam,
-                filename    = out_file,
-                paths       = paths,
-                clip_at     = RT_SAT_SCENE_HEIGHT_M + 50,
-                resolution  = (1280, 720),
-                num_samples = RT_RENDER_NUM_SAMPLES,
-            )
-            print(f"    [Render] {out_file}")
-        except Exception as e:
-            print(f"    [Render] Skipped {out_file}: {e}")
-
     # Extract per-UE stats by slicing the rx_idx dimension of the Paths tensors.
     # Pass ue_pos so that _extract_channel_stats can normalise the raw RT gain
     # by the proxy FSPL from that specific UE location.
@@ -731,40 +695,6 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
 
 
 # =============================================================================
-# Radio map
-# =============================================================================
-
-def _compute_and_save_radiomap(scene) -> None:
-    """
-    Compute a 2-D path-gain radio map with all satellite transmitters
-    added simultaneously, then save the render.  This gives a composite
-    view of coverage from the whole constellation snapshot.
-    """
-    print("\n  Computing composite radio map ...")
-    solver = RadioMapSolver()
-    try:
-        rm = solver(
-            scene         = scene,
-            max_depth     = RT_MAX_DEPTH,
-            cell_size     = RT_CELL_SIZE,
-            samples_per_tx = RT_SAMPLES_PER_TX,
-        )
-        cam = _make_camera()
-        scene.render_to_file(
-            camera   = cam,
-            filename = "output/ntn_rt_radiomap.png",
-            radio_map = rm,
-            rm_metric  = "path_gain",
-            rm_db_scale = True,
-            resolution  = (1280, 720),
-            num_samples = RT_RENDER_NUM_SAMPLES,
-        )
-        print("  [Render] output/ntn_rt_radiomap.png")
-    except Exception as e:
-        print(f"  [RadioMap] Skipped: {e}")
-
-
-# =============================================================================
 # Public entry point
 # =============================================================================
 
@@ -777,8 +707,6 @@ def run_ray_tracing() -> list:
        a. Compute its proxy position and elevation angle to the UE.
        b. Run PathSolver (LoS + specular reflections + refractions).
        c. Extract service-link channel statistics across sampled UEs.
-       d. Save a scene render with paths overlaid.
-    3. Compute and save a composite radio map.
 
     Parameters
     ----------
@@ -837,7 +765,6 @@ def run_ray_tracing() -> list:
             sat_id,
             sat_pos,
             ue_samples,
-            render_paths=True,   # always render from primary UE (rx0)
         )
 
         stats = _aggregate_sample_stats(sample_stats, sat_id, sat_pos)
@@ -851,23 +778,6 @@ def run_ray_tracing() -> list:
               f"p10={stats.get('mean_path_gain_p10_db', stats['mean_path_gain_db']):.1f} dB  "
               f"ds={stats['delay_spread_ns']:.1f} ns  "
               f"K={k_str}")
-
-    # ── Composite radio map: add all visible sats back simultaneously ─────────
-    visible_sats = [
-        (s["sat_id"], sat_positions[s["sat_id"]])
-        for s in all_stats
-        if s["elevation_deg"] >= SAT_HANDOVER_ELEVATION_DEG
-    ]
-    for sat_id, sat_pos in visible_sats:
-        tx = Transmitter(
-            name      = f"sat{sat_id}",
-            position  = sat_pos,
-            look_at   = RT_UE_POSITION,
-            power_dbm = RT_TX_POWER_DBM,
-        )
-        scene.add(tx)
-
-    _compute_and_save_radiomap(scene)
 
     print(f"\n  Ray tracing complete.  {len(all_stats)} satellite snapshots computed.\n")
     return all_stats
