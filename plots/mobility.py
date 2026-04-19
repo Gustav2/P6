@@ -19,6 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
+import matplotlib.lines as mlines
 
 from config import SIM_DURATION_S
 
@@ -142,6 +143,17 @@ def render_mobility_video(position_trace: dict,
     fig.patch.set_facecolor("#f8f9fa")
     ext = [-half_extent_m, half_extent_m, -half_extent_m, half_extent_m]
 
+    # Handover flash: for 0.5 s after each handover the satellite star pulses
+    # (larger, gold) so the event is visually obvious even without reading HUD.
+    _FLASH_S = 0.5
+    _ho_starts = sorted(s["t_start"] for s in handover_schedule
+                        if s.get("interruption_ms", 0) > 0)
+
+    # Legend proxy for the service-area circle (circle patches don't auto-appear
+    # in the legend, so we add a dashed-line proxy handle each frame).
+    _circle_proxy = mlines.Line2D([], [], color="#555", linestyle="--",
+                                   linewidth=0.9, label="service area (500 m)")
+
     print(f"[Mobility]  Rendering {n_frames} frames at {fps} fps -> {out}")
     log_every = max(1, n_frames // 10)
 
@@ -191,8 +203,15 @@ def render_mobility_video(position_trace: dict,
                          min(half_extent_m * 0.95, sx_m / 1000.0))
         sy_clamped = max(-half_extent_m * 0.95,
                          min(half_extent_m * 0.95, sy_m / 1000.0))
-        ax.scatter([sx_clamped], [sy_clamped], marker="*", s=250,
-                   color="#d62728", edgecolors="white", linewidths=1.2,
+        # Flash gold for 0.5 s after each handover so the event is obvious.
+        time_since_ho = min((t_s[f] - ts for ts in _ho_starts if ts <= t_s[f]),
+                            default=float("inf"))
+        is_flash = time_since_ho < _FLASH_S
+        ax.scatter([sx_clamped], [sy_clamped], marker="*",
+                   s=500 if is_flash else 250,
+                   color="#ffa500" if is_flash else "#d62728",
+                   edgecolors="white",
+                   linewidths=2.0 if is_flash else 1.2,
                    zorder=6, label="serving satellite")
 
         # HUD — sat_id and elev already set by the satellite marker block above
@@ -214,8 +233,12 @@ def render_mobility_video(position_trace: dict,
         ax.set_aspect("equal", adjustable="box")
         ax.set_title("NTN Client Mobility — Munich Scene", fontsize=12, weight="bold")
 
-        ax.legend(loc="lower right", fontsize=9, framealpha=0.92,
-                  edgecolor="#888", title="UE type", title_fontsize=8)
+        handles, labels = ax.get_legend_handles_labels()
+        handles.append(_circle_proxy)
+        labels.append("service area (500 m)")
+        ax.legend(handles=handles, labels=labels,
+                  loc="lower right", fontsize=9, framealpha=0.92,
+                  edgecolor="#888", title="Legend", title_fontsize=8)
 
         # Draw to canvas and extract RGB array for the writer.
         # matplotlib ≥ 3.8 removed tostring_rgb(); use buffer_rgba() + drop alpha.
