@@ -205,10 +205,8 @@ def render_mobility_video(position_trace: dict,
         ax.set_aspect("equal", adjustable="box")
         ax.set_title("NTN Client Mobility — Munich Scene", fontsize=12, weight="bold")
 
-        # Only show the legend on the first frame; thereafter rely on
-        # viewer memory (keeps the legend artist out of per-frame redraws).
-        if f == 0:
-            ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+        ax.legend(loc="lower right", fontsize=9, framealpha=0.92,
+                  edgecolor="#888", title="UE type", title_fontsize=8)
 
         # Draw to canvas and extract RGB array for the writer.
         # matplotlib ≥ 3.8 removed tostring_rgb(); use buffer_rgba() + drop alpha.
