@@ -405,7 +405,8 @@ def main() -> None:
         with open("output/.position_trace.pkl", "wb") as _f:
             pickle.dump({
                 "position_trace": trace_source["position_trace"],
-                "schedule": trace_source.get("schedule", []),
+                "schedule":       trace_source.get("schedule", []),
+                "channel_stats":  channel_stats,
             }, _f)
         render_mobility_video(
             position_trace    = trace_source["position_trace"],

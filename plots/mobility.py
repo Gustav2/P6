@@ -89,9 +89,17 @@ def render_mobility_video(position_trace: dict,
 
     t_s      = position_trace["t_s"]
     phones   = position_trace["phones"]       # list of [(x,y,z), ...] per frame
-    sat_xyz  = position_trace["satellite"]    # list of (x,y,z) per frame
+    sat_xyz  = position_trace["satellite"]    # list of (x,y,z) per frame — fallback
     n_stat   = position_trace.get("num_stationary", 30)
     n_ped    = position_trace.get("num_pedestrian", 10)
+
+    # Lookup table: sat_id → (x_m, y_m) from channel stats.
+    # Used to snap the satellite marker to the *serving* satellite's position
+    # (which changes at each handover) rather than following the single NS-3
+    # proxy node's continuous trajectory.
+    _sat_pos_lookup = {s["sat_id"]: (s["sat_x_m"], s["sat_y_m"])
+                       for s in channel_stats
+                       if "sat_x_m" in s and "sat_y_m" in s}
 
     n_frames = len(t_s)
     if n_frames == 0:
@@ -172,21 +180,24 @@ def render_mobility_video(position_trace: dict,
         xs, ys = _xy(f, veh_idx)
         ax.scatter(xs, ys, zorder=5, **_VEHICULAR_STYLE)
 
-        # Satellite ground-projection indicator (arrow from ground-projection
-        # of current sat onto scene).  The satellite x moves ~7.6 km per
-        # sim-second, so over 60 s it traverses ~450 km — off any reasonable
-        # 2D plot.  Clamp to the edge and annotate direction.
-        sx, sy, sz = sat_xyz[f]
+        # Satellite ground-projection indicator.
+        # Use the *serving* satellite's position from channel_stats so the
+        # marker jumps to the correct satellite at each handover, rather than
+        # following the single NS-3 proxy node's continuous trajectory.
+        sat_id, elev = _serving_sat_at(t_s[f], handover_schedule)
+        if sat_id in _sat_pos_lookup:
+            sx_m, sy_m = _sat_pos_lookup[sat_id]
+        else:
+            sx_m, sy_m, _ = sat_xyz[f]    # fallback: NS-3 node position
         sx_clamped = max(-half_extent_m * 0.95,
-                         min(half_extent_m * 0.95, sx / 1000.0))
+                         min(half_extent_m * 0.95, sx_m / 1000.0))
         sy_clamped = max(-half_extent_m * 0.95,
-                         min(half_extent_m * 0.95, sy / 1000.0))
+                         min(half_extent_m * 0.95, sy_m / 1000.0))
         ax.scatter([sx_clamped], [sy_clamped], marker="*", s=250,
                    color="#d62728", edgecolors="white", linewidths=1.2,
-                   zorder=6, label="satellite (×1000 km)")
+                   zorder=6, label="serving satellite")
 
-        # HUD
-        sat_id, elev = _serving_sat_at(t_s[f], handover_schedule)
+        # HUD — sat_id and elev already set by the satellite marker block above
         ho_count = sum(1 for s in handover_schedule if s["t_start"] <= t_s[f]
                        and s.get("interruption_ms", 0) > 0)
         hud = (f"t = {t_s[f]:5.1f} s    "
