@@ -110,7 +110,7 @@ from config import (
     SIM_SCENARIO,
 )
 from sim.phy           import run_sionna_ber
-from sim.ray_tracing   import run_ray_tracing, render_scene_background
+from sim.ray_tracing   import run_ray_tracing, render_scene_background, build_walkable_points
 from sim.ns3           import run_ns3_both_topologies
 from plots import (
     draw_ber_bler,
@@ -297,6 +297,12 @@ def main() -> None:
     # scene-load cost.  No-op when the cache file already exists.
     render_scene_background(out="output/.mobility_scene_bg.png",
                             half_extent_m=600.0)
+    # Walkable-point grid — ground-level cells with no building above.
+    # Built here (inside the RT/Mitsuba session) and cached to a pickle so
+    # the NS-3 mobility stage can place phones on streets rather than
+    # through walls.  No-op when the cache file already exists.
+    build_walkable_points(half_extent_m=500.0, spacing_m=5.0,
+                          cache_path="output/.walkable_points.pkl")
     timing["RT (Sionna RT)"] = time.perf_counter() - t0
 
     print(f"\n  Channel stats ({len(channel_stats)} satellites):")
@@ -396,6 +402,8 @@ def main() -> None:
     trace_source = next((r for r in direct_results
                          if r.get("position_trace")), None)
     if trace_source is not None:
+        with open("output/.position_trace.pkl", "wb") as _f:
+            pickle.dump(trace_source["position_trace"], _f)
         render_mobility_video(
             position_trace    = trace_source["position_trace"],
             channel_stats     = channel_stats,

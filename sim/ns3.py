@@ -922,15 +922,137 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     p2p = ns.PointToPointHelper()
 
     # ── Client positions ──────────────────────────────────────────────────────
-    # Phones are placed in a circle of CLIENT_AREA_RADIUS_M.
-    # Stationary: ConstantPosition.  Moving: RandomWaypoint.
+    # Phones are placed on ground-level cells of the Munich scene (streets,
+    # squares, courtyards) — never on top of buildings.  The walkable cells
+    # are precomputed by build_walkable_points() during the RT stage and
+    # loaded here from a pickle.  Stationary phones sit on a random walkable
+    # cell; moving phones walk a RandomWaypoint path through a LOCAL subset
+    # of walkable cells to reduce the chance of straight-line segments
+    # cutting through buildings.
     _rng = _random_mod.Random(42)
+
+    _walkable_pts = []
+    _walkable_path = "output/.walkable_points.pkl"
+    if os.path.exists(_walkable_path):
+        import pickle as _pickle
+        with open(_walkable_path, "rb") as _f:
+            _walkable_pts = _pickle.load(_f)
+    if not _walkable_pts:
+        print(f"[NS-3]  WARNING: no walkable points at {_walkable_path} — "
+              f"falling back to open-area circle placement.")
+
+    _walkable_arr = (np.asarray([(p[0], p[1]) for p in _walkable_pts],
+                                 dtype=float)
+                     if _walkable_pts else None)
+
+    # Fast lookup: bucket walkable cells on the 5-m sampling grid so that
+    # line-segment validation can be a single set membership check per sample.
+    _WALK_GRID_SPACING = 5.0
+    _walkable_grid = set()
+    if _walkable_arr is not None:
+        for _wx, _wy in _walkable_arr:
+            _walkable_grid.add((int(round(_wx / _WALK_GRID_SPACING)),
+                                 int(round(_wy / _WALK_GRID_SPACING))))
+
+    def _is_walkable(x: float, y: float) -> bool:
+        """Nearest-grid-cell test against the precomputed walkable set."""
+        if not _walkable_grid:
+            return True
+        key = (int(round(x / _WALK_GRID_SPACING)),
+               int(round(y / _WALK_GRID_SPACING)))
+        return key in _walkable_grid
+
+    def _segment_on_walkable(x0: float, y0: float,
+                              x1: float, y1: float,
+                              step: float = 2.0) -> bool:
+        """Return True iff the straight segment from (x0,y0) to (x1,y1)
+        passes only through walkable cells (sampled every `step` m)."""
+        dx = x1 - x0
+        dy = y1 - y0
+        length = _math.hypot(dx, dy)
+        n = max(1, int(length / step))
+        for k in range(1, n + 1):
+            a = k / n
+            if not _is_walkable(x0 + a * dx, y0 + a * dy):
+                return False
+        return True
 
     def _random_pos_in_circle(radius, z=1.5):
         """Uniform random (x,y) within a circle of given radius, height z."""
         angle  = _rng.uniform(0, 2 * _math.pi)
         r      = radius * _math.sqrt(_rng.uniform(0, 1))
         return r * _math.cos(angle), r * _math.sin(angle), z
+
+    def _random_walkable_pos(radius: float, z: float = 1.5):
+        """
+        Random ground-level cell within `radius` of the scene origin.
+        Falls back to _random_pos_in_circle when no walkable grid is loaded.
+        """
+        if _walkable_arr is None:
+            return _random_pos_in_circle(radius, z)
+        r2 = _walkable_arr[:, 0] ** 2 + _walkable_arr[:, 1] ** 2
+        mask = r2 <= radius * radius
+        idx = np.where(mask)[0]
+        if len(idx) == 0:
+            return _random_pos_in_circle(radius, z)
+        i = idx[_rng.randrange(len(idx))]
+        return float(_walkable_arr[i, 0]), float(_walkable_arr[i, 1]), z
+
+    def _local_walkable_subset(cx: float, cy: float,
+                                local_r: float, max_pts: int = 32) -> list:
+        """
+        Return a chained sequence of walkable (x,y) waypoints within
+        `local_r` of (cx, cy).  The RandomWaypointMobilityModel cycles
+        through a ListPositionAllocator, so each consecutive pair of
+        waypoints forms a straight-line segment.  To avoid segments that
+        clip buildings, waypoints are built as a greedy chain: each new
+        waypoint is selected so that the line from the *previous* chosen
+        waypoint stays on walkable cells.  The chain also closes back to
+        the first waypoint (which is the allocator's cycle boundary).
+        """
+        if _walkable_arr is None:
+            return []
+        dx = _walkable_arr[:, 0] - cx
+        dy = _walkable_arr[:, 1] - cy
+        d2 = dx * dx + dy * dy
+
+        r = local_r
+        for _attempt in range(5):
+            mask = d2 <= r * r
+            idx = np.where(mask)[0]
+            if len(idx) >= 8:
+                break
+            r *= 1.5
+        if len(idx) == 0:
+            return []
+
+        cand = [(float(_walkable_arr[i, 0]), float(_walkable_arr[i, 1]))
+                for i in idx]
+        _rng.shuffle(cand)
+
+        chain = []
+        prev_x, prev_y = cx, cy
+        for (wx, wy) in cand:
+            if len(chain) >= max_pts:
+                break
+            if _segment_on_walkable(prev_x, prev_y, wx, wy):
+                chain.append((wx, wy))
+                prev_x, prev_y = wx, wy
+
+        if len(chain) >= 2:
+            # Ensure the cycle-close segment (last → first) is also clean
+            # by rotating the chain until the close-back is walkable; if
+            # no rotation works, drop the final waypoint.
+            for _ in range(len(chain)):
+                cx0, cy0 = chain[0]
+                cxN, cyN = chain[-1]
+                if _segment_on_walkable(cxN, cyN, cx0, cy0):
+                    break
+                chain.append(chain.pop(0))
+            else:
+                chain.pop()
+
+        return chain
 
     # Each NS-3 Node may hold only ONE MobilityModel in its aggregation.
     # Object::DoGetObject returns the FIRST aggregated object whose TypeId
@@ -964,33 +1086,48 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     static_mob.SetMobilityModel("ns3::ConstantPositionMobilityModel")
     static_mob.Install(static_nc)
 
-    # Place stationary phones at random positions within the service area.
+    # Place stationary phones at random walkable cells within the service
+    # area.  Falls back to _random_pos_in_circle if no walkable grid is
+    # loaded (e.g. first run before RT has populated the pickle).
     phone_positions = [None] * num_clients
     for i in range(NUM_STATIONARY_CLIENTS):
-        px, py, pz = _random_pos_in_circle(CLIENT_AREA_RADIUS_M)
+        px, py, pz = _random_walkable_pos(CLIENT_AREA_RADIUS_M)
         phone_positions[i] = (px, py, pz)
         phones[i].GetObject[ns.ConstantPositionMobilityModel]().SetPosition(
             ns.Vector(px, py, pz))
 
     # Moving phones: install RandomWaypointMobilityModel as the SOLE mobility
-    # model on each node.  The NS-3 RandomWaypointMobilityModel has three
-    # attributes: Speed, Pause, PositionAllocator.  Bounds are enforced via
-    # the RandomRectanglePositionAllocator (X and Y random variables).
+    # model on each node.  Waypoints are drawn from a LOCAL subset of
+    # walkable cells around the phone's starting position (a pre-shuffled
+    # ListPositionAllocator).  Keeping the subset small (~25 m pedestrians,
+    # ~50 m vehicles) greatly reduces the chance that the straight-line
+    # segment between two waypoints clips through a building, since
+    # waypoints tend to stay within one street segment.
     for i in range(NUM_STATIONARY_CLIENTS, num_clients):
-        px, py, pz = _random_pos_in_circle(CLIENT_AREA_RADIUS_M)
+        px, py, pz = _random_walkable_pos(CLIENT_AREA_RADIUS_M)
         phone_positions[i] = (px, py, pz)
         rwp_mob = ns.CreateObject[ns.RandomWaypointMobilityModel]()
-        r = CLIENT_AREA_RADIUS_M
         vmin, vmax = _speed_bounds_for_client(i)
+        is_pedestrian = (i < pedestrian_end)
+        local_r = 25.0 if is_pedestrian else 50.0
         speed_var = ns.StringValue(
             f"ns3::UniformRandomVariable[Min={vmin}|Max={vmax}]"
         )
         pause_var = ns.StringValue("ns3::ConstantRandomVariable[Constant=0]")
-        pos_alloc = ns.CreateObject[ns.RandomRectanglePositionAllocator]()
-        pos_alloc.SetAttribute("X", ns.StringValue(
-            f"ns3::UniformRandomVariable[Min={-r}|Max={r}]"))
-        pos_alloc.SetAttribute("Y", ns.StringValue(
-            f"ns3::UniformRandomVariable[Min={-r}|Max={r}]"))
+        pos_alloc = ns.CreateObject[ns.ListPositionAllocator]()
+        waypoints = _local_walkable_subset(px, py, local_r, max_pts=64)
+        if not waypoints:
+            # No walkable grid loaded — fall back to an unconstrained
+            # rectangle in [-CLIENT_AREA_RADIUS_M, +CLIENT_AREA_RADIUS_M]².
+            pos_alloc = ns.CreateObject[ns.RandomRectanglePositionAllocator]()
+            r = CLIENT_AREA_RADIUS_M
+            pos_alloc.SetAttribute("X", ns.StringValue(
+                f"ns3::UniformRandomVariable[Min={-r}|Max={r}]"))
+            pos_alloc.SetAttribute("Y", ns.StringValue(
+                f"ns3::UniformRandomVariable[Min={-r}|Max={r}]"))
+        else:
+            for (wx, wy) in waypoints:
+                pos_alloc.Add(ns.Vector(wx, wy, pz))
         rwp_mob.SetAttribute("Speed",             speed_var)
         rwp_mob.SetAttribute("Pause",             pause_var)
         rwp_mob.SetAttribute("PositionAllocator", ns.PointerValue(pos_alloc))

@@ -928,3 +928,73 @@ def render_scene_background(out: str = "output/.mobility_scene_bg.png",
     except Exception as e:
         print(f"  [MobilityBg] Skipped: {e}")
     return out
+
+
+# =============================================================================
+# Walkable-point grid  (ground-level cells with no building above)
+# =============================================================================
+
+def build_walkable_points(half_extent_m: float = 500.0,
+                           spacing_m: float = 5.0,
+                           ped_z: float = 1.5,
+                           max_ground_z: float = 2.0,
+                           cache_path: str = "output/.walkable_points.pkl") -> list:
+    """
+    Return a list of (x, y, z) points inside the Munich scene where a
+    pedestrian or vehicle can legally stand — i.e. ground-level cells with
+    no building geometry above them.
+
+    The scene is sampled on a square grid of spacing `spacing_m` metres.
+    For each grid cell we cast a vertical ray from z=200 m downwards
+    through the Mitsuba scene BVH; cells where the first hit has z <
+    `max_ground_z` are classified as walkable.  Buildings with a roof
+    above 2 m are therefore excluded, leaving streets, squares, courtyards
+    and open ground.
+
+    Cached as a pickle so repeat runs skip the ~10k-ray batch trace.
+    """
+    import os as _os
+    import pickle as _pickle
+
+    if _os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            pts = _pickle.load(f)
+        print(f"  [Walkable] Using cached {cache_path}  "
+              f"({len(pts)} cells)")
+        return pts
+
+    scene_ref = getattr(sionna.rt.scene, RT_SCENE_NAME, RT_SCENE_NAME)
+    scene = load_scene(scene_ref, merge_shapes=True)
+    scene.frequency = RT_SCENE_FREQ_HZ
+    mi_scene = scene.mi_scene
+
+    nx = int(2 * half_extent_m / spacing_m) + 1
+    xs = np.linspace(-half_extent_m, half_extent_m, nx, dtype=np.float32)
+    X, Y = np.meshgrid(xs, xs, indexing="xy")
+    X_flat = X.ravel()
+    Y_flat = Y.ravel()
+    n = len(X_flat)
+
+    origin = mi.Point3f(X_flat, Y_flat, np.full_like(X_flat, 200.0))
+    direction = mi.Vector3f(
+        np.zeros(n, dtype=np.float32),
+        np.zeros(n, dtype=np.float32),
+        -np.ones(n, dtype=np.float32),
+    )
+    ray = mi.Ray3f(origin, direction)
+    si = mi_scene.ray_intersect(ray)
+    hit_z = np.asarray(si.p.z).ravel()
+    valid = np.asarray(si.is_valid()).ravel().astype(bool)
+
+    r2 = X_flat ** 2 + Y_flat ** 2
+    mask = valid & (hit_z < max_ground_z) & (r2 <= half_extent_m ** 2)
+    pts = [(float(X_flat[i]), float(Y_flat[i]), float(ped_z))
+           for i in np.where(mask)[0]]
+
+    _os.makedirs(_os.path.dirname(cache_path) or ".", exist_ok=True)
+    with open(cache_path, "wb") as f:
+        _pickle.dump(pts, f)
+    print(f"  [Walkable] Sampled {n} cells at {spacing_m:.1f} m spacing — "
+          f"{len(pts)} walkable ({100 * len(pts) / n:.1f}%)  "
+          f"-> {cache_path}")
+    return pts
