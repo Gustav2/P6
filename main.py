@@ -403,7 +403,10 @@ def main() -> None:
                          if r.get("position_trace")), None)
     if trace_source is not None:
         with open("output/.position_trace.pkl", "wb") as _f:
-            pickle.dump(trace_source["position_trace"], _f)
+            pickle.dump({
+                "position_trace": trace_source["position_trace"],
+                "schedule": trace_source.get("schedule", []),
+            }, _f)
         render_mobility_video(
             position_trace    = trace_source["position_trace"],
             channel_stats     = channel_stats,
