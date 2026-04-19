@@ -94,14 +94,22 @@ def render_mobility_video(position_trace: dict,
     n_stat   = position_trace.get("num_stationary", 30)
     n_ped    = position_trace.get("num_pedestrian", 10)
 
-    # No RT proxy position lookup needed: the satellite marker uses the NS-3
-    # node's actual continuous position (sat_xyz), which starts directly
-    # overhead and moves east at orbital velocity.  This is the correct
-    # representation — NS-3 models a single satellite traversing the sky;
-    # "handovers" are channel-quality profile switches, not physical satellite
-    # jumps.  The RT proxy positions (sat_x_m, sat_y_m) represent snapshot
-    # azimuths for ray tracing, not an orbital trajectory, so using them
-    # produced false east↔west jumps at handover boundaries.
+    # All-satellite positions: display every satellite from channel_stats as a
+    # small grey star; the currently serving one is highlighted red/gold.
+    # Positions are the Sionna RT proxy azimuths (sat_x_m, sat_y_m at 550 km)
+    # divided by 1000 to match the metre-scale plot axes.  Satellites beyond
+    # ±half_extent_m are clamped to the plot edge, which places them visually
+    # around the perimeter of the scene — a sensible constellation overview.
+    def _clamp(v): return max(-half_extent_m * 0.95, min(half_extent_m * 0.95, v))
+    _all_sats = [
+        (s["sat_id"],
+         _clamp(s["sat_x_m"] / 1000.0),
+         _clamp(s["sat_y_m"] / 1000.0),
+         s.get("elevation_deg", 0.0))
+        for s in channel_stats
+        if "sat_x_m" in s and "sat_y_m" in s
+    ]
+    _sat_by_id = {sid: (x, y) for sid, x, y, _ in _all_sats}
 
     n_frames = len(t_s)
     if n_frames == 0:
@@ -149,10 +157,10 @@ def render_mobility_video(position_trace: dict,
     _ho_starts = sorted(s["t_start"] for s in handover_schedule
                         if s.get("interruption_ms", 0) > 0)
 
-    # Legend proxy for the service-area circle (circle patches don't auto-appear
-    # in the legend, so we add a dashed-line proxy handle each frame).
+    # Legend proxy for the UE placement boundary (circle patches don't auto-appear
+    # in the legend, so we add a dashed-line proxy handle).
     _circle_proxy = mlines.Line2D([], [], color="#555", linestyle="--",
-                                   linewidth=0.9, label="service area (500 m)")
+                                   linewidth=0.9, label="UE placement area (500 m)")
 
     print(f"[Mobility]  Rendering {n_frames} frames at {fps} fps -> {out}")
     log_every = max(1, n_frames // 10)
@@ -193,26 +201,37 @@ def render_mobility_video(position_trace: dict,
         xs, ys = _xy(f, veh_idx)
         ax.scatter(xs, ys, zorder=5, **_VEHICULAR_STYLE)
 
-        # Satellite ground-projection indicator.
-        # Use the NS-3 satellite node's actual position: smooth eastward
-        # orbital motion at SAT_ORBITAL_VELOCITY_MS, starting overhead.
-        # Handover channel-quality changes are reflected in the HUD only.
+        # All constellation satellites: grey stars at their RT proxy positions.
+        # The serving satellite is highlighted in red/gold and uses its own
+        # RT proxy position so the marker jumps to the correct satellite at
+        # each handover instead of drifting with the NS-3 node trajectory.
         sat_id, elev = _serving_sat_at(t_s[f], handover_schedule)
-        sx_m, sy_m, _ = sat_xyz[f]
-        sx_clamped = max(-half_extent_m * 0.95,
-                         min(half_extent_m * 0.95, sx_m / 1000.0))
-        sy_clamped = max(-half_extent_m * 0.95,
-                         min(half_extent_m * 0.95, sy_m / 1000.0))
-        # Flash gold for 0.5 s after each handover so the event is obvious.
+
+        non_xs = [x for sid, x, y, _ in _all_sats if sid != sat_id]
+        non_ys = [y for sid, x, y, _ in _all_sats if sid != sat_id]
+        if non_xs:
+            ax.scatter(non_xs, non_ys, marker="*",
+                       s=80, color="#aaaaaa", edgecolors="#777", linewidths=0.6,
+                       zorder=6, label="other satellites")
+
+        if sat_id in _sat_by_id:
+            sx_clamped, sy_clamped = _sat_by_id[sat_id]
+        else:
+            sx_m, sy_m, _ = sat_xyz[f]
+            sx_clamped = max(-half_extent_m * 0.95,
+                             min(half_extent_m * 0.95, sx_m / 1000.0))
+            sy_clamped = max(-half_extent_m * 0.95,
+                             min(half_extent_m * 0.95, sy_m / 1000.0))
+
         time_since_ho = min((t_s[f] - ts for ts in _ho_starts if ts <= t_s[f]),
                             default=float("inf"))
         is_flash = time_since_ho < _FLASH_S
         ax.scatter([sx_clamped], [sy_clamped], marker="*",
-                   s=500 if is_flash else 250,
+                   s=500 if is_flash else 300,
                    color="#ffa500" if is_flash else "#d62728",
                    edgecolors="white",
                    linewidths=2.0 if is_flash else 1.2,
-                   zorder=6, label="serving satellite")
+                   zorder=7, label="serving satellite")
 
         # HUD — sat_id and elev already set by the satellite marker block above
         ho_count = sum(1 for s in handover_schedule if s["t_start"] <= t_s[f]
@@ -235,7 +254,7 @@ def render_mobility_video(position_trace: dict,
 
         handles, labels = ax.get_legend_handles_labels()
         handles.append(_circle_proxy)
-        labels.append("service area (500 m)")
+        labels.append("UE placement area (500 m)")
         ax.legend(handles=handles, labels=labels,
                   loc="lower right", fontsize=9, framealpha=0.92,
                   edgecolor="#888", title="Legend", title_fontsize=8)
