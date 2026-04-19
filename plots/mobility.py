@@ -20,7 +20,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 
-from config import SIM_DURATION_S
+from config import SIM_DURATION_S, SAT_ORBITAL_VELOCITY_MS
 
 
 _STATIONARY_STYLE = dict(color="#1f77b4", marker="s", s=30,
@@ -93,13 +93,29 @@ def render_mobility_video(position_trace: dict,
     n_stat   = position_trace.get("num_stationary", 30)
     n_ped    = position_trace.get("num_pedestrian", 10)
 
-    # Lookup table: sat_id → (x_m, y_m) from channel stats.
-    # Used to snap the satellite marker to the *serving* satellite's position
-    # (which changes at each handover) rather than following the single NS-3
-    # proxy node's continuous trajectory.
+    # Lookup table: sat_id → (x_m, y_m) from channel stats — the satellite's
+    # RT proxy position at the *start* of its slot.  Orbital motion is added
+    # per-frame so the marker moves smoothly within each slot.
     _sat_pos_lookup = {s["sat_id"]: (s["sat_x_m"], s["sat_y_m"])
                        for s in channel_stats
                        if "sat_x_m" in s and "sat_y_m" in s}
+
+    def _sat_pos_at(t: float):
+        """Return (x_m, y_m) of the serving satellite at time t.
+
+        Within each handover slot the satellite moves at orbital velocity
+        (x-direction only, matching the NS-3 ConstantVelocityMobilityModel).
+        At a handover boundary the position jumps to the new satellite's
+        starting location.  Returns None when channel_stats is unavailable.
+        """
+        for slot in handover_schedule:
+            if slot["t_start"] <= t <= slot["t_end"]:
+                sid = slot["sat_id"]
+                if sid in _sat_pos_lookup:
+                    x0, y0 = _sat_pos_lookup[sid]
+                    return (x0 + SAT_ORBITAL_VELOCITY_MS * (t - slot["t_start"]),
+                            y0)
+        return None
 
     n_frames = len(t_s)
     if n_frames == 0:
@@ -185,8 +201,9 @@ def render_mobility_video(position_trace: dict,
         # marker jumps to the correct satellite at each handover, rather than
         # following the single NS-3 proxy node's continuous trajectory.
         sat_id, elev = _serving_sat_at(t_s[f], handover_schedule)
-        if sat_id in _sat_pos_lookup:
-            sx_m, sy_m = _sat_pos_lookup[sat_id]
+        pos = _sat_pos_at(t_s[f])
+        if pos is not None:
+            sx_m, sy_m = pos
         else:
             sx_m, sy_m, _ = sat_xyz[f]    # fallback: NS-3 node position
         sx_clamped = max(-half_extent_m * 0.95,
