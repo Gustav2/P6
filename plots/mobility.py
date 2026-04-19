@@ -21,7 +21,16 @@ import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import matplotlib.lines as mlines
 
-from config import SIM_DURATION_S
+from config import (
+    SIM_DURATION_S,
+    RT_UE_POSITION,
+    SAT_HEIGHT_M,
+    SAT_ORBITAL_VELOCITY_MS,
+    SAT_HANDOVER_ELEVATION_DEG,
+)
+
+# Earth radius for slant-range geometry (matches sim/ns3.py).
+_EARTH_RADIUS_M = 6_371_000.0
 
 
 _STATIONARY_STYLE = dict(color="#1f77b4", marker="s", s=30,
@@ -48,6 +57,58 @@ def _serving_sat_at(t: float, handover_schedule: list):
         last = handover_schedule[-1]
         return last["sat_id"], last.get("elev_deg", float("nan"))
     return -1, float("nan")
+
+
+def _active_slot(t: float, handover_schedule: list):
+    """Return the slot containing time `t`, or the last slot as fallback."""
+    for slot in handover_schedule:
+        if slot["t_start"] <= t <= slot["t_end"]:
+            return slot
+    return handover_schedule[-1] if handover_schedule else None
+
+
+def _slant_range_m(height_m: float, elev_deg: float) -> float:
+    """Spherical-Earth slant range [m]. Matches sim/ns3.py._slant_range_m."""
+    e = math.radians(elev_deg)
+    return (math.sqrt((_EARTH_RADIUS_M + height_m) ** 2
+                      - (_EARTH_RADIUS_M * math.cos(e)) ** 2)
+            - _EARTH_RADIUS_M * math.sin(e))
+
+
+def _azel_to_xy(az_rad: float, elev_deg: float, half_extent_m: float,
+                r_max_frac: float = 0.8) -> tuple:
+    """
+    Sky-plot projection: elevation drives radius (90° = centre, 0° = horizon),
+    azimuth drives angle.  Scaled so the horizon ring sits inside the UE
+    placement circle.
+    """
+    r_frac = max(0.0, min(1.0, (90.0 - elev_deg) / 90.0))
+    r = r_frac * r_max_frac * half_extent_m
+    return r * math.sin(az_rad), r * math.cos(az_rad)
+
+
+def _serving_elev_at(t: float, slot: dict, peak_elev_deg: float) -> float:
+    """
+    Interpolate the serving-satellite elevation across its slot using the
+    same d(elev)/dt physics that drove the NS-3 slot-duration weighting
+    (sim/ns3.py:488–491).  Slot midpoint maps to the RT snapshot peak;
+    elevation rises slightly into the slot and falls toward the handover
+    threshold by slot end.
+    """
+    t_start = slot["t_start"]
+    t_end   = slot["t_end"]
+    t_mid   = 0.5 * (t_start + t_end)
+    peak    = max(peak_elev_deg, 1.0)
+
+    # rad/s angular elevation rate at peak; assumed roughly constant across
+    # the slot (a good first-order approximation for a zenith pass).
+    peak_rad  = math.radians(peak)
+    slant_m   = _slant_range_m(SAT_HEIGHT_M, peak)
+    rate_rads = SAT_ORBITAL_VELOCITY_MS * math.sin(peak_rad) / slant_m
+    rate_deg  = math.degrees(rate_rads)
+
+    elev = peak - rate_deg * (t - t_mid)
+    return max(float(SAT_HANDOVER_ELEVATION_DEG), min(90.0, elev))
 
 
 def render_mobility_video(position_trace: dict,
@@ -94,22 +155,21 @@ def render_mobility_video(position_trace: dict,
     n_stat   = position_trace.get("num_stationary", 30)
     n_ped    = position_trace.get("num_pedestrian", 10)
 
-    # All-satellite positions: display every satellite from channel_stats as a
-    # small grey star; the currently serving one is highlighted red/gold.
-    # Positions are the Sionna RT proxy azimuths (sat_x_m, sat_y_m at 550 km)
-    # divided by 1000 to match the metre-scale plot axes.  Satellites beyond
-    # ±half_extent_m are clamped to the plot edge, which places them visually
-    # around the perimeter of the scene — a sensible constellation overview.
-    def _clamp(v): return max(-half_extent_m * 0.95, min(half_extent_m * 0.95, v))
+    # Sky-plot overlay for satellites.  Plotting raw (sat_x_m, sat_y_m)
+    # can't work: RT proxies live at 550 km altitude with horizontal offsets
+    # of 200–785 km, which overflows the 1.2 km urban scene plot.  Instead
+    # we project (azimuth, elevation) onto the axes: azimuth → angle,
+    # (90° − elevation)/90° → radius.  Azimuth is derived from the snapshot
+    # geometry relative to the RT UE anchor.
+    _ux, _uy, _ = RT_UE_POSITION
     _all_sats = [
         (s["sat_id"],
-         _clamp(s["sat_x_m"] / 1000.0),
-         _clamp(s["sat_y_m"] / 1000.0),
+         math.atan2(s["sat_x_m"] - _ux, s["sat_y_m"] - _uy),
          s.get("elevation_deg", 0.0))
         for s in channel_stats
         if "sat_x_m" in s and "sat_y_m" in s
     ]
-    _sat_by_id = {sid: (x, y) for sid, x, y, _ in _all_sats}
+    _peak_by_id = {sid: (az, el) for sid, az, el in _all_sats}
 
     n_frames = len(t_s)
     if n_frames == 0:
@@ -157,10 +217,15 @@ def render_mobility_video(position_trace: dict,
     _ho_starts = sorted(s["t_start"] for s in handover_schedule
                         if s.get("interruption_ms", 0) > 0)
 
-    # Legend proxy for the UE placement boundary (circle patches don't auto-appear
-    # in the legend, so we add a dashed-line proxy handle).
+    # Legend proxies for the dashed circles (circle patches don't auto-appear
+    # in the legend, so we add dashed-line proxy handles).
+    _R_MAX_FRAC = 0.8
+    _HORIZON_R_M = _R_MAX_FRAC * half_extent_m
     _circle_proxy = mlines.Line2D([], [], color="#555", linestyle="--",
                                    linewidth=0.9, label="UE placement area (500 m)")
+    _horizon_proxy = mlines.Line2D([], [], color="#888", linestyle=":",
+                                    linewidth=0.9,
+                                    label=f"sky horizon (elev 0°, r={_HORIZON_R_M:.0f} m)")
 
     print(f"[Mobility]  Rendering {n_frames} frames at {fps} fps -> {out}")
     log_every = max(1, n_frames // 10)
@@ -179,11 +244,17 @@ def render_mobility_video(position_trace: dict,
                                         facecolor="#dfeaf2",
                                         edgecolor="none", zorder=0))
 
-        # Client-area boundary
+        # Client-area boundary (UE placement circle, fixed at 500 m)
         circle = plt.Circle((0, 0), 500.0, fill=False,
                              edgecolor="#666", linestyle="--",
                              linewidth=0.8, alpha=0.7, zorder=1)
         ax.add_patch(circle)
+
+        # Sky-plot horizon ring (radius where satellite elev = 0°).
+        horizon = plt.Circle((0, 0), _HORIZON_R_M, fill=False,
+                              edgecolor="#888", linestyle=":",
+                              linewidth=0.8, alpha=0.6, zorder=1)
+        ax.add_patch(horizon)
 
         # Motion tails for moving UEs (last _TAIL_FRAMES frames)
         tail_start = max(0, f - _TAIL_FRAMES)
@@ -201,43 +272,43 @@ def render_mobility_video(position_trace: dict,
         xs, ys = _xy(f, veh_idx)
         ax.scatter(xs, ys, zorder=5, **_VEHICULAR_STYLE)
 
-        # All constellation satellites: grey stars at their RT proxy positions.
-        # The serving satellite is highlighted in red/gold and uses its own
-        # RT proxy position so the marker jumps to the correct satellite at
-        # each handover instead of drifting with the NS-3 node trajectory.
-        sat_id, elev = _serving_sat_at(t_s[f], handover_schedule)
+        # Sky-plot: all constellation satellites as grey stars at their
+        # snapshot (azimuth, peak-elevation), and the serving satellite as
+        # a red/gold star whose elevation sweeps within its slot.
+        sat_id, _peak_elev = _serving_sat_at(t_s[f], handover_schedule)
+        slot = _active_slot(t_s[f], handover_schedule)
 
-        non_xs = [x for sid, x, y, _ in _all_sats if sid != sat_id]
-        non_ys = [y for sid, x, y, _ in _all_sats if sid != sat_id]
-        if non_xs:
+        non_xy = [_azel_to_xy(az, el, half_extent_m, _R_MAX_FRAC)
+                  for sid, az, el in _all_sats if sid != sat_id]
+        if non_xy:
+            non_xs, non_ys = zip(*non_xy)
             ax.scatter(non_xs, non_ys, marker="*",
                        s=80, color="#aaaaaa", edgecolors="#777", linewidths=0.6,
                        zorder=6, label="other satellites")
 
-        if sat_id in _sat_by_id:
-            sx_clamped, sy_clamped = _sat_by_id[sat_id]
+        if sat_id in _peak_by_id and slot is not None:
+            az_s, peak_s = _peak_by_id[sat_id]
+            elev_now = _serving_elev_at(t_s[f], slot, peak_s)
+            sx, sy = _azel_to_xy(az_s, elev_now, half_extent_m, _R_MAX_FRAC)
         else:
-            sx_m, sy_m, _ = sat_xyz[f]
-            sx_clamped = max(-half_extent_m * 0.95,
-                             min(half_extent_m * 0.95, sx_m / 1000.0))
-            sy_clamped = max(-half_extent_m * 0.95,
-                             min(half_extent_m * 0.95, sy_m / 1000.0))
+            sx, sy = 0.0, 0.0
+            elev_now = _peak_elev
 
         time_since_ho = min((t_s[f] - ts for ts in _ho_starts if ts <= t_s[f]),
                             default=float("inf"))
         is_flash = time_since_ho < _FLASH_S
-        ax.scatter([sx_clamped], [sy_clamped], marker="*",
+        ax.scatter([sx], [sy], marker="*",
                    s=500 if is_flash else 300,
                    color="#ffa500" if is_flash else "#d62728",
                    edgecolors="white",
                    linewidths=2.0 if is_flash else 1.2,
                    zorder=7, label="serving satellite")
 
-        # HUD — sat_id and elev already set by the satellite marker block above
+        # HUD — uses the animated elevation so the readout tracks the marker.
         ho_count = sum(1 for s in handover_schedule if s["t_start"] <= t_s[f]
                        and s.get("interruption_ms", 0) > 0)
         hud = (f"t = {t_s[f]:5.1f} s    "
-               f"serving sat{sat_id}  elev {elev:4.1f}°    "
+               f"serving sat{sat_id}  elev {elev_now:4.1f}°    "
                f"handovers: {ho_count}")
         ax.text(0.02, 0.98, hud,
                 transform=ax.transAxes, fontsize=11, weight="bold",
@@ -250,11 +321,14 @@ def render_mobility_video(position_trace: dict,
         ax.set_xlabel("x [m]", fontsize=9)
         ax.set_ylabel("y [m]", fontsize=9)
         ax.set_aspect("equal", adjustable="box")
-        ax.set_title("NTN Client Mobility — Munich Scene", fontsize=12, weight="bold")
+        ax.set_title("NTN Client Mobility — Munich Scene  ·  "
+                     "Satellites in sky-plot overlay (radius = zenith angle)",
+                     fontsize=11, weight="bold")
 
         handles, labels = ax.get_legend_handles_labels()
-        handles.append(_circle_proxy)
-        labels.append("UE placement area (500 m)")
+        handles.extend([_circle_proxy, _horizon_proxy])
+        labels.extend(["UE placement area (500 m)",
+                       f"sky horizon (elev 0°, r={_HORIZON_R_M:.0f} m)"])
         ax.legend(handles=handles, labels=labels,
                   loc="lower right", fontsize=9, framealpha=0.92,
                   edgecolor="#888", title="Legend", title_fontsize=8)
