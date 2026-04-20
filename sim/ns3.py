@@ -466,13 +466,17 @@ def _interp_channel_stats(sat_id: int, t_mid: float,
     b = by_id_b.get(sat_id)
     if a is None or b is None:
         return None
-    _lerp = lambda k: a[k] * (1.0 - alpha) + b[k] * alpha
+    def _safe_lerp(va, vb):
+        # NaN guard: when num_paths==0 a gain field is NaN; prefer the finite side.
+        if math.isnan(va): return vb
+        if math.isnan(vb): return va
+        return va * (1.0 - alpha) + vb * alpha
     return {
         **a,
-        "normalized_gain_db":  _lerp("normalized_gain_db"),
-        "normalized_p10_db":   _lerp("normalized_p10_db"),
-        "delay_spread_ns":     _lerp("delay_spread_ns"),
-        "k_factor_db":         _lerp("k_factor_db"),
+        "normalized_gain_db":  _safe_lerp(a["normalized_gain_db"],  b["normalized_gain_db"]),
+        "normalized_p10_db":   _safe_lerp(a["normalized_p10_db"],   b["normalized_p10_db"]),
+        "delay_spread_ns":     _safe_lerp(a["delay_spread_ns"],     b["delay_spread_ns"]),
+        "k_factor_db":         _safe_lerp(a["k_factor_db"],         b["k_factor_db"]),
     }
 
 

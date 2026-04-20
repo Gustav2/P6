@@ -411,7 +411,7 @@ VEHICULAR_SPEED_MAX_MS = 22.0
 # Data volume per flow
 # =============================================================================
 
-DATA_VOLUME_MB = 10.0
+DATA_VOLUME_MB = 100.0
 """
 Maximum data volume sent per TCP BulkSend flow [MB].
 
@@ -419,10 +419,11 @@ NS-3 BulkSend.MaxBytes is set to int(DATA_VOLUME_MB × 10⁶) bytes so that
 each flow terminates after transferring this fixed file size rather than
 saturating the link for the full SIM_DURATION_S.
 
-- 10 MB is representative of a medium-sized file transfer (e.g. a map
-  tile cache update or a short video segment for adaptive streaming).
-- Setting this value ensures all protocol runs transmit the same total
-  data volume, making throughput and latency comparisons fair.
+- 100 MB keeps BulkSend flows alive for the full 60 s simulation at NTN
+  rates (≤20 Mbps), so the TCP congestion controller reaches steady state
+  and the fairness index is computed over a complete flow. At 20 Mbps a
+  10 MB transfer finishes in ~4 s, leaving the congestion controller in
+  slow-start for most of the window — 100 MB prevents this early cutoff.
 - Set to 0 to disable the cap (unlimited BulkSend, saturating sender).
 
 UDP OnOff flows are not capped by this value (they use APP_DATA_RATE).
@@ -487,13 +488,16 @@ Source: 3GPP TR 38.821 §6.2.2 (NTN handover interruption time
         for conventional NTN CHO without predictive scheduling).
 """
 
-HANDOVER_INTERRUPTION_MS_MAX = 200.0
+HANDOVER_INTERRUPTION_MS_MAX = 300.0
 """
 Maximum total link-layer interruption time per handover event [ms].
 
-200 ms covers worst-case BFD timer expiry + congested RACH + slow
-RRC path switch under high orbital Doppler and multipath uncertainty.
-Source: 3GPP TR 38.821 §6.2.2; 3GPP TS 38.321 §5.17 (BFD max 200 ms).
+300 ms is the upper bound of the 3GPP NTN CHO interruption range
+(50–300 ms) for conventional LEO handover without pre-positioning.
+It covers worst-case BFD timer expiry + congested RACH + slow RRC path
+switch under high orbital Doppler and multipath uncertainty.
+Source: 3GPP TR 38.821 §6.2.2 (NTN realistic range 50–300 ms).
+        3GPP TS 38.321 §5.17 (BFD max 200 ms; RACH + CHO add remainder).
 """
 
 FADE_MEAN_DURATION_MS = 80.0
@@ -503,10 +507,24 @@ Mean duration of a shadow-fading burst on the NTN service link [ms].
 Shadow fading in urban NTN has a coherence time set by the satellite's
 angular velocity across building edges. At 550 km altitude and 7612 m/s,
 the satellite subtends ~1.4 m/s apparent lateral motion at street level,
-giving a fading coherence length of ~10–100 m (1–10 dB fade depth) and
-a corresponding coherence time of ~70–80 ms for a pedestrian UE.
-80 ms is the mid-range value consistent with 3GPP TR 38.811 §6.7.2
-urban S-band shadow-fading statistics.
+giving a fading coherence length L_c ≈ 10–100 m (1–10 dB fade depth).
+
+The speed-dependent mean fade duration is:
+    T_fade(v_UE) = L_c / v_rel,  where v_rel ≈ v_UE (satellite Doppler
+    dominates only for the frequency component; the shadow geometry is
+    determined by UE-to-building relative motion at street level).
+
+At pedestrian speed (~1.4 m/s):  T_fade ≈ 10–70 m / 1.4 m/s ≈ 70 ms  ✓
+At vehicular speed  (~15 m/s):   T_fade ≈ 10–70 m / 15   m/s ≈  5 ms
+At highway speed    (~30 m/s):   T_fade ≈ 10–70 m / 30   m/s ≈  2 ms
+
+80 ms is therefore appropriate only for pedestrian UEs. Vehicular UEs in
+this simulation (RandomWaypoint, speeds up to ~15 m/s) will experience
+shadow-fading bursts 8–16× shorter than modelled here. This overestimates
+burst duration and may slightly overstate protocol benefit from burst
+recovery (QUIC vs TCP). Documented as thesis caveat N1-a.
+
+Reference: 3GPP TR 38.811 §6.7.2 urban S-band shadow-fading statistics.
 Used in the burst-error state machine in sim/ns3.py (N1 fix).
 """
 

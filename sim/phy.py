@@ -1,7 +1,7 @@
 """
 ntn_phy.py — Part 1: Sionna 1.2.1 + OpenNTN BER/BLER simulation
 =================================================================
-Simulates the NTN downlink physical layer using OpenNTN's TR38.811
+Simulates the NTN uplink physical layer using OpenNTN's TR38.811
 channel models (DenseUrban, Urban, SubUrban) over an OFDM link with
 QPSK modulation and LDPC channel coding.
 
@@ -102,7 +102,7 @@ def build_channel_model(scenario: str):
 
 class NTNOFDMModel(Block):
     """
-    Sionna 1.2.1 end-to-end NTN downlink model (SISO QPSK LDPC).
+    Sionna 1.2.1 end-to-end NTN uplink model (SISO QPSK LDPC).
 
     Chain
     -----
