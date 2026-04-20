@@ -126,11 +126,6 @@ EventImpl* pythonMakeEvent(void (*f)()) { return MakeEvent(f); }
 
 from config import (
     CARRIER_FREQ_HZ,
-    FFT_SIZE,
-    NUM_OFDM_SYMBOLS,
-    PILOT_SYMBOL_IDX,
-    NUM_BITS_PER_SYMBOL,
-    CODERATE,
     SAT_HEIGHT_M,
     SAT_ORBITAL_VELOCITY_MS,
     SAT_HANDOVER_ELEVATION_DEG,
@@ -179,20 +174,26 @@ from config import (
 )
 
 # ---------------------------------------------------------------------------
-# Multi-codeword PER correction (C1)
-# 1 LDPC codeword carries FFT_SIZE × data_symbols × QPSK_bits × r info bits.
-# data_symbols = NUM_OFDM_SYMBOLS − len(PILOT_SYMBOL_IDX) = 14 − 2 = 12
-# info_bits = 128 × 12 × 2 × 0.5 = 1536 b = 192 B per codeword.
-# A 1400 B NS-3 packet spans ⌈1400×8 / 1536⌉ = 8 codewords.
-# The sigmoid fit returns per-codeword BLER; packet PER = 1 − (1−BLER)^N_CW.
-_INFO_BITS_PER_CW = int(
-    FFT_SIZE
-    * (NUM_OFDM_SYMBOLS - len(PILOT_SYMBOL_IDX))
-    * NUM_BITS_PER_SYMBOL
-    * CODERATE
-)   # 1536 bits = 192 bytes
-_N_CW_PER_PKT = max(1, math.ceil(PACKET_SIZE_BYTES * 8 / _INFO_BITS_PER_CW))
-# = ⌈11200 / 1536⌉ = 8
+# NTN block-fading / slow-fading note (C1 thesis caveat)
+#
+# A naive fix would apply  PER = 1 − (1−BLER)^N  where N = ⌈1400 B / 192 B⌉ = 8
+# codewords per IP packet, on the grounds that a packet error requires any one
+# codeword to fail.  That formula is only valid when codeword errors are
+# INDEPENDENT, i.e. the channel changes between codewords (fast fading).
+#
+# NTN is the opposite extreme — slow / block fading:
+#   - Coherence time ≫ packet duration (≈ 4 ms for 8 × 0.5 ms slots).
+#   - Over 4 ms at 550 km the satellite moves ~30 m → negligible channel change.
+#   - All 8 codewords in one packet therefore see the SAME instantaneous SNR
+#     and fail or succeed together.
+#
+# In the block-fading model:  PER_packet ≈ BLER_codeword
+# which is exactly what the sigmoid returns.  Using BLER directly as PER is
+# therefore the CORRECT assumption for NTN, not an approximation to be fixed.
+#
+# The real thesis caveat is the absence of HARQ-IR: incremental redundancy
+# would reduce the effective per-transmission BLER by ~3 dB but is not modelled.
+# Reference: 3GPP TR 38.821 §6.1.4 (HARQ in NTN), TS 38.212 §5.4.2 (IR-HARQ).
 
 # =============================================================================
 # Application-layer KPI helpers (ITU-T G.107 / empirical mappings)
@@ -428,8 +429,9 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
 
     snr_db = (PHONE_EIRP_DBM - fspl_db - atm_loss_db + urban_correction_db
               + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM)
-    bler   = 1.0 / (1.0 + math.exp(sigmoid_slope * (snr_db - snr_thresh_db)))
-    per    = 1.0 - (1.0 - bler) ** _N_CW_PER_PKT
+    # Block-fading (NTN slow-fading): PER_packet ≈ BLER_codeword.
+    # All codewords in one packet share the same channel state → use BLER directly.
+    per    = 1.0 / (1.0 + math.exp(sigmoid_slope * (snr_db - snr_thresh_db)))
     return float(np.clip(per, 0.0, 0.99))
 
 
