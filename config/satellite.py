@@ -60,14 +60,20 @@ Approximate total number of satellites in the reference LEO shell.
 - 3000 is in-family with modern broadband LEO shell sizes (order of 10^3).
 """
 
-VISIBLE_SATELLITES_PER_PASS = 8
+VISIBLE_SATELLITES_PER_PASS = 12
 """
 Number of satellites sampled as simultaneously visible during one urban pass.
 
 - This is the practical simulation density used by ray tracing and handover
   scheduling (NUM_SATELLITES below).
-- 8 provides a more realistic visible-satellite density than 3 while keeping
-  runtime manageable on CPU-only setups.
+- With RT_SAT_INITIAL_ZENITH_DEG = 5° and SAT_SPACING_DEG = 15°, the
+  12 satellites span zenith 5°–170°.  At t = 0, the first 6 (zenith
+  5°–80°) are above the 10° handover threshold.  As the constellation
+  advances 18.9° over 300 s, Sats 4–5 drop below threshold by t ≈ 238 s
+  but Sats 0–3 remain visible for the full simulation window.
+- 12 ensures there is always a buffer of at least 4 visible satellites
+  throughout SIM_DURATION_S = 300 s, preventing a satellite-starvation
+  condition that would occur with 8 sats at the original 20° initial zenith.
 """
 
 NUM_SATELLITES = VISIBLE_SATELLITES_PER_PASS

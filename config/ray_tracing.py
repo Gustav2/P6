@@ -57,16 +57,22 @@ Representative UE sampling points [x, y, z] in the Munich scene for RT.
   facade materials vary significantly over short distances.
 """
 
-RT_SAT_INITIAL_ZENITH_DEG = 20.0
+RT_SAT_INITIAL_ZENITH_DEG = 5.0
 """
 Zenith angle [degrees] of the first (highest-elevation) satellite
 in the ray-tracing snapshot.
-- Setting this > 0 avoids placing a transmitter directly overhead
+- Must be > 0 to avoid placing a transmitter directly overhead
   (zenith = 0°), which returns 0 valid paths in the Munich scene
   because there are no vertical surfaces to reflect near-vertical rays
-  down to a street-level UE.
-- 20° gives a small but non-zero horizontal offset so that building
-  walls are illuminated at a glancing angle, enabling reflections.
+  down to a street-level UE.  5° gives a small horizontal offset that
+  illuminates building walls at a glancing angle while starting the
+  constellation pass as close to zenith as the scene geometry allows.
+- Reduced from 20° to 5° so that with SAT_SPACING_DEG = 15° and
+  NUM_SATELLITES = 12, the first 6 satellites remain above the 10°
+  handover threshold (zenith < 80°) for the full SIM_DURATION_S = 300 s.
+  At 20° the 5th satellite (zenith 80°) was already at the threshold at
+  t = 0 and dropped below within seconds; with 5°, the 5th satellite
+  starts at zenith 65° and stays visible until t ≈ 238 s.
 """
 
 RT_SAT_SCENE_HEIGHT_M = 550_000.0

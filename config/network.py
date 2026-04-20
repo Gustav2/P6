@@ -45,19 +45,22 @@ Total NS-3 simulation duration [seconds].
   300 s is a practical upper bound for CPU-only runs.
 """
 
-RT_SNAPSHOT_INTERVAL_S = 30.0
+RT_SNAPSHOT_INTERVAL_S = 15.0
 """
 Time interval between successive Sionna RT snapshots [seconds].
 
-At 300 s simulation duration this produces 11 snapshots
-(t = 0, 30, 60, …, 300 s), each advancing the satellite constellation
-by ≈ 1.9° along the orbit (ω ≈ 0.063°/s at 550 km).  Per-slot channel
+At 300 s simulation duration this produces 21 snapshots
+(t = 0, 15, 30, …, 300 s), each advancing the satellite constellation
+by ≈ 0.95° along the orbit (ω ≈ 0.063°/s at 550 km).  Per-slot channel
 statistics in NS-3 are linearly interpolated between adjacent snapshots.
 
-- 30 s / 1.9° per interval keeps interpolation error negligible compared
-  to other model uncertainties (coplanar geometry, specular-only RT).
-- Reducing this value increases RT runtime proportionally; each additional
-  snapshot adds one PathSolver call (scene is loaded once and reused).
+- 15 s / 0.95° per interval gives finer temporal resolution than the
+  previous 30 s / 1.9° setting, better capturing how K-factor and delay
+  spread vary as each satellite's elevation angle changes over the pass.
+- Interpolation error across 0.95° intervals is negligible compared to
+  other model uncertainties (coplanar geometry, specular-only RT).
+- Each additional snapshot adds one PathSolver call; scene is loaded once
+  and reused so the overhead is PathSolver time only (not scene load).
 """
 
 # =============================================================================
