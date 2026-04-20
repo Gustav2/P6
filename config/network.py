@@ -496,6 +496,20 @@ RRC path switch under high orbital Doppler and multipath uncertainty.
 Source: 3GPP TR 38.821 §6.2.2; 3GPP TS 38.321 §5.17 (BFD max 200 ms).
 """
 
+FADE_MEAN_DURATION_MS = 80.0
+"""
+Mean duration of a shadow-fading burst on the NTN service link [ms].
+
+Shadow fading in urban NTN has a coherence time set by the satellite's
+angular velocity across building edges. At 550 km altitude and 7612 m/s,
+the satellite subtends ~1.4 m/s apparent lateral motion at street level,
+giving a fading coherence length of ~10–100 m (1–10 dB fade depth) and
+a corresponding coherence time of ~70–80 ms for a pedestrian UE.
+80 ms is the mid-range value consistent with 3GPP TR 38.811 §6.7.2
+urban S-band shadow-fading statistics.
+Used in the burst-error state machine in sim/ns3.py (N1 fix).
+"""
+
 # =============================================================================
 # Traffic profiles and client assignment
 # =============================================================================

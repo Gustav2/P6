@@ -105,6 +105,7 @@ from config import (
     RT_UE_SAMPLE_POSITIONS,
     SERVICE_LINK_RATE_MBPS,
     BACKHAUL_DELAY_MS,
+    SIM_DURATION_S,
     SIM_SCENARIO,
 )
 from sim.phy           import run_sionna_ber
@@ -288,8 +289,20 @@ def main() -> None:
     print("  Part 2 — Ray tracing  (Sionna RT, Munich scene)")
     print("─" * 70)
 
+    # R2 fix: run RT at 3 time snapshots and interpolate per-slot channel stats.
+    # Scene is loaded once on the first call and reused to avoid triple scene-
+    # load overhead (~1–2 s each).  Orbital advance ≈ 0.063°/s so the three
+    # snapshots bracket t=0, t=30 s, t=60 s, giving ≈ 0°, 1.9°, 3.8° advance.
     t0 = time.perf_counter()
-    channel_stats = run_ray_tracing()
+    _rt_snap_times = [0.0, SIM_DURATION_S / 2.0, SIM_DURATION_S]
+    _rt_scene, rt_stats_t0 = run_ray_tracing(time_offset_s=_rt_snap_times[0])
+    _, rt_stats_t1          = run_ray_tracing(time_offset_s=_rt_snap_times[1],
+                                              scene=_rt_scene)
+    _, rt_stats_t2          = run_ray_tracing(time_offset_s=_rt_snap_times[2],
+                                              scene=_rt_scene)
+    channel_stats_snapshots = [rt_stats_t0, rt_stats_t1, rt_stats_t2]
+    channel_stats           = rt_stats_t0   # backward-compat reference
+
     # Cached nadir render used as the backdrop for the mobility video.
     # Runs in the same RT TF/Mitsuba session so we don't pay another
     # scene-load cost.  No-op when the cache file already exists.
@@ -303,7 +316,7 @@ def main() -> None:
                           cache_path="output/.walkable_points.pkl")
     timing["RT (Sionna RT)"] = time.perf_counter() - t0
 
-    print(f"\n  Channel stats ({len(channel_stats)} satellites):")
+    print(f"\n  Channel stats snapshot t=0 ({len(channel_stats)} satellites):")
     for s in channel_stats:
         k = s.get("k_factor_db", float("nan"))
         k_str = f"{k:.1f} dB" if not math.isnan(k) else "NLoS"
@@ -337,6 +350,8 @@ def main() -> None:
         channel_stats, scenario="urban",
         snr_thresh_db=fitted_snr_thresh,
         sigmoid_slope=fitted_sigmoid_slope,
+        channel_stats_snapshots=channel_stats_snapshots,
+        snapshot_times=_rt_snap_times,
     )
     timing["NS-3 (4 protocols)"] = time.perf_counter() - t0
 

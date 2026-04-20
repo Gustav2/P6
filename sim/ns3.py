@@ -126,6 +126,11 @@ EventImpl* pythonMakeEvent(void (*f)()) { return MakeEvent(f); }
 
 from config import (
     CARRIER_FREQ_HZ,
+    FFT_SIZE,
+    NUM_OFDM_SYMBOLS,
+    PILOT_SYMBOL_IDX,
+    NUM_BITS_PER_SYMBOL,
+    CODERATE,
     SAT_HEIGHT_M,
     SAT_ORBITAL_VELOCITY_MS,
     SAT_HANDOVER_ELEVATION_DEG,
@@ -169,8 +174,25 @@ from config import (
     CLIENT_PROFILES,
     # Time-series
     TIMESERIES_BUCKET_S,
+    # Burst-fading model
+    FADE_MEAN_DURATION_MS,
 )
 
+# ---------------------------------------------------------------------------
+# Multi-codeword PER correction (C1)
+# 1 LDPC codeword carries FFT_SIZE × data_symbols × QPSK_bits × r info bits.
+# data_symbols = NUM_OFDM_SYMBOLS − len(PILOT_SYMBOL_IDX) = 14 − 2 = 12
+# info_bits = 128 × 12 × 2 × 0.5 = 1536 b = 192 B per codeword.
+# A 1400 B NS-3 packet spans ⌈1400×8 / 1536⌉ = 8 codewords.
+# The sigmoid fit returns per-codeword BLER; packet PER = 1 − (1−BLER)^N_CW.
+_INFO_BITS_PER_CW = int(
+    FFT_SIZE
+    * (NUM_OFDM_SYMBOLS - len(PILOT_SYMBOL_IDX))
+    * NUM_BITS_PER_SYMBOL
+    * CODERATE
+)   # 1536 bits = 192 bytes
+_N_CW_PER_PKT = max(1, math.ceil(PACKET_SIZE_BYTES * 8 / _INFO_BITS_PER_CW))
+# = ⌈11200 / 1536⌉ = 8
 
 # =============================================================================
 # Application-layer KPI helpers (ITU-T G.107 / empirical mappings)
@@ -406,7 +428,8 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
 
     snr_db = (PHONE_EIRP_DBM - fspl_db - atm_loss_db + urban_correction_db
               + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM)
-    per    = 1.0 / (1.0 + math.exp(sigmoid_slope * (snr_db - snr_thresh_db)))
+    bler   = 1.0 / (1.0 + math.exp(sigmoid_slope * (snr_db - snr_thresh_db)))
+    per    = 1.0 - (1.0 - bler) ** _N_CW_PER_PKT
     return float(np.clip(per, 0.0, 0.99))
 
 
@@ -414,10 +437,49 @@ def _rt_calibrated_per(fspl_db: float, rt_mean_gain_db: float,
 # Handover schedule computation
 # =============================================================================
 
+def _interp_channel_stats(sat_id: int, t_mid: float,
+                          snapshots: list, times: list) -> dict | None:
+    """
+    Linearly interpolate per-satellite channel stats at simulation time t_mid.
+
+    Returns None when snapshots is None or the sat_id is absent in a snapshot
+    (caller falls back to the static t=0 stats in that case).
+
+    Only the gain and DS fields are interpolated; non-numeric fields
+    (sat_id, los_exists, sat_x_m/y_m) are taken from the earlier snapshot.
+    """
+    if not snapshots or len(snapshots) < 2:
+        return None
+    t = max(times[0], min(times[-1], t_mid))
+    # Find bracket [i, i+1]
+    idx = 0
+    for i in range(len(times) - 1):
+        if times[i] <= t <= times[i + 1]:
+            idx = i
+            break
+    alpha = (t - times[idx]) / max(times[idx + 1] - times[idx], 1e-9)
+    by_id_a = {s["sat_id"]: s for s in snapshots[idx]}
+    by_id_b = {s["sat_id"]: s for s in snapshots[idx + 1]}
+    a = by_id_a.get(sat_id)
+    b = by_id_b.get(sat_id)
+    if a is None or b is None:
+        return None
+    _lerp = lambda k: a[k] * (1.0 - alpha) + b[k] * alpha
+    return {
+        **a,
+        "normalized_gain_db":  _lerp("normalized_gain_db"),
+        "normalized_p10_db":   _lerp("normalized_p10_db"),
+        "delay_spread_ns":     _lerp("delay_spread_ns"),
+        "k_factor_db":         _lerp("k_factor_db"),
+    }
+
+
 def _compute_handover_schedule(channel_stats: list,
                                 snr_thresh_db: float = None,
                                 sigmoid_slope: float = None,
-                                rng_seed: int = 42) -> list:
+                                rng_seed: int = 42,
+                                channel_stats_snapshots: list = None,
+                                snapshot_times: list = None) -> list:
     """
     Determine the sequence of (satellite_id, start_time, end_time,
     per, delay_ms, interruption_ms) intervals for the simulation duration.
@@ -515,10 +577,18 @@ def _compute_handover_schedule(channel_stats: list,
         t_cursor = t_end
         elev_deg = stat["elevation_deg"]
 
+        # R2 fix: if multi-snapshot stats are available, interpolate the
+        # channel parameters at this slot's midpoint time.
+        t_mid = 0.5 * (t_start + t_end)
+        interp = _interp_channel_stats(
+            stat["sat_id"], t_mid, channel_stats_snapshots, snapshot_times or []
+        )
+        eff_stat = interp if interp is not None else stat
+
         fspl   = _fspl_db(SAT_HEIGHT_M, max(elev_deg, 1.0))
         per    = _rt_calibrated_per(fspl,
-                                    stat.get("normalized_gain_db", float("nan")),
-                                    stat.get("normalized_p10_db"),
+                                    eff_stat.get("normalized_gain_db", float("nan")),
+                                    eff_stat.get("normalized_p10_db"),
                                     ref_gain_db,
                                     snr_thresh_db, sigmoid_slope,
                                     elev_deg=max(elev_deg, 1.0))
@@ -810,7 +880,9 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
 def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
             snr_thresh_db: float = None,
             sigmoid_slope: float = None,
-            sample_positions: bool = False) -> dict:
+            sample_positions: bool = False,
+            channel_stats_snapshots: list = None,
+            snapshot_times: list = None) -> dict:
     """
     Run one full NS-3 5G-NTN simulation with:
       - NUM_STATIONARY_CLIENTS + NUM_MOVING_CLIENTS client phones
@@ -868,6 +940,8 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         channel_stats,
         snr_thresh_db=snr_thresh_db,
         sigmoid_slope=sigmoid_slope,
+        channel_stats_snapshots=channel_stats_snapshots,
+        snapshot_times=snapshot_times,
     )
     print(f"  Handover schedule (EIRP={PHONE_EIRP_DBM:.0f} dBm): {len(schedule)} slot(s)")
     for slot in schedule:
@@ -1196,6 +1270,43 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     devs_svc.Get(1).SetAttribute(
         "ReceiveErrorModel", ns.PointerValue(em_svc))
 
+    # ── N1 fix: burst-correlated fading state machine ─────────────────────────
+    # Shadow fading has a coherence time of ~FADE_MEAN_DURATION_MS.
+    # The plain RateErrorModel drops packets i.i.d., which lets TCP recover
+    # quickly via fast-retransmit.  Real bursty fading triggers RTO.
+    # This state machine models that by clustering losses into exponentially-
+    # distributed burst events rather than independent per-packet coin flips.
+    # The fade entry rate is chosen so that the long-run average PER matches
+    # the link-budget PER: rate_in × fade_mean = PER  →  rate_in = PER / T_fade.
+    _FADE_MEAN_S = FADE_MEAN_DURATION_MS / 1000.0
+    _fade_active = [False]
+    _slot_per    = [first["per"]]   # updated at each handover restore
+
+    def _schedule_next_fade():
+        per_now = _slot_per[0]
+        if per_now < 1e-4:
+            return
+        rate = per_now / _FADE_MEAN_S   # fades per second
+        wait = _random_mod.expovariate(rate)
+        ev   = ns.cppyy.gbl.pythonMakeEvent(_enter_fade)
+        ns.Simulator.Schedule(ns.Seconds(wait), ev)
+
+    def _enter_fade():
+        if _fade_active[0]:
+            return
+        _fade_active[0] = True
+        em_svc.SetAttribute("ErrorRate", ns.DoubleValue(1.0))
+        dur = max(0.005, _random_mod.expovariate(1.0 / _FADE_MEAN_S))
+        ev  = ns.cppyy.gbl.pythonMakeEvent(_exit_fade)
+        ns.Simulator.Schedule(ns.Seconds(dur), ev)
+
+    def _exit_fade():
+        _fade_active[0] = False
+        em_svc.SetAttribute("ErrorRate", ns.DoubleValue(_slot_per[0]))
+        _schedule_next_fade()
+
+    _schedule_next_fade()
+
     ipv4.SetBase(ns.Ipv4Address(_next_subnet()),
                  ns.Ipv4Mask("255.255.255.0"))
     ipv4.Assign(devs_svc)
@@ -1246,11 +1357,14 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         if not handover_queue:
             return
         slot = handover_queue.popleft()
+        _slot_per[0] = slot["per"]   # keep burst-fade state machine in sync
+        _fade_active[0] = False      # end any in-progress fade on the old sat
         em_svc.SetAttribute("ErrorRate", ns.DoubleValue(slot["per"]))
         handover_count[0] += 1
         print(f"  [t={ns.Simulator.Now().GetSeconds():.2f}s] "
               f"Handover restored → sat{slot['sat_id']}  "
               f"PER={slot['per']:.3f}")
+        _schedule_next_fade()        # restart fade scheduling for new satellite
         # Schedule the next handover blackout if one exists
         if handover_queue:
             nxt = handover_queue[0]
@@ -1728,9 +1842,12 @@ def _ns3_parallel_worker(args: tuple) -> dict:
     spawn-context Pool.  Each worker runs in its own process with its
     own NS-3 instance, so there is no shared global state to worry about.
     """
-    scenario, pcfg, channel_stats, snr_thresh_db, sigmoid_slope, sample_positions = args
+    (scenario, pcfg, channel_stats, snr_thresh_db, sigmoid_slope,
+     sample_positions, channel_stats_snapshots, snapshot_times) = args
     return run_ns3(scenario, pcfg, channel_stats, snr_thresh_db, sigmoid_slope,
-                   sample_positions=sample_positions)
+                   sample_positions=sample_positions,
+                   channel_stats_snapshots=channel_stats_snapshots,
+                   snapshot_times=snapshot_times)
 
 
 # =============================================================================
@@ -1740,7 +1857,9 @@ def _ns3_parallel_worker(args: tuple) -> dict:
 def run_ns3_both_topologies(channel_stats: list,
                              scenario: str = "urban",
                              snr_thresh_db: float = None,
-                             sigmoid_slope: float = None) -> tuple:
+                             sigmoid_slope: float = None,
+                             channel_stats_snapshots: list = None,
+                             snapshot_times: list = None) -> tuple:
     """
     Run the NS-3 simulation once per entry in config.PROTOCOLS using the
     topology mode configured in config.USE_BASE_STATIONS, then return the
@@ -1789,7 +1908,8 @@ def run_ns3_both_topologies(channel_stats: list,
     non_quic_cfgs = [pcfg for pcfg in PROTOCOLS if pcfg["protocol"] != "quic"]
     args_list = [
         (scenario, {**common_tcp, **pcfg}, channel_stats,
-         snr_thresh_db, sigmoid_slope, (i == 0))
+         snr_thresh_db, sigmoid_slope, (i == 0),
+         channel_stats_snapshots, snapshot_times)
         for i, pcfg in enumerate(non_quic_cfgs)
     ]
 

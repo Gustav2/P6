@@ -210,6 +210,43 @@ def _tr38811_interp(table: dict, elev_deg: float) -> np.ndarray:
     return np.asarray(table[keys[-1]])
 
 
+def _rt_delay_spread_ns(valid_tau_s: np.ndarray, valid_a: np.ndarray) -> float:
+    """
+    Power-weighted RMS delay spread computed from RT path taps.
+
+    DS = sqrt( E[τ²] − E[τ]² )  where the expectation is weighted by
+    path power |h|².  Returns 0 if all powers are zero.
+    """
+    power = valid_a ** 2
+    p_sum = float(power.sum())
+    if p_sum == 0.0:
+        return 0.0
+    tau_mean = float((power * valid_tau_s).sum()) / p_sum
+    tau_rms  = math.sqrt(float((power * (valid_tau_s - tau_mean) ** 2).sum()) / p_sum)
+    return float(tau_rms * 1e9)   # seconds → nanoseconds
+
+
+def _rt_k_factor_db(valid_a: np.ndarray) -> float:
+    """
+    Rician K-factor estimated from RT path amplitudes.
+
+    K = P_dominant / P_scattered, where P_dominant is the power of the
+    strongest tap (treated as the LOS component) and P_scattered is the
+    sum of all remaining taps.  Clamped to [−10, 20] dB.
+
+    Returns 20 dB for a single-path response (pure LOS by definition).
+    """
+    power = valid_a ** 2
+    if len(power) < 2:
+        return 20.0
+    p_max  = float(power.max())
+    p_scat = float(power.sum()) - p_max
+    if p_scat <= 0.0:
+        return 20.0
+    k_lin = p_max / p_scat
+    return float(np.clip(10.0 * math.log10(k_lin + 1e-60), -10.0, 20.0))
+
+
 def _tr38811_sample_kf_ds(elev_deg: float, los_exists: bool,
                           seed: int) -> tuple:
     """
@@ -301,7 +338,8 @@ def _propagation_delay_ms(height_m: float, elev_deg: float) -> float:
 
 def _satellite_positions(ue_pos: list, height_m: float,
                          n_sats: int, spacing_deg: float,
-                         initial_zenith_deg: float = 0.0) -> list:
+                         initial_zenith_deg: float = 0.0,
+                         time_offset_s: float = 0.0) -> list:
     """
     Generate proxy transmitter positions for N satellites distributed at
     equal angular spacing around the UE in the horizontal plane, each at
@@ -331,13 +369,20 @@ def _satellite_positions(ue_pos: list, height_m: float,
     -------
     list of (x, y, z) tuples, one per satellite proxy.
     """
+    # Advance the initial zenith angle by the orbital motion in time_offset_s.
+    # T_orbit = 2π(R_E + h) / v_orb; ω = 360° / T_orbit.
+    _T_ORBIT_S = (2.0 * math.pi * (6_371_000.0 + height_m)
+                  / SAT_ORBITAL_VELOCITY_MS)
+    _omega_deg_per_s = 360.0 / _T_ORBIT_S   # ≈ 0.063°/s at 550 km
+    effective_initial = initial_zenith_deg + time_offset_s * _omega_deg_per_s
+
     positions = []
     ux, uy, _ = ue_pos
 
     for i in range(n_sats):
         # Zenith angle increases with index; first satellite starts at
-        # initial_zenith_deg so no satellite is placed directly overhead.
-        zenith_deg = initial_zenith_deg + i * spacing_deg
+        # effective_initial (initial_zenith_deg advanced by orbital motion).
+        zenith_deg = effective_initial + i * spacing_deg
         zenith_rad = math.radians(zenith_deg)
 
         # Horizontal distance from UE so that tan(zenith) = horiz / height
@@ -466,22 +511,12 @@ def _extract_channel_stats(paths, sat_id: int,
     # inter-satellite urban corrections.
     normalized_gain_db = round(mean_gain_db + pfspl, 2)
 
-    # Hybrid 3GPP channel statistics.  Shoot-and-bounce ray tracing cannot
-    # resolve urban multipath at 550 km TX altitude (the Munich scene
-    # subtends < 0.1°), and a street-level UE is usually blocked to most
-    # satellites, so RT alone would wrongly classify every satellite as
-    # NLoS.  Instead we use TR 38.811 Table 6.6.1-1 P_LoS to draw the
-    # LoS/NLoS state per (satellite, UE) pair, then sample K-factor and
-    # RMS delay spread from the matching Table 6.7.2-1 log-normal
-    # distribution.  This is the standards-compliant approach from 3GPP:
-    # all three tables are calibrated against real satellite-to-urban
-    # measurement campaigns.
-    _seed      = sat_id * 97 + ue_idx
-    los_rng    = np.random.default_rng(_seed ^ 0xA5A5)
-    p_los      = _tr38811_p_los(elev_deg)
-    los_exists = bool(los_rng.random() < p_los)
-    k_factor_db, delay_spread_ns = _tr38811_sample_kf_ds(
-        elev_deg, los_exists=los_exists, seed=_seed)
+    # R1 fix: compute delay spread and K-factor directly from the RT paths.
+    # valid_tau (seconds) and valid_a (|h| linear) are already extracted above.
+    # K > 0 dB (dominant tap > scattered sum) is taken as the LOS indicator.
+    delay_spread_ns = _rt_delay_spread_ns(valid_tau, valid_a)
+    k_factor_db     = _rt_k_factor_db(valid_a)
+    los_exists      = (k_factor_db > 0.0)
 
     return dict(
         sat_id             = sat_id,
@@ -492,7 +527,7 @@ def _extract_channel_stats(paths, sat_id: int,
         delay_spread_ns    = round(delay_spread_ns, 2),
         num_paths          = num_paths,
         los_exists         = los_exists,
-        k_factor_db        = k_factor_db,
+        k_factor_db        = round(k_factor_db, 2),
         sat_x_m            = round(sat_pos[0], 1),
         sat_y_m            = round(sat_pos[1], 1),
     )
@@ -698,57 +733,60 @@ def _trace_satellite(scene, sat_id: int, sat_pos: tuple,
 # Public entry point
 # =============================================================================
 
-def run_ray_tracing() -> list:
+def run_ray_tracing(time_offset_s: float = 0.0,
+                    scene=None) -> tuple:
     """
-    Execute the full Sionna RT ray tracing pipeline:
-
-    1. Load the Munich scene and place the UE receiver.
-    2. For each satellite in the constellation snapshot:
-       a. Compute its proxy position and elevation angle to the UE.
-       b. Run PathSolver (LoS + specular reflections + refractions).
-       c. Extract service-link channel statistics across sampled UEs.
+    Execute the Sionna RT pipeline for one time snapshot.
 
     Parameters
     ----------
-    None — all settings come from config.py.
+    time_offset_s : float
+        Seconds from t=0 to advance the satellite constellation.
+        Each satellite's zenith angle increases by time_offset_s × ω
+        where ω ≈ 0.063°/s (orbital angular rate at 550 km).
+        Default 0 gives the t=0 snapshot (same as original behaviour).
+    scene : Sionna RT Scene or None
+        Pre-loaded scene object.  When supplied the scene-load step is
+        skipped; pass the value returned by a previous call to amortise
+        the scene-load cost across multiple time snapshots.
 
     Returns
     -------
-    channel_stats : list[dict]
-        One dict per satellite (in order of simulation index).
-         Keys: sat_id, elevation_deg, mean_path_gain_db,
-               mean_path_gain_p10_db, delay_spread_ns, num_paths,
-               los_exists, sat_x_m, sat_y_m, sampled_ues.
-        This list is passed directly to ntn_ns3.run_ns3() so that the
-        NS-3 link budget uses RT-informed channel parameters.
+    (scene, channel_stats) : (Scene, list[dict])
+        scene         — Sionna RT Scene (reuse for subsequent calls).
+        channel_stats — one dict per satellite; same keys as before.
     """
-    print(f"\n[Sionna RT]  5G-NTN '{RT_SCENE_NAME}' scene — satellite constellation pass")
-    print(f"  Mitsuba variant: {mi.variant()}")
-    print(f"  Frequency      : {RT_SCENE_FREQ_HZ/1e9:.2f} GHz")
-    print(f"  UE samples     : {len(RT_UE_SAMPLE_POSITIONS)} points (multi-RX single scene)")
-    print(f"  Primary UE     : {RT_UE_POSITION} m")
-    print(f"  Proxy altitude : {RT_SAT_SCENE_HEIGHT_M} m")
+    ue_samples = RT_UE_SAMPLE_POSITIONS if RT_UE_SAMPLE_POSITIONS else [RT_UE_POSITION]
+
+    if scene is None:
+        print(f"\n[Sionna RT]  5G-NTN '{RT_SCENE_NAME}' scene — satellite constellation pass")
+        print(f"  Mitsuba variant: {mi.variant()}")
+        print(f"  Frequency      : {RT_SCENE_FREQ_HZ/1e9:.2f} GHz")
+        print(f"  UE samples     : {len(ue_samples)} points (multi-RX single scene)")
+        print(f"  Primary UE     : {RT_UE_POSITION} m")
+        print(f"  Proxy altitude : {RT_SAT_SCENE_HEIGHT_M} m")
+        # ── Load ONE scene with all UE receivers ──────────────────────────────
+        # Loading a single shared scene and adding all UE positions as named
+        # receivers lets PathSolver trace all (TX, RX) pairs in a single GPU
+        # kernel launch, cutting solver calls from N_ue × N_sats → 1 × N_sats.
+        scene, _receivers = _load_scene_with_ues(ue_samples)
+    else:
+        print(f"\n[Sionna RT]  Reusing loaded scene  (t_offset={time_offset_s:.1f} s)")
+
     print(f"  Satellites     : {NUM_SATELLITES}  "
-          f"(initial zenith {RT_SAT_INITIAL_ZENITH_DEG}°, "
+          f"(initial zenith {RT_SAT_INITIAL_ZENITH_DEG}°"
+          f" + {time_offset_s:.1f}s orbital advance, "
           f"spacing {SAT_SPACING_DEG}° per step)\n")
 
-    # ── Build satellite proxy positions ───────────────────────────────────────
+    # ── Build satellite proxy positions for this time snapshot ────────────────
     sat_positions = _satellite_positions(
         ue_pos             = RT_UE_POSITION,
         height_m           = RT_SAT_SCENE_HEIGHT_M,
         n_sats             = NUM_SATELLITES,
         spacing_deg        = SAT_SPACING_DEG,
         initial_zenith_deg = RT_SAT_INITIAL_ZENITH_DEG,
+        time_offset_s      = time_offset_s,
     )
-
-    # ── Load ONE scene with all UE receivers ──────────────────────────────────
-    # Previously the code loaded N separate scenes (one per UE) and called
-    # PathSolver N times per satellite.  Loading a single shared scene and
-    # adding all UE positions as named receivers (ue0…ueN) lets PathSolver
-    # trace all (TX, RX) pairs in a single GPU kernel launch, cutting the
-    # number of solver calls from N_ue × N_sats → 1 × N_sats.
-    ue_samples = RT_UE_SAMPLE_POSITIONS if RT_UE_SAMPLE_POSITIONS else [RT_UE_POSITION]
-    scene, _receivers = _load_scene_with_ues(ue_samples)
 
     all_stats = []
 
@@ -780,7 +818,7 @@ def run_ray_tracing() -> list:
               f"K={k_str}")
 
     print(f"\n  Ray tracing complete.  {len(all_stats)} satellite snapshots computed.\n")
-    return all_stats
+    return scene, all_stats
 
 
 # =============================================================================
