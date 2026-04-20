@@ -108,6 +108,12 @@ from config import (
     SIM_DURATION_S,
     RT_SNAPSHOT_INTERVAL_S,
     SIM_SCENARIO,
+    SIM_SEED,
+    SIM_RUN,
+    TRANSPORT_COMPARE_MODE,
+    QUIC_IS_ANALYTICAL,
+    PHY_REALISM_MODE,
+    RESIDUAL_DOPPLER_HZ_STD,
 )
 from sim.phy           import run_sionna_ber
 from sim.ray_tracing   import run_ray_tracing, render_scene_background, build_walkable_points
@@ -186,6 +192,10 @@ def main() -> None:
     print(f"  TF threads      : {_n_cores} cores")
     print(f"  Scenario        : {SIM_SCENARIO}  "
           f"(outputs -> {OUTPUT_DIR}/)")
+    print(f"  Seed / run      : seed={SIM_SEED}  run={SIM_RUN}")
+    print(f"  Compare mode    : {TRANSPORT_COMPARE_MODE}")
+    print(f"  QUIC model      : {'analytical' if QUIC_IS_ANALYTICAL else 'packet-level'}")
+    print(f"  PHY realism     : {PHY_REALISM_MODE}  (residual Doppler std={RESIDUAL_DOPPLER_HZ_STD:.1f} Hz)")
     print("=" * 70)
 
     t_start = time.perf_counter()
@@ -293,9 +303,9 @@ def main() -> None:
     # Run RT at evenly-spaced time snapshots and interpolate per-slot stats.
     # Scene is loaded once on the first call and reused; subsequent calls
     # only re-run PathSolver with the updated satellite positions.
-    # Orbital advance ≈ 0.063°/s → RT_SNAPSHOT_INTERVAL_S = 30 s gives
-    # ≈ 1.9° per interval over the full SIM_DURATION_S = 300 s window
-    # (11 snapshots, ~18.9° total advance).
+    # Orbital advance ≈ 0.063°/s → RT_SNAPSHOT_INTERVAL_S = 15 s gives
+    # ≈ 0.95° per interval over the full SIM_DURATION_S = 300 s window
+    # (21 snapshots, ~18.9° total advance).
     t0 = time.perf_counter()
     _rt_snap_times = list(np.arange(0.0, SIM_DURATION_S + 1e-9,
                                     RT_SNAPSHOT_INTERVAL_S))

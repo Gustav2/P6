@@ -21,6 +21,7 @@ PROTO_COLORS = {
     "TCP CUBIC":   "#2ca02c",
     "TCP BBR":     "#ff7f0e",
     "QUIC":        "#9467bd",
+    "QUIC (analytical)": "#9467bd",
 }
 
 # Fallback for any unlisted label

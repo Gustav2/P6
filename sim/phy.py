@@ -45,6 +45,8 @@ from config import (
     SAT_HEIGHT_M,
     ELEVATION_ANGLE_DEG,
     SAT_ORBITAL_VELOCITY_MS,
+    PHY_REALISM_MODE,
+    RESIDUAL_DOPPLER_HZ_STD,
 )
 
 
@@ -143,7 +145,7 @@ class NTNOFDMModel(Block):
             channel_model=channel_model,
             resource_grid=self._rg,
             add_awgn=True,
-            normalize_channel=True,
+            normalize_channel=(PHY_REALISM_MODE == "normalized"),
             return_channel=True,
         )
 
@@ -212,7 +214,7 @@ def run_sionna_ber(snr_db_range: np.ndarray, scenario: str):
     )
     ut_orientations = tf.zeros([BATCH_SIZE, 1, 3], dtype=tf.float32)
     bs_orientations = tf.zeros([BATCH_SIZE, 1, 3], dtype=tf.float32)
-    # Velocity: set to zero to model NTN-capable UEs with Doppler pre-compensation.
+    # Velocity: post-compensation residual Doppler model.
     # 3GPP TR 38.821 §6.1.2 mandates that NTN UEs pre-compensate the LEO satellite
     # Doppler shift (up to ±50.7 kHz at 2 GHz) before the OFDM demodulator.
     # Without pre-compensation, the 7612 m/s orbital velocity produces a Doppler
@@ -220,7 +222,13 @@ def run_sionna_ber(snr_db_range: np.ndarray, scenario: str):
     # Setting ut_velocities = 0 models a UE that has pre-compensated Doppler;
     # the channel statistics (delay spread, shadow fading) still reflect the NTN
     # environment per TR 38.811.
-    ut_velocities   = tf.zeros([BATCH_SIZE, 1, 3], dtype=tf.float32)
+    if RESIDUAL_DOPPLER_HZ_STD > 0.0:
+        residual_v_std = RESIDUAL_DOPPLER_HZ_STD * 3e8 / CARRIER_FREQ_HZ
+    else:
+        residual_v_std = 0.0
+    ut_velocities   = tf.random.normal(
+        [BATCH_SIZE, 1, 3], mean=0.0, stddev=residual_v_std, dtype=tf.float32
+    )
     in_state        = tf.zeros([BATCH_SIZE, 1], dtype=tf.bool)
 
     ch_model.set_topology(

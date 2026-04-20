@@ -249,6 +249,11 @@ def draw_empirical_validation(ns3_results: list,
     ax4.grid(axis="y", alpha=0.3)
 
     # ── Figure-level title and caption ────────────────────────────────────────
+    if any(r.get("is_analytical", False) for r in ns3_results):
+        fig.text(0.5, 0.985,
+                 "Note: QUIC is analytical (post-processed), not packet-level NS-3.",
+                 ha="center", fontsize=8.5, color="#b71c1c")
+
     fig.suptitle("NTN Simulation — Empirical Real-World Validation",
                  fontsize=13, weight="bold", y=0.995)
     fig.text(0.5, 0.01,

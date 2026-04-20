@@ -24,11 +24,11 @@ def draw_handover_impact(ns3_results: list,
                           out: str = "output/ntn_handover_impact.png") -> str:
     """
     Per-slot throughput bar chart showing the impact of satellite handovers
-    on each protocol.  The high-PER slot illustrates TCP congestion collapse
-    vs QUIC resilience.
+    on each protocol.
 
-    The per-slot throughput is reconstructed analytically from the aggregate
-    NS-3 FlowMonitor result by distributing proportionally to (1-PER) per slot.
+    The per-slot throughput is reconstructed from aggregate throughput by
+    distributing proportionally to (1-PER) per slot; this is an estimate,
+    not a directly measured slot-throughput trace.
 
     Parameters
     ----------
@@ -62,7 +62,6 @@ def draw_handover_impact(ns3_results: list,
         weights = weights / weights.sum()
         return agg_kbps * weights * n_slots
 
-    rng = np.random.default_rng(99)
     slot_labels = []
     for s in schedule:
         lbl = s.get("label") or f"Sat {s['sat_id']}"
@@ -74,14 +73,12 @@ def draw_handover_impact(ns3_results: list,
     fig, ax = plt.subplots(figsize=(10, 5))
     fig.suptitle(
         "Per-Slot Throughput — Handover Impact on Each Protocol\n"
-        "High-PER slot shows TCP congestion collapse vs QUIC resilience",
+        "Reconstructed estimate from aggregate throughput and slot PER",
         fontsize=10,
     )
 
     for pi, r in enumerate(ns3_results):
         slot_tput = _per_slot_tput(r["throughput_kbps"], schedule)
-        noise     = rng.normal(0, slot_tput * 0.03 + 0.5)
-        slot_tput = np.clip(slot_tput + noise, 0, None)
         offset    = (pi - n_protos / 2 + 0.5) * bar_w
         ax.bar(x_base + offset, slot_tput, bar_w,
                color=_proto_color(r["label"], pi),

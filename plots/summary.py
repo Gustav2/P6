@@ -52,42 +52,46 @@ def draw_validation_summary(ns3_results: list,
         print("[ValidationSummary]  No NS-3 results — skipping.")
         return out
 
+    packet_level_results = [r for r in ns3_results if not r.get("is_analytical", False)]
+    if not packet_level_results:
+        packet_level_results = list(ns3_results)
+
     # ── Aggregate KPIs across protocols ───────────────────────────────────────
-    throughputs_kbps = [r.get("throughput_kbps", 0.0) for r in ns3_results]
+    throughputs_kbps = [r.get("throughput_kbps", 0.0) for r in packet_level_results]
     median_tput_mbps = _median(throughputs_kbps) / 1e3
     shannon_ceiling_mbps = SERVICE_LINK_RATE_MBPS
     tput_efficiency_pct = (100.0 * median_tput_mbps / shannon_ceiling_mbps
                            if shannon_ceiling_mbps > 0 else 0.0)
 
-    latencies_ms = [r.get("mean_delay_ms", 0.0) for r in ns3_results
+    latencies_ms = [r.get("mean_delay_ms", 0.0) for r in packet_level_results
                     if r.get("mean_delay_ms", 0.0) > 0]
     median_latency_ms = _median(latencies_ms)
 
-    losses_pct = [r.get("loss_pct", 0.0) for r in ns3_results]
+    losses_pct = [r.get("loss_pct", 0.0) for r in packet_level_results]
     median_loss_pct = _median(losses_pct)
 
-    fairness_vals = [r.get("fairness_index", 0.0) for r in ns3_results]
+    fairness_vals = [r.get("fairness_index", 0.0) for r in packet_level_results]
     median_fairness = _median(fairness_vals)
 
-    ho_success_rates = [r.get("handover_success_rate", 1.0) for r in ns3_results]
+    ho_success_rates = [r.get("handover_success_rate", 1.0) for r in packet_level_results]
     worst_ho_success = min(ho_success_rates) if ho_success_rates else 1.0
 
-    rebuffer_pcts = [r.get("rebuffer_ratio_pct", 0.0) for r in ns3_results]
+    rebuffer_pcts = [r.get("rebuffer_ratio_pct", 0.0) for r in packet_level_results]
     worst_rebuffer = max(rebuffer_pcts) if rebuffer_pcts else 0.0
 
-    psnrs = [r.get("stream_psnr_db", 0.0) for r in ns3_results
+    psnrs = [r.get("stream_psnr_db", 0.0) for r in packet_level_results
              if r.get("stream_psnr_db", 0.0) > 0]
     worst_psnr = min(psnrs) if psnrs else 0.0
 
-    gaming_latencies = [r.get("gaming_latency_ms") for r in ns3_results
+    gaming_latencies = [r.get("gaming_latency_ms") for r in packet_level_results
                         if r.get("gaming_latency_ms") is not None]
     worst_gaming_latency = (max(gaming_latencies) if gaming_latencies
                             else float("nan"))
 
-    mos_vals = [r.get("voice_mos", 0.0) for r in ns3_results]
+    mos_vals = [r.get("voice_mos", 0.0) for r in packet_level_results]
     worst_mos = min(mos_vals) if mos_vals else 0.0
 
-    overhead_vals = [r.get("protocol_overhead_pct", 0.0) for r in ns3_results]
+    overhead_vals = [r.get("protocol_overhead_pct", 0.0) for r in packet_level_results]
     max_overhead = max(overhead_vals) if overhead_vals else 0.0
 
     # Cross-layer R²: recompute from channel_stats + schedule

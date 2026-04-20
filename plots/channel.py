@@ -193,7 +193,7 @@ def draw_link_budget_waterfall(channel_stats: list,
 # =============================================================================
 
 def draw_snr_vs_elevation(channel_stats: list,
-                           out: str = "output/ntn_snr_vs_elevation.png") -> str:
+                            out: str = "output/ntn_snr_vs_elevation.png") -> str:
     """
     Plot SNR vs elevation angle (0–90°) for phone EIRP,
     with the PER sigmoid on a right y-axis.
@@ -208,7 +208,8 @@ def draw_snr_vs_elevation(channel_stats: list,
     -------
     str  Path of the saved figure.
     """
-    from config import PHONE_EIRP_DBM, SAT_HEIGHT_M, SAT_RX_ANTENNA_GAIN_DB, NOISE_FLOOR_DBM
+    from config import (PHONE_EIRP_DBM, SAT_HEIGHT_M, SAT_RX_ANTENNA_GAIN_DB,
+                        NOISE_FLOOR_DBM, SNR_THRESH_DB, SIGMOID_SLOPE)
     from sim.ns3 import _fspl_db as _ns3_fspl_db, _rt_calibrated_per
 
     # Slot color constants — used by draw_snr_vs_elevation and draw_handover_impact
@@ -221,9 +222,22 @@ def draw_snr_vs_elevation(channel_stats: list,
         fspl = np.array([_ns3_fspl_db(SAT_HEIGHT_M, e) for e in elev])
         return eirp_dbm - fspl + SAT_RX_ANTENNA_GAIN_DB - NOISE_FLOOR_DBM
 
+    # Reference normalized gain baseline for PER plotting
+    valid_norm = [s.get("normalized_gain_db", float("nan")) for s in channel_stats
+                  if not math.isnan(s.get("normalized_gain_db", float("nan")))]
+    ref_gain = max(valid_norm) if valid_norm else None
+
     def _per_curve(eirp_dbm):
         return np.array([
-            _rt_calibrated_per(_ns3_fspl_db(SAT_HEIGHT_M, e), -100.0, None, None, eirp_dbm)
+            _rt_calibrated_per(
+                _ns3_fspl_db(SAT_HEIGHT_M, e),
+                rt_mean_gain_db=(ref_gain if ref_gain is not None else float("nan")),
+                rt_gain_p10_db=None,
+                rt_ref_gain_db=ref_gain,
+                snr_thresh_db=SNR_THRESH_DB,
+                sigmoid_slope=SIGMOID_SLOPE,
+                elev_deg=e,
+            )
             for e in elev
         ])
 

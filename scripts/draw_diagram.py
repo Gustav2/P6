@@ -264,18 +264,18 @@ ax.text(PNL_X, 9.55, "Key parameters",
 
 params = [
     ("Orbit altitude",      "550 km  (Starlink Shell 1)"),
-    ("Carrier frequency",   "3.5 GHz  (5G NR  n78)"),
+    ("Carrier frequency",   "2.0 GHz  (5G NR  n255, S-band NTN)"),
     ("Satellite speed",     "7612 m/s  |  constellation: 3 sats"),
-    ("Clients",             "3 stationary + 2 moving"),
+    ("Clients",             "30 stationary + 20 moving"),
     ("Mobility model",      "RandomWaypoint  1–5 m/s  within 500 m"),
     ("Phone EIRP",          "23 dBm  (UE Power Class 3)"),
-    ("Sim duration",        "60 s  |  2 handovers  (t=13.8 s, t=45.6 s)"),
-    ("Service link rate",   "10 Mbps  (bottleneck)"),
+    ("Sim duration",        "300 s  |  multi-slot handovers"),
+    ("Service link rate",   "20 Mbps  (bottleneck)"),
     ("ISL rate",            "1 Gbps  |  5 ms  |  PER 10⁻⁴"),
     ("Feeder link",         "Ka-band 26.5 GHz  |  ~3500 Mbps"),
     ("Backhaul",            "1 Gbps fibre  |  10 ms"),
     ("Channel model",       "Sionna RT path gains → PER sigmoid"),
-    ("QUIC",                "Emulated: BBR + RFC 9000/9002 deltas"),
+    ("QUIC",                "Analytical: BBR + RFC 9000/9002 deltas"),
 ]
 for j, (k, v) in enumerate(params):
     yy = 9.05 - j * 0.50

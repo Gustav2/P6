@@ -5,6 +5,19 @@ config/network.py — NS-3 / protocols / clients / traffic parameters
 import os
 
 # =============================================================================
+# Reproducibility controls
+# =============================================================================
+
+SIM_SEED = int(os.environ.get("SIM_SEED", "42"))
+"""Global deterministic seed used by Python/NumPy/NS-3 RNGs."""
+
+SIM_RUN = int(os.environ.get("SIM_RUN", "1"))
+"""NS-3 run index (RngRun) for controlled multi-run sweeps."""
+
+PY_RANDOM_SEED = SIM_SEED
+"""Seed for Python's random module in simulation helpers."""
+
+# =============================================================================
 # Scenario selector
 # =============================================================================
 #
@@ -97,6 +110,42 @@ Application-layer target data rate for UDP CBR traffic [NS-3 string].
 - TCP (BulkSend) always attempts to fill the pipe; this value is ignored
   for TCP runs.
 - Format: "<number><unit>" where unit is bps / kbps / Mbps / Gbps.
+"""
+
+TRANSPORT_COMPARE_MODE = os.environ.get(
+    "TRANSPORT_COMPARE_MODE", "matched_offered_load"
+).strip().lower()
+"""
+Transport comparison mode.
+
+- "matched_offered_load" (default): all protocols use equivalent offered-load
+  traffic generators per profile (rate-controlled OnOff), so differences are
+  attributable to transport behavior rather than load mismatch.
+- "legacy_mixed_apps": preserve historical app selection (UDP profiles via
+  OnOff, bulk via TCP BulkSend in TCP runs).
+"""
+
+if TRANSPORT_COMPARE_MODE not in ("matched_offered_load", "legacy_mixed_apps"):
+    raise ValueError(
+        f"TRANSPORT_COMPARE_MODE={TRANSPORT_COMPARE_MODE!r} not recognised; "
+        "expected 'matched_offered_load' or 'legacy_mixed_apps'"
+    )
+
+# Matched offered-load rates used when TRANSPORT_COMPARE_MODE is enabled.
+# This table is intentionally explicit so protocol parity is reproducible.
+MATCHED_PROFILE_DATA_RATES = {
+    "streaming": "1.5Mbps",
+    "gaming": "120kbps",
+    "texting": "30kbps",
+    "voice": "32kbps",
+    "bulk": "1.5Mbps",
+}
+"""Per-profile offered-load rates for matched-transport comparisons."""
+
+QUIC_IS_ANALYTICAL = True
+"""
+Marks QUIC results as analytical post-processed estimates over a TCP BBR
+baseline (not packet-level QUIC stack simulation).
 """
 
 PACKET_SIZE_BYTES = 1400
@@ -515,6 +564,12 @@ It covers worst-case BFD timer expiry + congested RACH + slow RRC path
 switch under high orbital Doppler and multipath uncertainty.
 Source: 3GPP TR 38.821 §6.2.2 (NTN realistic range 50–300 ms).
         3GPP TS 38.321 §5.17 (BFD max 200 ms; RACH + CHO add remainder).
+"""
+
+HANDOVER_PHASE_JITTER_MS = 5.0
+"""
+Uniform random jitter magnitude [ms] applied independently to BFD, RACH,
+and CHO phase durations when building handover interruption events.
 """
 
 FADE_MEAN_DURATION_MS = 80.0

@@ -164,13 +164,24 @@ from config import (
     # Beam management
     HANDOVER_INTERRUPTION_MS_MIN,
     HANDOVER_INTERRUPTION_MS_MAX,
+    BEAM_FAILURE_DETECTION_MS,
+    RANDOM_ACCESS_DELAY_MS,
+    CONDITIONAL_HO_PREP_MS,
+    HANDOVER_PHASE_JITTER_MS,
     # Traffic profiles
     TRAFFIC_PROFILES,
     CLIENT_PROFILES,
+    TRANSPORT_COMPARE_MODE,
+    MATCHED_PROFILE_DATA_RATES,
+    QUIC_IS_ANALYTICAL,
     # Time-series
     TIMESERIES_BUCKET_S,
     # Burst-fading model
     FADE_MEAN_DURATION_MS,
+    # Reproducibility
+    SIM_SEED,
+    SIM_RUN,
+    PY_RANDOM_SEED,
 )
 
 # ---------------------------------------------------------------------------
@@ -466,6 +477,8 @@ def _interp_channel_stats(sat_id: int, t_mid: float,
     b = by_id_b.get(sat_id)
     if a is None or b is None:
         return None
+    def _getv(d, k, default=float("nan")):
+        return d[k] if k in d else default
     def _safe_lerp(va, vb):
         # NaN guard: when num_paths==0 a gain field is NaN; prefer the finite side.
         if math.isnan(va): return vb
@@ -473,10 +486,16 @@ def _interp_channel_stats(sat_id: int, t_mid: float,
         return va * (1.0 - alpha) + vb * alpha
     return {
         **a,
-        "normalized_gain_db":  _safe_lerp(a["normalized_gain_db"],  b["normalized_gain_db"]),
-        "normalized_p10_db":   _safe_lerp(a["normalized_p10_db"],   b["normalized_p10_db"]),
-        "delay_spread_ns":     _safe_lerp(a["delay_spread_ns"],     b["delay_spread_ns"]),
-        "k_factor_db":         _safe_lerp(a["k_factor_db"],         b["k_factor_db"]),
+        "elevation_deg":      _safe_lerp(float(_getv(a, "elevation_deg", 0.0)),
+                                          float(_getv(b, "elevation_deg", 0.0))),
+        "normalized_gain_db": _safe_lerp(float(_getv(a, "normalized_gain_db")),
+                                          float(_getv(b, "normalized_gain_db"))),
+        "normalized_p10_db":  _safe_lerp(float(_getv(a, "normalized_p10_db")),
+                                          float(_getv(b, "normalized_p10_db"))),
+        "delay_spread_ns":    _safe_lerp(float(_getv(a, "delay_spread_ns", 0.0)),
+                                          float(_getv(b, "delay_spread_ns", 0.0))),
+        "k_factor_db":        _safe_lerp(float(_getv(a, "k_factor_db")),
+                                          float(_getv(b, "k_factor_db"))),
     }
 
 
@@ -527,6 +546,12 @@ def _compute_handover_schedule(channel_stats: list,
                                  Zero for the first slot (no incoming HO).
     """
     rng = _random_mod.Random(rng_seed)
+
+    def _phase_duration_ms(base_ms: float) -> float:
+        j = HANDOVER_PHASE_JITTER_MS
+        if j <= 0.0:
+            return max(base_ms, 0.0)
+        return max(base_ms + rng.uniform(-j, j), 0.0)
 
     # Sort by elevation, descending (highest elevation served first)
     sorted_stats = sorted(channel_stats, key=lambda s: s["elevation_deg"],
@@ -590,36 +615,48 @@ def _compute_handover_schedule(channel_stats: list,
             stat["sat_id"], t_mid, channel_stats_snapshots, snapshot_times or []
         )
         eff_stat = interp if interp is not None else stat
+        elev_eff = float(eff_stat.get("elevation_deg", elev_deg))
 
-        fspl   = _fspl_db(SAT_HEIGHT_M, max(elev_deg, 1.0))
+        fspl   = _fspl_db(SAT_HEIGHT_M, max(elev_eff, 1.0))
         per    = _rt_calibrated_per(fspl,
                                     eff_stat.get("normalized_gain_db", float("nan")),
                                     eff_stat.get("normalized_p10_db"),
                                     ref_gain_db,
                                     snr_thresh_db, sigmoid_slope,
-                                    elev_deg=max(elev_deg, 1.0))
-        delay  = _one_way_delay_ms(SAT_HEIGHT_M, max(elev_deg, 1.0))
+                                    elev_deg=max(elev_eff, 1.0))
+        delay  = _one_way_delay_ms(SAT_HEIGHT_M, max(elev_eff, 1.0))
 
         # Capture atmospheric / rain / scintillation components for reporting
-        rain_db  = _itu_p618_rain_fade_db(max(elev_deg, 1.0))
-        scint_db = _itu_p618_scintillation_db(max(elev_deg, 1.0))
+        rain_db  = _itu_p618_rain_fade_db(max(elev_eff, 1.0))
+        scint_db = _itu_p618_scintillation_db(max(elev_eff, 1.0))
 
-        # Beam interruption gap: zero for the first slot (no incoming HO),
-        # random draw for subsequent slots per 3GPP TS 38.300 §10.1.2.3.
+        # Beam interruption: zero for first slot. For subsequent slots,
+        # model BFD + RACH + CHO phase durations with small jitter.
         if i == 0:
             gap_ms = 0.0
+            bfd_ms = 0.0
+            rach_ms = 0.0
+            cho_ms = 0.0
         else:
-            gap_ms = rng.uniform(HANDOVER_INTERRUPTION_MS_MIN,
-                                 HANDOVER_INTERRUPTION_MS_MAX)
+            bfd_ms = _phase_duration_ms(BEAM_FAILURE_DETECTION_MS)
+            rach_ms = _phase_duration_ms(RANDOM_ACCESS_DELAY_MS)
+            cho_ms = _phase_duration_ms(CONDITIONAL_HO_PREP_MS)
+            gap_ms = bfd_ms + rach_ms + cho_ms
+            gap_ms = float(np.clip(gap_ms,
+                                   HANDOVER_INTERRUPTION_MS_MIN,
+                                   HANDOVER_INTERRUPTION_MS_MAX))
 
         schedule.append(dict(
             sat_id         = stat["sat_id"],
             t_start        = round(t_start, 3),
             t_end          = round(t_end, 3),
-            elev_deg       = elev_deg,
+            elev_deg       = round(elev_eff, 2),
             per            = round(per, 4),
             delay_ms       = round(delay, 2),
             interruption_ms = round(gap_ms, 1),
+            bfd_ms         = round(bfd_ms, 1),
+            rach_ms        = round(rach_ms, 1),
+            cho_ms         = round(cho_ms, 1),
             rain_fade_db   = round(rain_db, 3),
             scint_db       = round(scint_db, 3),
             atm_gaseous_db = round(ATMO_GASEOUS_DB, 2),
@@ -767,7 +804,8 @@ def _apply_quic_corrections(bbr_result: dict, schedule: list,
     import copy
     result = copy.deepcopy(bbr_result)
     result["protocol"] = "quic"
-    result["label"]    = "QUIC"
+    result["label"]    = "QUIC (analytical)" if QUIC_IS_ANALYTICAL else "QUIC"
+    result["is_analytical"] = bool(QUIC_IS_ANALYTICAL)
 
     # If BBR got zero throughput the link is effectively dead (e.g. direct
     # topology with phone EIRP is too weak).  QUIC cannot overcome a
@@ -928,6 +966,12 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     import collections
     import math as _math
 
+    # Global reproducibility controls
+    _random_mod.seed(PY_RANDOM_SEED)
+    np.random.seed(SIM_SEED)
+    ns.RngSeedManager.SetSeed(SIM_SEED)
+    ns.RngSeedManager.SetRun(SIM_RUN)
+
     proto     = protocol_cfg["protocol"]
     label     = protocol_cfg.get("label", proto.upper())
     ns3_proto = "udp" if proto == "quic" else proto
@@ -1009,7 +1053,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     # cell; moving phones walk a RandomWaypoint path through a LOCAL subset
     # of walkable cells to reduce the chance of straight-line segments
     # cutting through buildings.
-    _rng = _random_mod.Random(42)
+    _rng = _random_mod.Random(PY_RANDOM_SEED)
 
     _walkable_pts = []
     _walkable_path = "output/.walkable_points.pkl"
@@ -1285,6 +1329,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     # The fade entry rate is chosen so that the long-run average PER matches
     # the link-budget PER: rate_in × fade_mean = PER  →  rate_in = PER / T_fade.
     _FADE_MEAN_S = FADE_MEAN_DURATION_MS / 1000.0
+    _fade_rng = _random_mod.Random(PY_RANDOM_SEED + 17)
     _fade_active = [False]
     _slot_per    = [first["per"]]   # updated at each handover restore
 
@@ -1293,7 +1338,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         if per_now < 1e-4:
             return
         rate = per_now / _FADE_MEAN_S   # fades per second
-        wait = _random_mod.expovariate(rate)
+        wait = _fade_rng.expovariate(rate)
         ev   = ns.cppyy.gbl.pythonMakeEvent(_enter_fade)
         ns.Simulator.Schedule(ns.Seconds(wait), ev)
 
@@ -1302,7 +1347,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
             return
         _fade_active[0] = True
         em_svc.SetAttribute("ErrorRate", ns.DoubleValue(1.0))
-        dur = max(0.005, _random_mod.expovariate(1.0 / _FADE_MEAN_S))
+        dur = max(0.005, _fade_rng.expovariate(1.0 / _FADE_MEAN_S))
         ev  = ns.cppyy.gbl.pythonMakeEvent(_exit_fade)
         ns.Simulator.Schedule(ns.Seconds(dur), ev)
 
@@ -1387,78 +1432,76 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
             ns.Simulator.Schedule(ns.Seconds(first_ho["t_start"]), ev)
 
     # =========================================================================
-    # Application layer — mixed traffic profiles
+    # Application layer — transport comparison modes
     # =========================================================================
-    port        = 9
-    server_addr = ns.InetSocketAddress(iface_srv.GetAddress(1), port)
+    base_port = 9000
+    profile_names = list(TRAFFIC_PROFILES.keys())
+    profile_ports = {p: base_port + i for i, p in enumerate(profile_names)}
 
     # Compute per-flow MaxBytes for TCP BulkSend
-    max_bytes = 0  # unlimited (for UDP; ignored)
+    max_bytes = 0
     if DATA_VOLUME_MB > 0:
         max_bytes = int(DATA_VOLUME_MB * 1_000_000)
 
-    # Install per-client applications according to CLIENT_PROFILES.
-    # streaming / gaming / texting / voice → OnOffHelper (UDP CBR)
-    # bulk                 → BulkSendHelper (TCP)
-    #
-    # When the protocol under test is QUIC (ns3_proto == "udp") or plain UDP,
-    # bulk clients also use OnOff/UDP instead of BulkSend/TCP because the
-    # protocol comparison must be consistent (all flows use the same socket
-    # factory).  TCP bulk profiles are only active when ns3_proto == "tcp".
+    udp_sinks_by_profile = {}
+    tcp_sinks_by_profile = {}
+    for pname, pport in profile_ports.items():
+        udp_sink = ns.PacketSinkHelper(
+            "ns3::UdpSocketFactory",
+            ns.InetSocketAddress(ns.Ipv4Address.GetAny(), pport).ConvertTo())
+        tcp_sink = ns.PacketSinkHelper(
+            "ns3::TcpSocketFactory",
+            ns.InetSocketAddress(ns.Ipv4Address.GetAny(), pport).ConvertTo())
+        udp_app = udp_sink.Install(server)
+        udp_app.Start(ns.Seconds(0.0))
+        udp_app.Stop(ns.Seconds(SIM_DURATION_S + 2.0))
+        tcp_app = tcp_sink.Install(server)
+        tcp_app.Start(ns.Seconds(0.0))
+        tcp_app.Stop(ns.Seconds(SIM_DURATION_S + 2.0))
+        udp_sinks_by_profile[pname] = udp_app.Get(0).GetObject[ns.PacketSink]()
+        tcp_sinks_by_profile[pname] = tcp_app.Get(0).GetObject[ns.PacketSink]()
 
-    udp_sink = ns.PacketSinkHelper(
-        "ns3::UdpSocketFactory",
-        ns.InetSocketAddress(ns.Ipv4Address.GetAny(), port).ConvertTo())
-    tcp_sink = ns.PacketSinkHelper(
-        "ns3::TcpSocketFactory",
-        ns.InetSocketAddress(ns.Ipv4Address.GetAny(), port).ConvertTo())
+    if TRANSPORT_COMPARE_MODE == "matched_offered_load":
+        active_ip_protos = {6} if ns3_proto == "tcp" else {17}
+    else:
+        # Legacy mode keeps UDP profiles even in TCP runs.
+        active_ip_protos = {17}
+        if ns3_proto == "tcp":
+            active_ip_protos.add(6)
 
-    # Install sinks on server before apps on phones
-    udp_sink_app = udp_sink.Install(server)
-    udp_sink_app.Start(ns.Seconds(0.0))
-    udp_sink_app.Stop(ns.Seconds(SIM_DURATION_S + 2.0))
-
-    tcp_sink_app = None
-    if ns3_proto == "tcp":
-        tcp_sink_app = tcp_sink.Install(server)
-        tcp_sink_app.Start(ns.Seconds(0.0))
-        tcp_sink_app.Stop(ns.Seconds(SIM_DURATION_S + 2.0))
-
-    # Track which sink app handles which ip_proto_num for FlowMonitor
-    # We collect stats for both protocols (6 + 17) in a single pass.
-    active_ip_protos = {17}   # UDP always present
-    if ns3_proto == "tcp":
-        active_ip_protos.add(6)
+    def _profile_rate(profile_name: str, profile: dict) -> str:
+        if TRANSPORT_COMPARE_MODE == "matched_offered_load":
+            return MATCHED_PROFILE_DATA_RATES.get(profile_name, APP_DATA_RATE)
+        return profile.get("data_rate") or APP_DATA_RATE
 
     for ci, phone in enumerate(phones):
         profile_name = CLIENT_PROFILES[ci] if ci < len(CLIENT_PROFILES) else "bulk"
         profile      = TRAFFIC_PROFILES[profile_name]
         app_type     = profile["app_type"]
+        pkt_size     = int(profile.get("packet_size", PACKET_SIZE_BYTES))
+        duty         = float(profile.get("duty", 1.0))
+        server_addr  = ns.InetSocketAddress(
+            iface_srv.GetAddress(1), profile_ports[profile_name]
+        )
 
-        # When running a non-TCP protocol comparison pass (UDP/QUIC), treat
-        # all clients as UDP CBR with the profile's data_rate.  This ensures
-        # every protocol comparison run uses the same number of active flows.
-        if ns3_proto != "tcp" or app_type != "tcp_bulk":
-            # UDP OnOff application
-            data_rate  = profile.get("data_rate") or APP_DATA_RATE
-            pkt_size   = profile["packet_size"]
-            duty       = profile["duty"]
+        if duty >= 1.0:
+            on_time_str  = "ns3::ConstantRandomVariable[Constant=1]"
+            off_time_str = "ns3::ConstantRandomVariable[Constant=0]"
+        else:
+            on_time_str  = "ns3::UniformRandomVariable[Min=0.9|Max=1.1]"
+            off_period   = (1.0 / max(duty, 0.01)) - 1.0
+            off_time_str = (
+                "ns3::UniformRandomVariable"
+                f"[Min={off_period*0.9:.2f}|Max={off_period*1.1:.2f}]"
+            )
 
-            if duty >= 1.0:
-                on_time_str  = "ns3::ConstantRandomVariable[Constant=1]"
-                off_time_str = "ns3::ConstantRandomVariable[Constant=0]"
-            else:
-                # IoT duty cycle: on for ~10% of time
-                on_str       = f"ns3::UniformRandomVariable[Min=0.9|Max=1.1]"
-                off_period   = (1.0 / max(duty, 0.01)) - 1.0
-                off_str      = (f"ns3::UniformRandomVariable"
-                                f"[Min={off_period*0.9:.2f}|Max={off_period*1.1:.2f}]")
-                on_time_str  = on_str
-                off_time_str = off_str
-
-            onoff = ns.OnOffHelper(
-                "ns3::UdpSocketFactory", server_addr.ConvertTo())
-            onoff.SetAttribute("DataRate",   ns.StringValue(data_rate))
+        if TRANSPORT_COMPARE_MODE == "matched_offered_load":
+            socket_factory = (
+                "ns3::TcpSocketFactory" if ns3_proto == "tcp"
+                else "ns3::UdpSocketFactory"
+            )
+            onoff = ns.OnOffHelper(socket_factory, server_addr.ConvertTo())
+            onoff.SetAttribute("DataRate",   ns.StringValue(_profile_rate(profile_name, profile)))
             onoff.SetAttribute("PacketSize", ns.UintegerValue(pkt_size))
             onoff.SetAttribute("OnTime",     ns.StringValue(on_time_str))
             onoff.SetAttribute("OffTime",    ns.StringValue(off_time_str))
@@ -1466,43 +1509,58 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
                 app_tx = onoff.Install(phone)
                 app_tx.Start(ns.Seconds(1.0))
                 app_tx.Stop(ns.Seconds(SIM_DURATION_S))
-
         else:
-            # TCP BulkSend application (bulk profile, TCP protocol run only)
-            bulk = ns.BulkSendHelper(
-                "ns3::TcpSocketFactory", server_addr.ConvertTo())
-            bulk.SetAttribute("SendSize", ns.UintegerValue(profile["packet_size"]))
-            bulk.SetAttribute("MaxBytes", ns.UintegerValue(max_bytes))
-            for _ in range(NUM_PARALLEL_FLOWS):
-                app_tx = bulk.Install(phone)
-                app_tx.Start(ns.Seconds(1.0))
-                app_tx.Stop(ns.Seconds(SIM_DURATION_S))
+            # Legacy behavior: bulk uses TCP BulkSend in TCP runs, otherwise CBR.
+            if ns3_proto != "tcp" or app_type != "tcp_bulk":
+                onoff = ns.OnOffHelper(
+                    "ns3::UdpSocketFactory", server_addr.ConvertTo())
+                onoff.SetAttribute("DataRate",   ns.StringValue(_profile_rate(profile_name, profile)))
+                onoff.SetAttribute("PacketSize", ns.UintegerValue(pkt_size))
+                onoff.SetAttribute("OnTime",     ns.StringValue(on_time_str))
+                onoff.SetAttribute("OffTime",    ns.StringValue(off_time_str))
+                for _ in range(NUM_PARALLEL_FLOWS):
+                    app_tx = onoff.Install(phone)
+                    app_tx.Start(ns.Seconds(1.0))
+                    app_tx.Stop(ns.Seconds(SIM_DURATION_S))
+            else:
+                bulk = ns.BulkSendHelper(
+                    "ns3::TcpSocketFactory", server_addr.ConvertTo())
+                bulk.SetAttribute("SendSize", ns.UintegerValue(pkt_size))
+                bulk.SetAttribute("MaxBytes", ns.UintegerValue(max_bytes))
+                for _ in range(NUM_PARALLEL_FLOWS):
+                    app_tx = bulk.Install(phone)
+                    app_tx.Start(ns.Seconds(1.0))
+                    app_tx.Stop(ns.Seconds(SIM_DURATION_S))
 
     # =========================================================================
-    # Per-second throughput time-series probe (PacketSink cumulative RX bytes)
+    # Per-second throughput time-series probe (aggregate sinks)
     # =========================================================================
-    # The probe reads the total received bytes from the server's UDP sink
-    # (and TCP sink when present) every TIMESERIES_BUCKET_S seconds and
-    # records the delta as per-second throughput.
-    #
-    # NOTE: For simplicity we probe the UDP sink only when ns3_proto == "udp",
-    # and the TCP sink only when ns3_proto == "tcp".  In mixed-profile runs
-    # (ns3_proto == "tcp") the UDP flows from streaming/gaming/texting/voice
-    # clients will not appear in the TCP PacketSink — this is intentional; we only
-    # time-series the primary protocol under test.
+    ts_t_list     = []
+    ts_bytes_list = []
+    def _all_sinks_total_rx() -> int:
+        total = 0
+        for pname in profile_names:
+            total += int(udp_sinks_by_profile[pname].GetTotalRx())
+            total += int(tcp_sinks_by_profile[pname].GetTotalRx())
+        return total
 
-    ts_t_list     = []   # simulation time at each probe [s]
-    ts_bytes_list = []   # cumulative RX bytes at each probe
+    def _streaming_sink_total_rx() -> int:
+        if "streaming" not in udp_sinks_by_profile:
+            return 0
+        return (
+            int(udp_sinks_by_profile["streaming"].GetTotalRx())
+            + int(tcp_sinks_by_profile["streaming"].GetTotalRx())
+        )
 
-    # Get the primary sink app handle (index 0 = first installed)
-    primary_sink_app = tcp_sink_app.Get(0) if (ns3_proto == "tcp" and tcp_sink_app is not None) else udp_sink_app.Get(0)
+    ts_stream_bytes_list = []
 
     def _ts_probe():
-        t        = ns.Simulator.Now().GetSeconds()
-        cum_bytes = primary_sink_app.GetObject[ns.PacketSink]().GetTotalRx()
+        t = ns.Simulator.Now().GetSeconds()
+        cum_bytes = _all_sinks_total_rx()
+        stream_bytes = _streaming_sink_total_rx()
         ts_t_list.append(t)
         ts_bytes_list.append(int(cum_bytes))
-        # Reschedule until end of simulation
+        ts_stream_bytes_list.append(int(stream_bytes))
         if t + TIMESERIES_BUCKET_S <= SIM_DURATION_S + 1.0:
             ev = ns.cppyy.gbl.pythonMakeEvent(_ts_probe)
             ns.Simulator.Schedule(ns.Seconds(TIMESERIES_BUCKET_S), ev)
@@ -1557,14 +1615,19 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
 
     # ── Build per-second time-series ──────────────────────────────────────────
     ts_throughput_kbps = []
+    ts_streaming_kbps = []
     for k in range(len(ts_t_list)):
         prev_bytes = ts_bytes_list[k - 1] if k > 0 else 0
         delta_bytes = max(ts_bytes_list[k] - prev_bytes, 0)
+        prev_stream_bytes = ts_stream_bytes_list[k - 1] if k > 0 else 0
+        delta_stream_bytes = max(ts_stream_bytes_list[k] - prev_stream_bytes, 0)
         ts_throughput_kbps.append(round(delta_bytes * 8.0 / TIMESERIES_BUCKET_S / 1e3, 2))
+        ts_streaming_kbps.append(round(delta_stream_bytes * 8.0 / TIMESERIES_BUCKET_S / 1e3, 2))
 
     timeseries = {
         "t_s":              [round(t, 1) for t in ts_t_list],
         "throughput_kbps":  ts_throughput_kbps,
+        "streaming_throughput_kbps": ts_streaming_kbps,
         "handover_times":   list(handover_times),
     }
 
@@ -1608,6 +1671,7 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
                            for p in TRAFFIC_PROFILES},
         timeseries      = timeseries,
         position_trace  = position_trace,
+        is_analytical   = False,
     )
 
     active_s = SIM_DURATION_S - 1.0   # exclude 1 s warm-up
@@ -1619,10 +1683,9 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     rx_bytes   = 0
     flow_tputs = []   # per-flow throughput for Jain's fairness
 
-    # Profile tagging: FlowMonitor gives us the flow's source IPv4 address
-    # via the classifier, and ip_to_profile (built when the access links
-    # were wired) maps each phone's IP to its assigned traffic profile.
-    # TCP flows → bulk (the TCP run only emits bulk applications).
+    # Profile tagging: map FlowMonitor records to profiles via destination port
+    # (preferred; one sink port per profile), then source IP fallback.
+    port_to_profile = {int(p): n for n, p in profile_ports.items()}
     tcp_flow_count = 0
 
     for pair in stats:
@@ -1649,26 +1712,20 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
         rx_bytes   += b
         flow_tputs.append(flow_tput)
 
-        # Profile tagging: TCP flows → bulk; UDP flows → profile bucket
-        # determined by the flow's source IPv4 address (set when the
-        # client was given its traffic profile during access-link wiring).
         if ip_proto == 6:
             tcp_flow_count += 1
-            ps = result["profile_stats"]["bulk"]
-            ps["tx"] += tx_n
-            ps["rx"] += rx_n
-            ps["rx_bytes"] += b
-            ps["delay_sum"] += d_s
-        else:
+        dst_port = int(getattr(finfo, "destinationPort", 0))
+        pname = port_to_profile.get(dst_port)
+        if pname is None:
             src_key = int(finfo.sourceAddress.Get())
             pname = ip_to_profile.get(src_key, "bulk")
-            if pname not in result["profile_stats"]:
-                pname = "bulk"
-            ps = result["profile_stats"][pname]
-            ps["tx"] += tx_n
-            ps["rx"] += rx_n
-            ps["rx_bytes"] += b
-            ps["delay_sum"] += d_s
+        if pname not in result["profile_stats"]:
+            pname = "bulk"
+        ps = result["profile_stats"][pname]
+        ps["tx"] += tx_n
+        ps["rx"] += rx_n
+        ps["rx_bytes"] += b
+        ps["delay_sum"] += d_s
 
     if total_rx > 0:
         # Jain's fairness index: J = (Σx)² / (n · Σx²)
@@ -1746,7 +1803,8 @@ def run_ns3(scenario: str, protocol_cfg: dict, channel_stats: list,
     rebuffer_threshold_kbps = 0.8 * streaming_target_kbps
     rebuffer_seconds = 0
     observed_seconds = 0
-    for tt, kbps in zip(ts_t_list, ts_throughput_kbps):
+    ts_stream_for_qoe = timeseries.get("streaming_throughput_kbps", ts_throughput_kbps)
+    for tt, kbps in zip(ts_t_list, ts_stream_for_qoe):
         if tt < 2.0:   # skip warm-up probe (app starts at t=1s)
             continue
         observed_seconds += 1

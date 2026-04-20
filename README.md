@@ -24,11 +24,11 @@ UE (Phone)  ──5G-NR NTN──  LEO Satellite  ──direct link──  Inter
 | Numerology | µ=1 · 30 kHz SCS |
 | Modulation / code rate | QPSK · LDPC r=0.5 |
 | Satellite altitude | 550 km (LEO, Starlink Shell 1) |
-| Visible satellites simulated | 8 |
+| Visible satellites simulated | 12 |
 | Protocols compared | UDP, TCP NewReno, TCP CUBIC, TCP BBR, QUIC |
 | Traffic profiles | streaming, gaming, texting, voice, bulk |
 | Clients | 30 stationary + 20 moving (pedestrian + vehicular) |
-| Simulation duration | 60 s |
+| Simulation duration | 300 s |
 | Ray tracing scene | Munich (Sionna RT, OpenStreetMap) |
 
 ## Setup
@@ -86,7 +86,29 @@ Key knobs:
 | Parameter | Default | Description |
 |---|---|---|
 | `RT_MAX_DEPTH` | `5` | Max ray reflections per path |
-| `SIM_DURATION_S` | `60.0` | NS-3 simulation duration [s] |
+| `SIM_DURATION_S` | `300.0` | NS-3 simulation duration [s] |
+
+## Model Scope
+
+- NS-3 uses an impaired-link abstraction (P2P + error models + handover scheduler),
+  not a full 5G NR NTN stack.
+- QUIC is reported as `QUIC (analytical)` and derived from a TCP BBR baseline
+  with RFC 9000/9002-inspired corrections.
+- Transport comparisons default to matched offered load
+  (`TRANSPORT_COMPARE_MODE=matched_offered_load`) so protocol deltas are not
+  confounded by traffic-generator mismatch.
+- PHY defaults to realism mode (`PHY_REALISM_MODE=realistic`) and injects
+  residual Doppler uncertainty (`RESIDUAL_DOPPLER_HZ_STD`).
+
+## Reproducibility
+
+- Use `SIM_SEED` and `SIM_RUN` to reproduce/stride random streams.
+- Example:
+
+```bash
+SIM_SEED=42 SIM_RUN=1 TRANSPORT_COMPARE_MODE=matched_offered_load \
+PYTHONPATH=~/ns-3-dev/build/bindings/python python3 main.py
+```
 | `NUM_PEDESTRIAN_MOVING_CLIENTS` | `10` | Pedestrian moving clients |
 | `NUM_VEHICULAR_MOVING_CLIENTS` | `10` | Vehicular moving clients |
 

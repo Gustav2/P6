@@ -290,6 +290,7 @@ from config import (
     SAT_SPACING_DEG,
     SAT_HANDOVER_ELEVATION_DEG,
     SAT_HEIGHT_M,
+    SAT_ORBITAL_VELOCITY_MS,
     RT_TX_POWER_DBM,
 )
 

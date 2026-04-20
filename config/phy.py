@@ -94,6 +94,30 @@ Number of independent channel realisations evaluated per SNR point.
 - Higher values reduce Monte-Carlo variance but increase memory/time.
 - 512 keeps all 8 Jetson CPU cores busy via TF intra-op parallelism while
   staying well within the 61 GB unified memory budget (~400 MB peak).
-- Original value was 64; 512 gives 8× better variance reduction per sweep,
-  which is important for reliable BER→PER sigmoid fitting.
+- Original value was 64; 512 gives 8x better variance reduction per sweep,
+  which is important for reliable BER->PER sigmoid fitting.
+"""
+
+PHY_REALISM_MODE = "realistic"
+"""
+PHY channel-power handling mode.
+
+- "realistic": keep absolute channel power (no normalization) so BER/BLER
+  reflects link-budget sensitivity.
+- "normalized": legacy mode where channel power is normalized.
+"""
+
+if PHY_REALISM_MODE not in ("realistic", "normalized"):
+    raise ValueError(
+        f"PHY_REALISM_MODE={PHY_REALISM_MODE!r} not recognised; "
+        "expected 'realistic' or 'normalized'"
+    )
+
+RESIDUAL_DOPPLER_HZ_STD = 300.0
+"""
+Residual Doppler/CFO standard deviation [Hz] after NTN pre-compensation.
+
+Applied as a zero-mean Gaussian residual in the PHY stage to avoid the
+unrealistic perfect-compensation assumption while staying within practical
+residual-tracking ranges for NTN-capable UEs.
 """
