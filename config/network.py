@@ -33,17 +33,31 @@ if SIM_SCENARIO not in ("contended", "empirical"):
 # NS-3 network simulation parameters
 # =============================================================================
 
-SIM_DURATION_S = 60.0
+SIM_DURATION_S = 300.0
 """
 Total NS-3 simulation duration [seconds].
-- 60 s shows at least one handover event with NUM_SATELLITES = 3.
-  At 7612 m/s and 550 km altitude, a full overhead pass takes ~8 min;
-  three satellites with 15° spacing give handovers at ~14 s and ~46 s.
-- Longer durations (e.g. 600 s) significantly increase NS-3 runtime:
-  with 50 clients, each extra 30 s of simulated time adds ~24 min wall-
-  time, making 600 s × 5 protocols ≈ 8 hours impractical.
-- DATA_VOLUME_MB caps each TCP flow at 10 MB, so TCP runs will finish
-  their transfer well before t=60 s even at the limited NTN rates.
+- 300 s (5 min) covers a substantial portion of one LEO overhead pass
+  (~8 min total at 550 km / 7612 m/s) and includes multiple handover
+  events with NUM_SATELLITES = 8 and SAT_SPACING_DEG = 15°.
+- At ω ≈ 0.063°/s the satellite advances ~18.9° over 300 s, giving
+  meaningful orbital geometry variation across RT snapshots.
+- NS-3 runtime scales roughly linearly with SIM_DURATION_S × NUM_CLIENTS;
+  300 s is a practical upper bound for CPU-only runs.
+"""
+
+RT_SNAPSHOT_INTERVAL_S = 30.0
+"""
+Time interval between successive Sionna RT snapshots [seconds].
+
+At 300 s simulation duration this produces 11 snapshots
+(t = 0, 30, 60, …, 300 s), each advancing the satellite constellation
+by ≈ 1.9° along the orbit (ω ≈ 0.063°/s at 550 km).  Per-slot channel
+statistics in NS-3 are linearly interpolated between adjacent snapshots.
+
+- 30 s / 1.9° per interval keeps interpolation error negligible compared
+  to other model uncertainties (coplanar geometry, specular-only RT).
+- Reducing this value increases RT runtime proportionally; each additional
+  snapshot adds one PathSolver call (scene is loaded once and reused).
 """
 
 # =============================================================================
@@ -419,7 +433,7 @@ NS-3 BulkSend.MaxBytes is set to int(DATA_VOLUME_MB × 10⁶) bytes so that
 each flow terminates after transferring this fixed file size rather than
 saturating the link for the full SIM_DURATION_S.
 
-- 100 MB keeps BulkSend flows alive for the full 60 s simulation at NTN
+- 100 MB keeps BulkSend flows alive for the full 300 s simulation at NTN
   rates (≤20 Mbps), so the TCP congestion controller reaches steady state
   and the fairness index is computed over a complete flow. At 20 Mbps a
   10 MB transfer finishes in ~4 s, leaving the congestion controller in

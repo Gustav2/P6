@@ -106,6 +106,7 @@ from config import (
     SERVICE_LINK_RATE_MBPS,
     BACKHAUL_DELAY_MS,
     SIM_DURATION_S,
+    RT_SNAPSHOT_INTERVAL_S,
     SIM_SCENARIO,
 )
 from sim.phy           import run_sionna_ber
@@ -289,19 +290,22 @@ def main() -> None:
     print("  Part 2 — Ray tracing  (Sionna RT, Munich scene)")
     print("─" * 70)
 
-    # R2 fix: run RT at 3 time snapshots and interpolate per-slot channel stats.
-    # Scene is loaded once on the first call and reused to avoid triple scene-
-    # load overhead (~1–2 s each).  Orbital advance ≈ 0.063°/s so the three
-    # snapshots bracket t=0, t=30 s, t=60 s, giving ≈ 0°, 1.9°, 3.8° advance.
+    # Run RT at evenly-spaced time snapshots and interpolate per-slot stats.
+    # Scene is loaded once on the first call and reused; subsequent calls
+    # only re-run PathSolver with the updated satellite positions.
+    # Orbital advance ≈ 0.063°/s → RT_SNAPSHOT_INTERVAL_S = 30 s gives
+    # ≈ 1.9° per interval over the full SIM_DURATION_S = 300 s window
+    # (11 snapshots, ~18.9° total advance).
     t0 = time.perf_counter()
-    _rt_snap_times = [0.0, SIM_DURATION_S / 2.0, SIM_DURATION_S]
-    _rt_scene, rt_stats_t0 = run_ray_tracing(time_offset_s=_rt_snap_times[0])
-    _, rt_stats_t1          = run_ray_tracing(time_offset_s=_rt_snap_times[1],
-                                              scene=_rt_scene)
-    _, rt_stats_t2          = run_ray_tracing(time_offset_s=_rt_snap_times[2],
-                                              scene=_rt_scene)
-    channel_stats_snapshots = [rt_stats_t0, rt_stats_t1, rt_stats_t2]
-    channel_stats           = rt_stats_t0   # backward-compat reference
+    _rt_snap_times = list(np.arange(0.0, SIM_DURATION_S + 1e-9,
+                                    RT_SNAPSHOT_INTERVAL_S))
+    _rt_scene, _first_stats = run_ray_tracing(time_offset_s=_rt_snap_times[0])
+    channel_stats_snapshots = [_first_stats]
+    for _t in _rt_snap_times[1:]:
+        _, _stats = run_ray_tracing(time_offset_s=_t, scene=_rt_scene)
+        channel_stats_snapshots.append(_stats)
+        print(f"  [RT snap t={_t:.0f}s]  {len(_stats)} satellites traced")
+    channel_stats = channel_stats_snapshots[0]  # backward-compat reference
 
     # Cached nadir render used as the backdrop for the mobility video.
     # Runs in the same RT TF/Mitsuba session so we don't pay another
